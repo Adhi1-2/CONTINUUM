@@ -34,6 +34,7 @@ stdin: `authority_id`, `consumer_run_id`, `via_action_id`, `consumed_at`, and
 walkthrough any command printing a verdict will do:
 
 ```bash
+mkdir -p /tmp/probe-demo
 export DB=/tmp/probe-demo/g.db
 continuum --db $DB start probe-demo --goal "demo approvals"
 ```
