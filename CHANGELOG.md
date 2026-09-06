@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Plan-aware bench scenario reports zero duplicate work (#468).**
+  `plan_aware_resume_skips_completed_units` starts a 5-unit linear plan via
+  `PLAN_UPSERT`, completes 2 units, reprojects from the log as a post-crash
+  resume would, and asserts units 1-2 never re-execute while 3-5 remain,
+  recording the duplicate count in the report metrics. It runs in CI through
+  the parametrized phase-6 suite.
+
 - **`examples/demo.ipynb`, the crash-recovery walkthrough as a notebook (#283).**
   The lowest-friction way to watch a recovery was `docker run`, which still wants
   a daemon; this wants a browser. Colab and Binder badges in the Quick Start
