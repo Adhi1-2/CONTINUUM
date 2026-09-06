@@ -17,7 +17,7 @@ from continuum.cli.main import build_parser
 TABLE = Path(__file__).resolve().parents[1] / "docs" / "api" / "cli.md"
 
 
-def _row_pattern(name: str) -> "re.Pattern[str]":
+def _row_pattern(name: str) -> re.Pattern[str]:
     return re.compile(r"^\|\s*`" + re.escape(name) + r"(?=[\s`|])", re.MULTILINE)
 
 
