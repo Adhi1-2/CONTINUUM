@@ -1021,7 +1021,9 @@ def cmd_watch(args: argparse.Namespace, storage: Storage, out: Any, err: Any) ->
 
         # Use override if provided, else load contract
         if override_threshold is not None:
-            contract = CadenceContract(max_silence_seconds=override_threshold)
+            # Empty scopes so the explicit operator value wins: otherwise the
+            # default otherwise scope (3600s) would silently override the flag (#670).
+            contract = CadenceContract(max_silence_seconds=override_threshold, phase_scopes={})
             # We need to compute advisory manually with override
             from datetime import UTC, datetime
 
