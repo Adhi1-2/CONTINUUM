@@ -168,8 +168,9 @@ All notable changes to this project are documented here. The format follows
 
 - `health` and `watch` honor the global `--json` flag (#677).
   Both re-registered the flag on their subparser, whose default silently
-  replaced the global value, so machine output never appeared. The shadow
-  registrations are removed.
+  replaced the global value, so machine output never appeared. The subparser
+  defaults are now SUPPRESS: both flag positions work and trailing `--json`
+  keeps working.
 
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
