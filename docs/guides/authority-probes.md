@@ -51,8 +51,12 @@ with SQLiteStorage("/tmp/probe-demo/g.db") as store:
 EOF
 ```
 
-```json
+Write that config to disk where the later commands expect it:
+
+```bash
+cat > reconcilers.json <<'EOF'
 {"probes": {"approval-7": {"command": "echo valid=true", "timeout": 10}}}
+EOF
 ```
 
 ## 2. Read the three verdicts
