@@ -86,8 +86,9 @@ continuum --db $DB watch live-demo --max-silence 1s \
 ```
 
 Delivery is fail-open like every notification path: a dead receiver prints a
-warning and never changes the verdict. Signed delivery with
-`CONTINUUM_WEBHOOK_SECRET` is covered by the shared notify primitive.
+warning and never changes the verdict. The POST carries the advisory as plain
+JSON; there is no authentication on the receiver side, so put the URL behind
+your own secret path or bearer check.
 
 ## Rules worth knowing
 
