@@ -166,6 +166,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Provenance listings paginate with --limit/--offset, display only (#597).
+  `continuum provenance` and `continuum impact` truncate the rendered nodes
+  (JSON carries nodes_total/nodes_hidden and downstream totals) while the
+  in-memory graph behind staleness stays whole. `--limit 0` is refused.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or
