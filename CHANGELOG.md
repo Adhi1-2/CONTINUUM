@@ -166,6 +166,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `health` and `watch` honor the global `--json` flag (#677).
+  Both re-registered the flag on their subparser, whose default silently
+  replaced the global value, so machine output never appeared. The shadow
+  registrations are removed.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or
