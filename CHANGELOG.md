@@ -166,6 +166,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `watch --max-silence` override wins without an open claim (#670).
+  The override kept the default phase scopes, so the `otherwise` scope
+  (3600s) silently replaced the flag value. The override contract now
+  carries empty scopes and falls back to the requested seconds.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or
