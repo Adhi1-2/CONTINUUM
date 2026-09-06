@@ -59,7 +59,8 @@ def test_signed_post_delivers_and_verifies() -> None:
         server.shutdown()
 
 
-def test_unsigned_post_keeps_plain_format() -> None:
+def test_unsigned_post_keeps_plain_format(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.delenv("CONTINUUM_WEBHOOK_SECRET", raising=False)
     captured: dict = {}
     server = _receiver(captured)
     try:
@@ -86,6 +87,11 @@ def test_secret_env_var_signs(monkeypatch) -> None:  # type: ignore[no-untyped-d
     finally:
         server.shutdown()
         monkeypatch.undo()
+
+
+def test_non_serializable_payload_fails_open() -> None:
+    """Serialization happens inside the fail-open boundary (#674 review)."""
+    assert post_webhook("http://127.0.0.1:1/hook", {"bad": object()}, timeout=0.2) is False
 
 
 def test_malformed_status_line_still_fails_open() -> None:
