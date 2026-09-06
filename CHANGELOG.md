@@ -166,6 +166,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- FINDING_ADDED accepts caused_by causal links like decisions and actions (#597).
+  Findings derived from evidence link back under the same 32-id, 1-128-char
+  caps and unknown-id refusal, validated on every append path (memory log,
+  SQLite, Postgres) behind one shared CAUSED_BY_TYPES constant. The graph
+  fold already edges any node type, so finding-to-evidence edges appear with
+  no projection change. PLAN_UPSERT nodes stay a separate design question.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or
