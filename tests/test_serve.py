@@ -532,3 +532,31 @@ def json_line(rid: int, method: str, params: dict) -> str:
     import json
 
     return json.dumps({"id": rid, "method": method, "params": params})
+
+
+def test_malformed_consumed_inputs_is_bad_params_not_internal() -> None:
+    """Ledger validation failures surface as parameter errors (#645 review)."""
+    from continuum.serve.server import BadParams
+
+    srv = make_server()
+    srv.dispatch("record_progress", {"run_id": "r1", "completed": 1, "goal": "g"})
+    claim = srv.dispatch("intercept_action", {"run_id": "r1", "action_type": "x.do", "key": "k1"})
+    with pytest.raises(BadParams, match="greater than or equal"):
+        srv.dispatch(
+            "complete_action",
+            {
+                "run_id": "r1",
+                "action_key": claim["action_key"],
+                "consumed_inputs": {"checkpoint_seq": -1},
+            },
+        )
+    with pytest.raises(BadParams, match="consumed_inputs"):
+        srv.dispatch(
+            "reconcile_action",
+            {
+                "run_id": "r1",
+                "action_key": claim["action_key"],
+                "occurred": True,
+                "consumed_inputs": [1, 2],
+            },
+        )
