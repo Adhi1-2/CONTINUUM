@@ -35,8 +35,6 @@ Ingest one signal (in production a monitor posts these; here we post directly):
 
 ```bash
 python - <<'EOF'
-from continuum.models import Run
-from continuum.events import EventType
 from continuum.storage import SQLiteStorage
 from continuum.recovery.risk import ingest_risk_json_line
 with SQLiteStorage("/tmp/risk-demo/g.db") as store:
