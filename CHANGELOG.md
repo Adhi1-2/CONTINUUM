@@ -166,6 +166,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Thin-adapter ledger writes carry EXTERNAL_AGENT provenance (#612).
+  `ContinuumToolGuard` claims about framework-executed tools were recorded
+  `deterministic`, so agent-asserted effects laundered to trusted and derived
+  provenance hid the writer. `ActionLedger` accepts a `source` (default
+  unchanged) and the guard stamps `EXTERNAL_AGENT`, matching its docstring
+  and the OpenAI adapter. Denial records stay deterministic as ledger verdicts.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or
