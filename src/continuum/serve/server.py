@@ -879,7 +879,10 @@ def _h_complete_action(server: SidecarServer, params: dict[str, Any]) -> dict[st
     run_id = _require(params, "run_id")
     action_key = _require(params, "action_key")
     action = server._ledger(run_id).complete(
-        action_key, external_id=params.get("external_id"), result=params.get("result")
+        action_key,
+        external_id=params.get("external_id"),
+        result=params.get("result"),
+        consumed_inputs=params.get("consumed_inputs"),
     )
     return {
         "run_id": run_id,
@@ -912,6 +915,7 @@ def _h_reconcile_action(server: SidecarServer, params: dict[str, Any]) -> dict[s
         occurred=occurred,
         external_id=params.get("external_id"),
         note=params.get("note", ""),
+        consumed_inputs=params.get("consumed_inputs"),
     )
     return {
         "run_id": run_id,
