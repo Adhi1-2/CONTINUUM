@@ -371,3 +371,15 @@ def test_transfer_encoding_closes_gateway_connection(db: str, gateway: str) -> N
     assert b"Connection: close" in response
     assert b"transfer encoding is not supported" in response
     assert b"501" not in response
+
+
+def test_compacted_consumed_authority_still_denies(db: str, gateway: str) -> None:
+    from continuum.actions.authority import record_authority_consumed
+    from continuum.cli import main
+
+    with SQLiteStorage(db) as store:
+        record_authority_consumed(store, "run_1", "spent", via_action_id="original-action")
+    assert main(["--db", db, "compact", "run_1", "--force"]) == 0
+    status, body = post(gateway, "/v1/invoices", {"id": "new", "authority_id": "spent"})
+    assert status == 403
+    assert "spent" in body["reason"] and "consumed at seq" in body["reason"]
