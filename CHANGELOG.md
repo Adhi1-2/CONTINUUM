@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Shared signed webhook delivery primitive for human notification (#305).
+  `continuum.recovery.notify` posts JSON with an HMAC-SHA256 signature when
+  `CONTINUUM_WEBHOOK_SECRET` is set and plain JSON otherwise, always
+  fail-open. The liveness watch webhook path now routes through it with
+  identical wire behavior when unconfigured.
+
 - **`examples/demo.ipynb`, the crash-recovery walkthrough as a notebook (#283).**
   The lowest-friction way to watch a recovery was `docker run`, which still wants
   a daemon; this wants a browser. Colab and Binder badges in the Quick Start
@@ -165,12 +171,6 @@ All notable changes to this project are documented here. The format follows
   held for review the way an MCP-reported one is. Docs-only, no runtime change.
 
 ### Fixed
-
-- Shared signed webhook delivery primitive for human notification (#305).
-  `continuum.recovery.notify` posts JSON with an HMAC-SHA256 signature when
-  `CONTINUUM_WEBHOOK_SECRET` is set and plain JSON otherwise, always
-  fail-open. The liveness watch webhook path now routes through it with
-  identical wire behavior when unconfigured.
 
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
