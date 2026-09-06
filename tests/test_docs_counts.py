@@ -24,12 +24,20 @@ COUNTED_FILES = (
 # hundreds (#316: exact, #630: 135). Tolerance 30 splits the difference.
 TOLERANCE = 30
 
-_COLLECTED_RE = re.compile(r"~([\d,]+)`?\s+collected")
+# Every prose form the three files use for the collected total (#664 review):
+# "~2,053 collected", "roughly 2,053 tests collected", "~2,053 tests".
+# Passed/skipped figures are deliberately unmatched: they vary by environment.
+_COLLECTED_RES = (
+    re.compile(r"~([\d,]+)`?\s+collected"),
+    re.compile(r"roughly\s+([\d,]+)\s+tests\s+collected"),
+    re.compile(r"~([\d,]+)\s+tests\b"),
+)
 
 
 def documented_total(path: Path) -> int:
-    matches = _COLLECTED_RE.findall(path.read_text(encoding="utf-8"))
-    assert matches, f"{path.name} states no ~N collected figure"
+    text = path.read_text(encoding="utf-8")
+    matches = [m for rx in _COLLECTED_RES for m in rx.findall(text)]
+    assert matches, f"{path.name} states no collected-total figure"
     totals = {int(m.replace(",", "")) for m in matches}
     assert len(totals) == 1, f"{path.name} states inconsistent figures: {sorted(totals)}"
     return totals.pop()
