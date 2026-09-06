@@ -3630,7 +3630,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dashboard", action="store_true", help="render the Phase 14 recovery dashboard."
     )
 
-    with_run(add("health", cmd_health, "Advisory prefix-trust health check. Read-only."))
+    health = with_run(add("health", cmd_health, "Advisory prefix-trust health check. Read-only."))
+    # Subparser default SUPPRESS: accepts trailing --json without shadowing the global flag (#677).
+    health.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     # health is advisory only; it never gates, never moves mode, never changes exit code
     # (issue #401). It reports trust_score with per-dimension breakdown.
 
@@ -4030,6 +4032,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="webhook URL for --on-breach webhook",
     )
+    # Subparser default SUPPRESS: accepts trailing --json without shadowing the global flag (#677).
+    watch.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
 
     return parser
 

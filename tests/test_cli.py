@@ -1199,3 +1199,13 @@ def test_health_and_watch_honor_global_json_flag(db: str) -> None:
     code, out, _ = run("--db", db, "--json", "watch", "run_1", "--max-silence", "1h")
     assert code == ExitCode.OK, out
     assert json.loads(out)["breached"] is False
+
+
+def test_json_flag_works_after_the_subcommand(db: str) -> None:
+    """Trailing --json keeps working once shadowing is fixed (#677)."""
+    code, out, _ = run("--db", db, "health", "run_1", "--json")
+    assert code == ExitCode.OK
+    assert json.loads(out)["advisory"]["trust_score"] >= 0
+    code, out, _ = run("--db", db, "watch", "run_1", "--max-silence", "1h", "--json")
+    assert code == ExitCode.OK, out
+    assert json.loads(out)["breached"] is False
