@@ -166,6 +166,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Preserve archived action history in grant and authority enforcement, CLI and
+  gateway gate decisions, cross-run action scans, and memory enumeration and
+  forensic joins (#615, #616). Compaction no longer hides spent authority or
+  memory records from those consumers. Existing uncertainty checks still govern
+  unfinished retries; forgetting records continues to enumerate external deletion
+  targets and append a tombstone, without deleting external data itself.
+
 - **The published image's default command runs the demo again (#280).**
   `Dockerfile` installs the sources root-owned under `/opt/continuum` and then
   drops to an unprivileged user, while `examples/crash_recovery_agent.py` pinned
