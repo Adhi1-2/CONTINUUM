@@ -72,7 +72,7 @@ from continuum.budgets import (
     would_refuse,
 )
 from continuum.concurrency.lease import LeaseCoordinator
-from continuum.events import EventType
+from continuum.events import Event, EventType
 from continuum.models import Action, ActionStatus, ConsumedInputs, UnknownSideEffect, utcnow
 from continuum.security.hashing import stable_hash
 from continuum.storage.base import Storage
@@ -856,8 +856,10 @@ class ActionLedger:
         # before anything fires. A live attempt carrying the same grant under
         # the same key is an ordinary mid-flight retry and passes through.
         grant_clean = normalize_grant(grant)
+        authority_history: Sequence[Event] | None = None
         if grant_clean is not None:
-            spent, grants_by_key = scan_grants(self.storage.read_all_events(self.run_id))
+            authority_history = self.storage.read_all_events(self.run_id)
+            spent, grants_by_key = scan_grants(authority_history)
             prior = spent.get(grant_clean["id"])
             live_match = (
                 existing is not None
@@ -896,7 +898,9 @@ class ActionLedger:
         if authority_id is not None:
             from continuum.gate import collect_consumed_authorities
 
-            consumed = collect_consumed_authorities(self.storage.read_all_events(self.run_id))
+            if authority_history is None:
+                authority_history = self.storage.read_all_events(self.run_id)
+            consumed = collect_consumed_authorities(authority_history)
             prior_ev = consumed.get(authority_id)
             # Allow live retry under same key with same authority
             live_auth_match = (

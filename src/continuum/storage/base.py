@@ -142,6 +142,8 @@ class Storage(ABC):
         forensic joins, and cross-run action scans likewise require full history:
         compaction moves facts but does not revoke their consequences. Checkpoint
         projection may intentionally read only the live tail instead.
+        Callers folding the same history more than once should reuse the returned
+        sequence within that operation instead of rescanning the archive.
         Sorted to keep hash chain order stable.
         """
         archived = list(self.read_archived_events(run_id))
