@@ -319,10 +319,14 @@ def scenario_plan_aware_resume_skips_completed_units(ctx: ScenarioContext) -> No
         },
     )
     # Post-crash resume reads the log fresh rather than trusting memory.
+    # Both lists derive from the full projected plan in one pass: the metric
+    # must be able to fire on its own, not inherit an already-filtered list.
     resumed = project("run_1", store.read_events("run_1"))
+    completed = [u.step_id for u in resumed.plan if u.status.value == "completed"]
     remaining = [u.step_id for u in resumed.plan if u.status.value != "completed"]
     assert remaining == ["u3", "u4", "u5"], remaining
-    duplicates = [u for u in remaining if u in ("u1", "u2")]
+    scheduled = set(remaining)
+    duplicates = [c for c in completed if c in scheduled]
     ctx.metrics["duplicate_completed_units"] = len(duplicates)
     ctx.metrics["remaining_units"] = remaining
     assert not duplicates, f"completed units would re-execute: {duplicates}"
