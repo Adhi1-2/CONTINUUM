@@ -57,15 +57,17 @@ def post_webhook(
     import urllib.request
 
     secret = secret if secret is not None else os.environ.get(SECRET_ENV_VAR)
-    data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if secret:
-        headers[SIGNATURE_HEADER] = signature(data, secret)
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if secret:
+            headers[SIGNATURE_HEADER] = signature(data, secret)
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return bool(200 <= response.status < 300)
-    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+    except (urllib.error.URLError, OSError, ValueError, TypeError, http.client.HTTPException):
+        # TypeError covers non-serializable payloads: serialization is inside
+        # the boundary so a bad payload fails open like a bad network.
         # HTTPException covers malformed status lines and truncated bodies,
         # which urlopen lets through unwrapped: all still fail open.
         return False
