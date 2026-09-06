@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import os
 from typing import Any
@@ -64,5 +65,7 @@ def post_webhook(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return bool(200 <= response.status < 300)
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        # HTTPException covers malformed status lines and truncated bodies,
+        # which urlopen lets through unwrapped: all still fail open.
         return False

@@ -86,3 +86,32 @@ def test_secret_env_var_signs(monkeypatch) -> None:  # type: ignore[no-untyped-d
     finally:
         server.shutdown()
         monkeypatch.undo()
+
+
+def test_malformed_status_line_still_fails_open() -> None:
+    """Response framing errors must not escape post_webhook (#674 review)."""
+    import socket
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def garble() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            try:
+                conn.recv(65536)
+            except OSError:
+                return
+            conn.sendall(b"NOTHTTP garbage\r\n\r\n")
+
+    thread = threading.Thread(target=garble, daemon=True)
+    thread.start()
+    try:
+        assert post_webhook(f"http://127.0.0.1:{port}/hook", {"run_id": "r1"}) is False
+    finally:
+        stop.set()
+        listener.close()
