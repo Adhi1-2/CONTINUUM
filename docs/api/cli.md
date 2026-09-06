@@ -91,6 +91,9 @@ with per-pin status (`present`, `absent`, `unverifiable`), grace deadline, and
 flagged set. Flagged pins render prominently in human text as `[!!]` lines
 coloured on TTY and plain when piped, byte-identical modulo colour (issue #419).
 
+The authority-probe flow (`--authority`, verdicts, unblocking) is walked through
+in `docs/guides/authority-probes.md`.
+
 `reconcile <run_id>` reads its probe registry from `.continuum/reconcilers.json`
 unless `--config <path>` names another file, and each probe's `timeout` is in
 seconds and optional:
