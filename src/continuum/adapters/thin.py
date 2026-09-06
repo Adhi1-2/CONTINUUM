@@ -24,6 +24,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from continuum.models import Origin
+
 __all__ = [
     "crewai_available",
     "pydantic_ai_available",
@@ -69,11 +71,20 @@ class ContinuumToolGuard:
         *,
         key_fn: Callable[[str, dict[str, Any]], str] | None = None,
         external_id_fn: Callable[[Any], str | None] | None = None,
+        source: Origin = Origin.EXTERNAL_AGENT,
     ) -> None:
+        """Bind the guard to a run.
+
+        ``source`` stamps the ledger writes (issue #612): a framework
+        executing tools asserts facts about its own work, so the
+        default is ``EXTERNAL_AGENT`` and the run is held for review
+        like any agent-reported work.
+        """
         self._storage = storage
         self._run_id = run_id
         self._key_fn = key_fn
         self._external_id_fn = external_id_fn
+        self._source = source
         self._ledger: Any | None = None
         self._seq = 0
         self._inflight: dict[int, str] = {}
@@ -83,7 +94,7 @@ class ContinuumToolGuard:
         if self._ledger is None:
             from continuum.actions import ActionLedger
 
-            self._ledger = ActionLedger(self._storage, self._run_id)
+            self._ledger = ActionLedger(self._storage, self._run_id, source=self._source)
         return self._ledger
 
     def _args_dict(self, args: Any) -> dict[str, Any]:
