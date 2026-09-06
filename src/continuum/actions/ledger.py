@@ -556,7 +556,7 @@ class ActionLedger:
         for run in self.storage.list_runs():
             if run.run_id == self.run_id:
                 continue
-            folded = fold_action_events(self.storage.read_events(run.run_id))
+            folded = fold_action_events(self.storage.read_all_events(run.run_id))
             candidate = folded.get(key)
             if candidate is not None:
                 found = candidate
@@ -857,7 +857,7 @@ class ActionLedger:
         # the same key is an ordinary mid-flight retry and passes through.
         grant_clean = normalize_grant(grant)
         if grant_clean is not None:
-            spent, grants_by_key = scan_grants(self.storage.read_events(self.run_id))
+            spent, grants_by_key = scan_grants(self.storage.read_all_events(self.run_id))
             prior = spent.get(grant_clean["id"])
             live_match = (
                 existing is not None
@@ -896,7 +896,7 @@ class ActionLedger:
         if authority_id is not None:
             from continuum.gate import collect_consumed_authorities
 
-            consumed = collect_consumed_authorities(self.storage.read_events(self.run_id))
+            consumed = collect_consumed_authorities(self.storage.read_all_events(self.run_id))
             prior_ev = consumed.get(authority_id)
             # Allow live retry under same key with same authority
             live_auth_match = (
@@ -1239,7 +1239,7 @@ class ActionLedger:
         try:
             from continuum.security.hashing import stable_hash as _sh
 
-            for ev in self.storage.read_events(self.run_id):
+            for ev in self.storage.read_all_events(self.run_id):
                 if ev.type == EventType.PERCEPTION_OBSERVED:
                     try:
                         digest = _sh(dict(ev.payload))
@@ -1252,7 +1252,7 @@ class ActionLedger:
                         obs_by_digest[ch] = ev
         except Exception:
             obs_by_digest = {}
-        for ev in self.storage.read_events(self.run_id):
+        for ev in self.storage.read_all_events(self.run_id):
             if ev.type not in _ACTION_EVENT_TYPES:
                 continue
             payload = dict(ev.payload)
@@ -1336,7 +1336,7 @@ def forensic_join_across_runs(storage: Storage, record_key: str) -> list[dict[st
         # Build per-run observation index
         obs_by_digest: dict[str, Any] = {}
         try:
-            for ev in storage.read_events(run_id):
+            for ev in storage.read_all_events(run_id):
                 if ev.type == EventType.PERCEPTION_OBSERVED:
                     try:
                         digest = _sh(dict(ev.payload))
@@ -1349,7 +1349,7 @@ def forensic_join_across_runs(storage: Storage, record_key: str) -> list[dict[st
         except Exception:
             obs_by_digest = {}
         try:
-            events = storage.read_events(run_id)
+            events = storage.read_all_events(run_id)
         except Exception:
             continue
         for ev in events:

@@ -452,10 +452,10 @@ class GatewayServer:
                         return
                     from continuum.actions.ledger import fold_action_events
 
-                    actions = fold_action_events(storage.read_events(run_id))
+                    actions = fold_action_events(storage.read_all_events(run_id))
                     from continuum.gate import collect_consumed_authorities
 
-                    consumed = collect_consumed_authorities(storage.read_events(run_id))
+                    consumed = collect_consumed_authorities(storage.read_all_events(run_id))
                     decision = match_route(
                         server._routes,
                         host=host.split(":")[0],

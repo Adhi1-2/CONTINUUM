@@ -2782,9 +2782,11 @@ def cmd_gate(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> 
         )
         return 2
 
-    actions_by_key = fold_action_events(storage.read_events(run_id)) if run_id is not None else {}
+    actions_by_key = (
+        fold_action_events(storage.read_all_events(run_id)) if run_id is not None else {}
+    )
     consumed = (
-        collect_consumed_authorities(storage.read_events(run_id)) if run_id is not None else {}
+        collect_consumed_authorities(storage.read_all_events(run_id)) if run_id is not None else {}
     )
     decision = gate_decide(
         config,
@@ -3096,7 +3098,7 @@ def cmd_forget(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
 
     for run in runs_to_scan:
         try:
-            events = storage.read_events(run.run_id)
+            events = storage.read_all_events(run.run_id)
         except Exception:
             continue
         for ev in events:
