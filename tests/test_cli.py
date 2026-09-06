@@ -1189,3 +1189,13 @@ def test_a_healthy_compacted_run_still_resumes_after_degrade_landed(db: str) -> 
     assert code in (ExitCode.OK, ExitCode.REQUIRES_HUMAN), f"{out}{err}"
     assert "PROJECTION FAILURE" not in out
     assert "Traceback" not in err
+
+
+def test_health_and_watch_honor_global_json_flag(db: str) -> None:
+    """Subparsers must not shadow the global --json flag (#677)."""
+    code, out, _ = run("--db", db, "--json", "health", "run_1")
+    assert code == ExitCode.OK
+    assert json.loads(out)["advisory"]["trust_score"] >= 0
+    code, out, _ = run("--db", db, "--json", "watch", "run_1", "--max-silence", "1h")
+    assert code == ExitCode.OK, out
+    assert json.loads(out)["breached"] is False
