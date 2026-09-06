@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Completed actions record consumed inputs for restore-point admissibility (#558).**
+  `ActionLedger.complete` and `reconcile` accept an optional `consumed_inputs`
+  mapping (`checkpoint_seq`, `event_positions`, `component_ids`, `action_ids`),
+  validated and stored on the action row and in the `action_index` projection.
+  Rows written before the field existed load as empty and stay admissible. The
+  MCP `complete` and `reconcile` tools and the sidecar `complete_action` and
+  `reconcile_action` handlers forward the field, so agent-driven callers can
+  declare what state an effect was computed from.
+
 - **`examples/demo.ipynb`, the crash-recovery walkthrough as a notebook (#283).**
   The lowest-friction way to watch a recovery was `docker run`, which still wants
   a daemon; this wants a browser. Colab and Binder badges in the Quick Start
