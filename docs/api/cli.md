@@ -47,6 +47,17 @@ continuum --json <command>                    # machine-readable output
 | `attest-verify <run_id> --attest <file>` | Verify a signed attestation against the live chain. |
 | `serve` | Run the Tier 0 newline-delimited JSON sidecar (no MCP dependency). |
 | `dashboard` | Serve the dashboard (presentation over run data). |
+| `export-evidence` | Export evidence as content-addressed JSON lines. Read-only. |
+| `forget` | Enumerate and tombstone memory records for a tenant. Mutates unless --dry-run. |
+| `health` | Advisory prefix-trust health check. Read-only. |
+| `impact` | Show downstream impact of an evidence item. Read-only. |
+| `merge` | Merge into a run at an anchor. Mutates storage. |
+| `precompact` | Checkpoint before context compaction (PreCompact hook). Mutates the run. |
+| `provenance` | Show provenance DAG. Read-only. |
+| `record-plan` | Record a structured plan upsert. Mutates storage. |
+| `restore` | Restore a run to an anchor checkpoint. Mutates storage. |
+| `rewind` | Rewind workspace and projection to a checkpoint. |
+| `watch` | Watch a run for liveness breach, optionally notify via webhook. |
 
 ## Examples
 
