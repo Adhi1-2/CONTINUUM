@@ -482,7 +482,7 @@ class SQLiteStorage(Storage):
         ``through_sequence`` must stay below the anchor marker's sequence:
         the live log always retains its anchor, so a value at or above it is
         rejected (issue #705) instead of silently deleting the anchor and
-        every live row — which would leave the next append minting a fresh
+        every live row, which would leave the next append minting a fresh
         genesis and fork the hash chain away from the archive.
         """
         from continuum.checkpoint.manager import CheckpointManager
