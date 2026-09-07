@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from continuum.events import Event, EventType
@@ -191,6 +191,18 @@ def _as_str_list(value: Any) -> list[str]:
     if isinstance(value, Iterable):
         return [str(v) for v in value]
     return [str(value)]
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Interpret a naive datetime as UTC; aware values pass through.
+
+    Event payloads are external input: an ``expires_at`` ISO string without a
+    UTC offset (``"2027-01-01"``) parses to a naive datetime, and everything
+    downstream compares against the tz-aware ``utcnow()`` — which would raise
+    TypeError and brick validation for the run (issue #704). The project
+    convention is UTC everywhere, so a missing offset is read as UTC.
+    """
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 def _replace(items: list[Any], key: str, identifier: str, updated: Any) -> bool:
@@ -467,7 +479,9 @@ class _Accumulator:
                     if event.payload.get("granted_by") is not None
                     else None
                 ),
-                "expires_at": datetime.fromisoformat(str(expires_raw)) if expires_raw else None,
+                "expires_at": (
+                    _as_utc(datetime.fromisoformat(str(expires_raw))) if expires_raw else None
+                ),
                 "reason": (
                     str(event.payload["reason"])
                     if event.payload.get("reason") is not None
