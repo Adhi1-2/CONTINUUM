@@ -144,6 +144,7 @@ class Component(StrEnum):
     MODEL = "model"
     APPROVAL = "approval"
     ENVIRONMENT = "environment"
+    PIN = "pin"
 
 
 class DiffKind(StrEnum):

@@ -203,6 +203,18 @@ def diff_states(before: SemanticState, after: SemanticState) -> StateDiff:
         describe=lambda d: f"{d.resource} {d.version or ''}".strip(),
         fields=("version", "checksum", "status", "kind"),
     )
+    # Pins are first-class state (issue #417): the active constraint set a
+    # resuming agent must honour. The semantic diff predates them, so a pin
+    # added or retracted between two states used to yield an empty diff and
+    # `continuum diff` reported "no semantic change" (issue #740).
+    entries += _compare_collection(
+        list(before.pins.values()),
+        list(after.pins.values()),
+        component=Component.PIN,
+        key=lambda p: p.constraint_id,
+        describe=lambda p: f"{p.constraint_id} {p.sha256[:12]}",
+        fields=("sha256", "status", "pinned_at"),
+    )
 
     before_model = before.model.model if before.model else None
     after_model = after.model.model if after.model else None
