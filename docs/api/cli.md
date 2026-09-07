@@ -127,27 +127,65 @@ was wrong (issue #322).
 ## hooks
 
 `continuum hooks install` writes host-side observation hooks into agent
-settings files (for example `.claude/settings.json` or `.gemini/settings.json`).
-The installed `observe` command is baked in at install time and may take one of
-two shapes:
+settings files (for example `.claude/settings.json`, `.gemini/settings.json`, or
+`.codex/hooks.json`).
+
+By default, `hooks install` configures up to three entries (depending on the
+client profile; event names and matchers below are Claude Code's, see the
+per-client notes for Gemini and Codex):
+
+- **`PostToolUse` (`observe`)**: intercepts file modifications (matching
+  `Write|Edit|MultiEdit|NotebookEdit` on Claude Code) and runs
+  `continuum observe` to record file writes as `TOOL_COMPLETED` events with
+  path, size, and sha256 hash. Gemini uses the `AfterTool` event with the
+  `write_file|replace` matcher, and Codex observes shell calls only
+  (`^Bash$|^shell$`).
+- **`SessionStart` (`briefing`)**: runs `continuum briefing` to inject the active
+  run id, goal, progress, and recovery next steps at session start or resume.
+- **`PreCompact` (`precompact`)**: runs `continuum precompact` to seal a
+  checkpoint before context compaction discards unverified transcript state
+  (configured by default on clients with a compaction event, such as Claude Code).
+
+When `--with-gate` is passed, an additional entry is installed:
+
+- **`PreToolUse` (`gate`)**: intercepts tool calls and runs `continuum gate`
+  to deny unregistered or unclaimed side effects before they fire. The matcher
+  is client specific: `*` on Claude Code, `.*` on Gemini (`BeforeTool`), and
+  `^Bash$|^shell$` on Codex, which only sees shell calls.
+
+### Flags
+
+- **`--db <path>`**: bakes a specific database path into each hook command (for
+  example `continuum --db /abs/path.db observe`), ensuring hook processes running
+  from the project root resolve the intended database without ambiguity.
+- **`--with-gate`**: installs the `PreToolUse` gate hook in addition to the default
+  hooks.
+- **`--no-precompact`**: skips installing the `PreCompact` checkpoint hook, and
+  removes one if an earlier install wrote it.
+- **`--settings <path>`**: writes to a custom settings file path instead of the
+  default location determined by the client profile.
+
+The installed commands are baked in at install time and take one of two shapes:
 
 - **`continuum` on PATH**: an absolute path to the resolved executable, for
   example `/usr/local/bin/continuum observe`.
 - **Editable / interpreter-only installs**: `/path/to/python -m continuum.cli observe`
   when no `continuum` executable is found on PATH.
 
-If you pass `--db`, that path is baked into the command too (for example
-`continuum --db /abs/path.db observe`), because hook processes run with the
-project root as cwd and the default database path would otherwise be ambiguous.
-
-To see what was installed, inspect the settings file after install:
+To inspect what was installed, view the target settings file:
 
 ```bash
-continuum hooks install claude-code --db /tmp/test.db
+continuum hooks install claude-code --db /tmp/test.db --with-gate
 cat .claude/settings.json
 ```
 
-If the command looks unexpected after moving a virtualenv, re-run the
-same install command for that host, including the original `--db` value
-when one was used (for example `continuum hooks install claude-code --db /tmp/test.db`);
-it rewrites the baked command path without changing the database target.
+If the command paths become stale after moving a virtualenv or interpreter,
+re-running `continuum hooks install` updates the baked command paths while preserving
+existing targets.
+
+To remove all installed CONTINUUM hooks from a client settings file:
+
+```bash
+continuum hooks remove claude-code
+```
+
