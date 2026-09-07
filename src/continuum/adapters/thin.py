@@ -56,7 +56,14 @@ def pydantic_ai_available() -> bool:
 
 
 def autogen_available() -> bool:
-    """True when ``autogen_core.tools`` is importable (probe only, never imports it)."""
+    """True when AutoGen core's tools module is findable in this environment.
+
+    Unlike the other two probes this one resolves a dotted name, and
+    resolving a dotted name imports its parent: ``find_spec`` loads
+    ``autogen_core`` to locate ``autogen_core.tools``. When that parent is
+    absent the call raises ``ModuleNotFoundError`` instead of returning
+    False, so a caller probing on a bare machine must be ready to catch it.
+    """
     return _flag("autogen_core.tools")
 
 
