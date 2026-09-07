@@ -37,7 +37,7 @@ from continuum.models import (
     SemanticState,
     StateStatus,
 )
-from continuum.state.semantic import ProjectionReport, project_incremental
+from continuum.state.semantic import ProjectionReport, _as_str_list, project_incremental
 
 __all__ = [
     "ExtractionContext",
@@ -155,7 +155,7 @@ class LLMExtractor:
                     decision_id=decision_id,
                     decision=str(raw.get("decision", "")),
                     reason=str(raw.get("reason", "")),
-                    evidence=[str(e) for e in raw.get("evidence", [])],
+                    evidence=_as_str_list(raw.get("evidence")),
                     status=StateStatus.REQUIRES_REVIEW,
                     provenance=provenance,
                 )
@@ -173,7 +173,7 @@ class LLMExtractor:
                 Finding(
                     finding_id=finding_id,
                     claim=str(raw.get("claim", "")),
-                    evidence=[str(e) for e in raw.get("evidence", [])],
+                    evidence=_as_str_list(raw.get("evidence")),
                     confidence=min(max(confidence, 0.0), 1.0),
                     status=StateStatus.REQUIRES_REVIEW,
                     provenance=provenance,
