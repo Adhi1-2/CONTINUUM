@@ -12,12 +12,12 @@ Your dashboard is presentation. CONTINUUM stays the substrate. That separation i
 
 ## Substrates consumed
 
-### 1. Resume contract (`continuum resume --json`)
+### 1. Resume contract (`continuum --json resume`)
 
 Shell:
 
 ```bash
-continuum resume my-task --json | python -m json.tool
+continuum --json resume my-task | python -m json.tool
 ```
 
 Python:
@@ -139,7 +139,7 @@ For an external verifier that holds only the attestation file:
 ```bash
 continuum attest-keygen --out signer.pem --pub signer.pem.pub
 continuum attest my-task --key signer.pem --out my-task.attest.json
-continuum attest-verify my-task --attest my-task.attest.json --json | python -m json.tool
+continuum --json attest-verify my-task --attest my-task.attest.json | python -m json.tool
 ```
 
 Verdicts are `SIGNED`, `ALTERED`, or `UNTRUSTED` and appear in both human text and JSON.
@@ -251,7 +251,7 @@ print("claimed", out.key)
 PY
 
 # SIGKILL simulation done, now ask the dashboard substrate what it should show
-continuum --db /tmp/byod-demo.db resume dashboard-demo --json | python -m json.tool | head -n 60
+continuum --db /tmp/byod-demo.db --json resume dashboard-demo | python -m json.tool | head -n 60
 continuum --db /tmp/byod-demo.db export-evidence dashboard-demo | wc -l
 continuum --db /tmp/byod-demo.db verify dashboard-demo
 ```
@@ -285,7 +285,7 @@ Measured from a fresh checkout:
 
 1. `uv pip install -e ".[dev]"` (about 40s)
 2. `continuum start my-task --goal "trial"` (1s)
-3. `python dashboard_minimal.py` (or `continuum resume my-task --json` from any UI) (1s)
+3. `python dashboard_minimal.py` (or `continuum --json resume my-task` from any UI) (1s)
 4. Simulate kill, re-poll `GET /api/run/my-task/resume` and see `request_human` (under 1s)
 5. Reconcile, re-poll, see `resume` (under 1s)
 
