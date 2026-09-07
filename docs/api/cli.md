@@ -131,11 +131,15 @@ settings files (for example `.claude/settings.json`, `.gemini/settings.json`, or
 `.codex/hooks.json`).
 
 By default, `hooks install` configures up to three entries (depending on the
-client profile):
+client profile; event names and matchers below are Claude Code's, see the
+per-client notes for Gemini and Codex):
 
 - **`PostToolUse` (`observe`)**: intercepts file modifications (matching
-  `Write|Edit|MultiEdit|NotebookEdit`) and runs `continuum observe` to record
-  file writes as `TOOL_COMPLETED` events with path, size, and sha256 hash.
+  `Write|Edit|MultiEdit|NotebookEdit` on Claude Code) and runs
+  `continuum observe` to record file writes as `TOOL_COMPLETED` events with
+  path, size, and sha256 hash. Gemini uses the `AfterTool` event with the
+  `write_file|replace` matcher, and Codex observes shell calls only
+  (`^Bash$|^shell$`).
 - **`SessionStart` (`briefing`)**: runs `continuum briefing` to inject the active
   run id, goal, progress, and recovery next steps at session start or resume.
 - **`PreCompact` (`precompact`)**: runs `continuum precompact` to seal a
@@ -144,8 +148,10 @@ client profile):
 
 When `--with-gate` is passed, an additional entry is installed:
 
-- **`PreToolUse` (`gate`)**: intercepts all tool calls (`*`) and runs
-  `continuum gate` to deny unregistered or unclaimed side effects before they fire.
+- **`PreToolUse` (`gate`)**: intercepts tool calls and runs `continuum gate`
+  to deny unregistered or unclaimed side effects before they fire. The matcher
+  is client specific: `*` on Claude Code, `.*` on Gemini (`BeforeTool`), and
+  `^Bash$|^shell$` on Codex, which only sees shell calls.
 
 ### Flags
 
