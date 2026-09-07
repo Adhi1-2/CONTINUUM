@@ -20,6 +20,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from continuum import __version__
 from continuum.cli.exitcodes import ExitCode
 from continuum.storage.base import Storage
 from continuum.tui import model
@@ -27,13 +28,27 @@ from continuum.tui.model import RunRow
 
 __all__ = ["TuiApp", "run_tui"]
 
+#: The splash logo, hand-drawn in the ANSI Shadow style and joined at full
+#: glyph width so it fits a standard 80-column terminal (78 columns exactly).
+_LOGO_LINES = (
+    " ██████╗ ██████╗ ███╗   ██╗████████╗██╗███╗   ██╗██╗   ██╗██╗   ██╗███╗   ███╗",
+    "██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██║████╗  ██║██║   ██║██║   ██║████╗ ████║",
+    "██║     ██║   ██║██╔██╗ ██║   ██║   ██║██╔██╗ ██║██║   ██║██║   ██║██╔████╔██║",
+    "██║     ██║   ██║██║╚██╗██║   ██║   ██║██║╚██╗██║██║   ██║██║   ██║██║╚██╔╝██║",
+    "╚██████╗╚██████╔╝██║ ╚████║   ██║   ██║██║ ╚████║╚██████╔╝╚██████╔╝██║ ╚═╝ ██║",
+    " ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═╝     ╚═╝",
+)
+_LOGO_WIDTH = max(len(line) for line in _LOGO_LINES)
+_LANDING_TAGLINE = "durable recovery for long-running agents"
+
 
 class TuiApp:
     """State machine for the terminal dashboard.
 
-    The view is two-level: a runs index, then one run's detail with tabs
-    (overview, recovery, checkpoints, actions, events, family, budget).
-    Table tabs carry a selectable cursor; text tabs only scroll.
+    The view is three-level: a landing splash (logo, version, run count),
+    then a runs index, then one run's detail with tabs (overview, recovery,
+    checkpoints, actions, events, family, budget). Table tabs carry a
+    selectable cursor; text tabs only scroll.
     """
 
     TABS = ("overview", "recovery", "checkpoints", "actions", "events", "family", "budget")
@@ -41,7 +56,8 @@ class TuiApp:
 
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
-        self.view = "runs"
+        self.view = "landing"
+        self.width = 80  # the driver restamps this from the real screen each draw
         self.tab = 0
         self.index = 0  # selection in the runs index
         self.cursor = -1  # selected body line in a table tab, -1 when none
@@ -59,7 +75,9 @@ class TuiApp:
 
     def refresh(self) -> None:
         """Reload the current view's data from storage. Read-only."""
-        if self.view == "runs":
+        if self.view in ("landing", "runs"):
+            # the landing screen shows the run count, and leaving it lands on
+            # the runs list, so both views read the same rows
             self.rows = model.run_rows(self.storage)
             self.cursor = -1  # the runs list marks its selection itself
             if self.rows:
@@ -140,6 +158,8 @@ class TuiApp:
 
     def header(self) -> str:
         """The top line: where we are and what view is active."""
+        if self.view == "landing":
+            return ""
         if self.view == "runs":
             return "CONTINUUM  runs  (enter: open, r: refresh, ?: help, q: quit)"
         run_id = self._run_id() or "-"
@@ -150,10 +170,31 @@ class TuiApp:
             "(left/right or 1-7: tabs, esc: runs, r: refresh, q: quit)"
         )
 
+    def _landing_lines(self) -> list[str]:
+        """The splash page: logo, version, how many runs the store holds."""
+
+        def center(text: str) -> str:
+            return " " * max(0, (self.width - len(text)) // 2) + text
+
+        if self.width >= _LOGO_WIDTH + 2:
+            art: list[str] = list(_LOGO_LINES)
+        else:  # too narrow for the logo: a banner that fits, not one that clips
+            art = ["C O N T I N U U M"]
+        runs_line = f"{len(self.rows)} run(s) recorded" if self.rows else "no runs recorded yet"
+        return (
+            [""]
+            + [center(line) for line in art]
+            + ["", ""]
+            + [center(_LANDING_TAGLINE), center(f"v{__version__}   {runs_line}")]
+            + ["", "", center("press any key to open the dashboard")]
+        )
+
     def body_lines(self) -> list[str]:
         """The body: the help overlay when asked for, the view otherwise."""
         if self.show_help:
             return list(_HELP_LINES)
+        if self.view == "landing":
+            return self._landing_lines()
         if self.view == "runs":
             if not self.rows:
                 return ['No runs recorded. Start one with: continuum start <id> --goal "..."']
@@ -184,6 +225,8 @@ class TuiApp:
             return self.message
         if self.show_help:
             return "? hides help"
+        if self.view == "landing":
+            return "press any key to open the dashboard   q quits"
         if self.view == "runs":
             return "runs: enter open | r refresh | c checkpoint | x complete | y confirm"
         return "1-7 tabs | esc back | y/n reconcile (actions tab) | c checkpoint | x complete"
@@ -199,6 +242,16 @@ class TuiApp:
             return True
         if key == "q":
             return False
+        if self.view == "landing":
+            if key == "resize":  # a resize is not a keystroke: keep the splash
+                return True
+            # the splash promises "press any key", so any key (except q above)
+            # opens the dashboard; there is nothing else to do on this screen
+            self.view = "runs"
+            self.message = ""
+            self.scroll = 0
+            self.refresh()
+            return True
         if key == "?":
             self.show_help = not self.show_help
             return True
@@ -400,6 +453,7 @@ def _driver(curses: Any, screen: Any, app: TuiApp, refresh_seconds: float) -> in
     while True:
         screen.erase()
         height, width = screen.getmaxyx()
+        app.width = width  # the landing screen centres the logo on this
         _addline(screen, 0, 0, app.header(), curses.A_BOLD)
         body = app.body_lines()
         available = max(1, height - 3)

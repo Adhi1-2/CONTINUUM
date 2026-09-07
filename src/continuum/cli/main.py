@@ -4065,6 +4065,48 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 
 
+def _bare_invocation(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, out: Any, err: Any
+) -> int:
+    """`continuum` with no subcommand: open the TUI, or print help.
+
+    The interactive path is what an operator typing bare `continuum` at a
+    shell expects (issue #782): the full-screen dashboard with its landing
+    splash. Piped output, `--json` and platforms without curses keep the
+    help text unchanged: a script that runs `continuum` blind must never
+    find a curses screen where it expected usage text.
+    """
+    interactive = not args.json and _stream_is_a_tty(out) and _curses_available()
+    if not interactive:
+        parser.print_help(file=out)
+        return ExitCode.OK
+    from continuum.tui import run_tui
+
+    try:
+        storage = open_storage(args.db)
+    except (StorageError, ValueError, NotImplementedError, RuntimeError) as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    except sqlite3.Error as exc:
+        print(f"error: cannot open storage at '{args.db}': {exc}", file=err)
+        return ExitCode.ERROR
+    try:
+        return run_tui(storage, err=err)
+    finally:
+        storage.close()
+
+
+def _stream_is_a_tty(out: Any) -> bool:
+    isatty = getattr(out, "isatty", None)
+    return callable(isatty) and bool(isatty())
+
+
+def _curses_available() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("curses") is not None
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -4085,8 +4127,7 @@ def main(
         Palette(False) if args.json else Palette.for_stream(out, force=getattr(args, "color", None))
     )
     if getattr(args, "func", None) is None:
-        parser.print_help(file=out)
-        return ExitCode.OK
+        return _bare_invocation(parser, args, out, err)
 
     # hooks never touches a run, so it must not create an empty database as a
     # side effect of editing a settings file.

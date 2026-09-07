@@ -4,6 +4,12 @@ The `continuum` command is the command-line surface, also usable in scripts. Exi
 codes are a safety contract: only a verified-safe run exits `0`, so
 `continuum resume "$RUN" && ./start-agent.sh` cannot launch onto stale state.
 
+Typing bare `continuum` at an interactive terminal opens the full-screen
+dashboard on its landing splash (issue #782); piped or non-terminal output,
+`--json`, and platforms without curses print the help text instead, so scripts
+that run `continuum` blind never find a curses screen where they expected
+usage text.
+
 ```bash
 continuum <command> [args]                    # storage defaults to ./continuum.db
 continuum --db <url-or-path> <command>        # storage URL or path (default: continuum.db)

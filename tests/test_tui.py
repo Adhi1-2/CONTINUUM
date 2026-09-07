@@ -168,14 +168,60 @@ def test_recovery_lines_render_the_verdict_and_the_family_block(
 
 
 # --------------------------------------------------------------------------- #
+# the landing splash
+# --------------------------------------------------------------------------- #
+
+
+def test_the_app_opens_on_a_landing_screen_with_the_logo(db: str) -> None:
+    run("--db", db, "start", "r1", "--goal", "g")
+    app = TuiApp(SQLiteStorage(db))
+
+    assert app.view == "landing"
+    app.width = 100  # wide enough for the ASCII logo
+    body = "\n".join(app.body_lines())
+    assert "██╔═══██╗" in body  # the logo, not just the word
+    assert "run(s) recorded" in body
+    assert "press any key to open the dashboard" in app.footer()
+
+
+def test_a_narrow_terminal_gets_a_banner_that_fits(db: str) -> None:
+    app = TuiApp(SQLiteStorage(db))
+    app.width = 40
+    body = app.body_lines()
+    assert all(len(line) <= 40 for line in body)
+    assert "C O N T I N U U M" in body[1]
+
+
+def test_any_key_leaves_the_landing_screen(db: str) -> None:
+    run("--db", db, "start", "r1", "--goal", "g")
+    app = TuiApp(SQLiteStorage(db))
+
+    assert app.handle_key(" ") is True
+    assert app.view == "runs"
+    assert "r1" in "\n".join(app.body_lines())
+
+
+def test_q_quits_from_the_landing_screen(db: str) -> None:
+    app = TuiApp(SQLiteStorage(db))
+    assert app.handle_key("q") is False
+
+
+# --------------------------------------------------------------------------- #
 # the app state machine
 # --------------------------------------------------------------------------- #
+
+
+def _enter_dashboard(app: TuiApp) -> None:
+    """Dismiss the landing splash: any key opens the dashboard."""
+    assert app.handle_key(" ") is True
+    assert app.view == "runs"
 
 
 def test_the_app_lists_runs_and_quits_on_q(db: str) -> None:
     run("--db", db, "start", "ok_run", "--goal", "fine")
     run("--db", db, "start", "other", "--goal", "more work")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
 
     assert app.view == "runs"
     body = "\n".join(app.body_lines())
@@ -187,6 +233,7 @@ def test_the_app_lists_runs_and_quits_on_q(db: str) -> None:
 def test_enter_opens_the_detail_and_esc_returns(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "analyse documents")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
 
     app.handle_key("enter")
     assert app.view == "detail"
@@ -203,6 +250,7 @@ def test_tab_keys_switch_views(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
     ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:I-1")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
     app.handle_key("enter")
 
     for tab in ("4", "5", "6", "7", "3", "2"):
@@ -221,6 +269,7 @@ def test_tab_keys_switch_views(db: str) -> None:
 def test_the_help_overlay_lists_the_keys(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
     app.handle_key("?")
     assert "quit" in "\n".join(app.body_lines())
 
@@ -230,6 +279,7 @@ def test_reconcile_requires_confirmation_and_only_y_writes(db: str) -> None:
     ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:I-1")
 
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
     app.handle_key("enter")
     app.handle_key("4")  # actions tab, cursor on the one action
     app.handle_key("y")  # queue reconcile-as-occurred
@@ -258,6 +308,7 @@ def test_a_settled_action_cannot_be_reconciled_again_from_the_tui(db: str) -> No
     ledger.reconcile(key, occurred=True)
 
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
     app.handle_key("enter")
     app.handle_key("4")
     app.handle_key("y")
@@ -268,6 +319,7 @@ def test_a_settled_action_cannot_be_reconciled_again_from_the_tui(db: str) -> No
 def test_checkpoint_and_complete_confirmations_write(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
 
     app.handle_key("c")
     assert app.pending is not None
@@ -285,6 +337,7 @@ def test_checkpoint_and_complete_confirmations_write(db: str) -> None:
 def test_confirm_state_writes_review_confirmed(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
 
     app.handle_key("y")
     assert "REVIEW_CONFIRMED" in app.pending[0]
@@ -296,6 +349,7 @@ def test_confirm_state_writes_review_confirmed(db: str) -> None:
 def test_a_cancelled_action_writes_nothing(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
     app = TuiApp(SQLiteStorage(db))
+    _enter_dashboard(app)
     events_before = len(SQLiteStorage(db).read_events("r1"))
 
     app.handle_key("c")
@@ -361,13 +415,24 @@ class _FakeScreen:
 
 def test_the_driver_draws_and_honours_keys(db: str) -> None:
     run("--db", db, "start", "r1", "--goal", "g")
-    screen = _FakeScreen([_FakeCurses.KEY_DOWN, _FakeCurses.KEY_ENTER, ord("4")])
+    # a space dismisses the landing splash, then the driver is driven normally
+    screen = _FakeScreen([ord(" "), _FakeCurses.KEY_DOWN, _FakeCurses.KEY_ENTER, ord("4")])
     code = _driver(_FakeCurses(), screen, TuiApp(SQLiteStorage(db)), 0.0)
 
     assert code == ExitCode.OK
     drawn = "\n".join(text for _, text in screen.lines)
     assert "CONTINUUM" in drawn
     assert "actions" in drawn
+
+
+def test_the_driver_draws_the_splash_first(db: str) -> None:
+    run("--db", db, "start", "r1", "--goal", "g")
+    screen = _FakeScreen([])  # the default key is q: the splash is all we see
+    _driver(_FakeCurses(), screen, TuiApp(SQLiteStorage(db)), 0.0)
+
+    drawn = "\n".join(text for _, text in screen.lines)
+    assert "██╔═══██╗" in drawn  # the logo: 80 columns is just wide enough
+    assert "press any key" in drawn
 
 
 def test_run_tui_refuses_when_curses_is_missing(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -401,3 +466,64 @@ def test_the_tui_command_is_registered_and_documented(
     help_text = capsys.readouterr().out
     assert "--refresh" in help_text
     assert "dashboard" in help_text
+
+
+# --------------------------------------------------------------------------- #
+# bare `continuum`: splash when interactive, help otherwise
+# --------------------------------------------------------------------------- #
+
+
+class _Tty(io.StringIO):
+    """A stream that claims to be a terminal, as a real shell would give."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_bare_continuum_opens_the_tui_when_interactive(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run_tui(storage: Any, **kw: Any) -> int:
+        seen["storage"] = storage
+        return 77
+
+    monkeypatch.setattr("continuum.tui.run_tui", fake_run_tui)
+    code = main(["--db", db], out=_Tty())
+
+    assert code == 77
+    assert seen["storage"] is not None
+
+
+def test_bare_continuum_prints_help_when_piped(db: str) -> None:
+    """A script running `continuum` blind must find usage text, not curses."""
+    code, out, _ = run("--db", db)
+
+    assert code == ExitCode.OK
+    assert "usage:" in out
+    assert "dashboard" in out
+
+
+def test_bare_continuum_prints_help_with_json(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--json` is a machine contract: it never opens an interactive screen."""
+
+    def fail_tui(storage: Any, **kw: Any) -> int:
+        raise AssertionError("the tui must not open under --json")
+
+    monkeypatch.setattr("continuum.tui.run_tui", fail_tui)
+    code, out, _ = run("--db", db, "--json")
+
+    assert code == ExitCode.OK
+    assert "usage:" in out
+
+
+def test_bare_continuum_reports_an_unopenable_database(db: str, tmp_path: Path) -> None:
+    bad = tmp_path / "not-a-dir" / "continuum.db"
+    out, err = _Tty(), io.StringIO()
+
+    code = main(["--db", str(bad)], out=out, err=err)
+
+    assert code == ExitCode.ERROR
+    assert "error:" in err.getvalue()
+    assert "usage:" not in out.getvalue()
