@@ -478,6 +478,12 @@ class SQLiteStorage(Storage):
         crash in between leave an anchored live log whose prefix never
         reached the archive, so verify would trust a genesis that was never
         earned.
+
+        ``through_sequence`` must stay below the anchor marker's sequence:
+        the live log always retains its anchor, so a value at or above it is
+        rejected (issue #705) instead of silently deleting the anchor and
+        every live row — which would leave the next append minting a fresh
+        genesis and fork the hash chain away from the archive.
         """
         from continuum.checkpoint.manager import CheckpointManager
 
@@ -493,6 +499,14 @@ class SQLiteStorage(Storage):
         storage_version = lv
         if storage_version is None:
             raise ValueError(f"run {run_id!r} could not be anchored: no projectable state")
+        # The anchor marker is appended at the head of the log in the
+        # transaction below, so its sequence is the current head + 1.
+        anchor_sequence = self.last_sequence(run_id) + 1
+        if through_sequence is not None and through_sequence >= anchor_sequence:
+            raise ValueError(
+                f"through_sequence {through_sequence} would archive the anchor marker"
+                f" at sequence {anchor_sequence}: the live log must retain its anchor"
+            )
         through = (
             through_sequence
             if through_sequence is not None
