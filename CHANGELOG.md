@@ -8,6 +8,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **External probe for consumed authorities via reconcilers.json (#557).**
+  `reconcile --authority <id>` runs the configured authority probe with the
+  recorded consumption payload on stdin; `valid=true` appends
+  `AUTHORITY_RECONCILED` and clears the consumed mark, `valid=false` keeps it
+  blocked, and anything else leaves it blocked. Covered by
+  `tests/test_authority_probe.py`, including the negative test that a restore
+  does not resurrect.
+
+- **Liveness watchdog and risk-informed recovery (#302, #303).**
+  Cadence contracts drive `continuum watch`, which appends
+  `LIVENESS_SILENCE_DETECTED` on breach and `LIVENESS_RECOVERED` on recovery
+  (webhook delivery is fail-open); `RISK_OBSERVED` ingestion maps through
+  `.continuum/risk-policy.json` with risks arriving as `EXTERNAL_MONITOR`
+  witnesses, and the contract carries a `triggering_risks` section. Covered
+  by the liveness, risk, and watch suites.
+
+- **Reconciler registry accepts documented shapes and refuses bool timeouts (#322).**
+  Probe entries require a command and a positive numeric timeout; a boolean
+  timeout is refused rather than read as seconds. The registry shape and the
+  default timeout are pinned by `tests/test_reconcilers.py`.
+
+- **Bench harness records byte counts, revalidation calls, and resume tokens (#568).**
+  Per-strategy counters flow into the shared report envelope, covered by
+  `tests/test_benchmark_counters.py`.
+
 - **`examples/demo.ipynb`, the crash-recovery walkthrough as a notebook (#283).**
   The lowest-friction way to watch a recovery was `docker run`, which still wants
   a daemon; this wants a browser. Colab and Binder badges in the Quick Start
@@ -563,7 +588,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~1,918 collected, ~1,880 passed, ~38 skipped on a minimal env).
+  (~2,053 collected, ~2,030 passed, ~23 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
