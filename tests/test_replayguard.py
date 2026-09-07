@@ -25,6 +25,7 @@ from continuum.events import EventType  # noqa: E402
 from continuum.models import ActionStatus, Run  # noqa: E402
 from continuum.replayguard import (  # noqa: E402
     GuardKind,
+    ReplayBlocked,
     evaluate,
     langgraph_protected_node,
     protected_call,
@@ -90,6 +91,32 @@ def test_decision_table_matches_the_gate_contract(db: str) -> None:
     assert verdict(db, "send_invoice", "i:3").kind is GuardKind.BLOCK_UNCERTAIN
     seed(db, "send_invoice", "i:4", ActionStatus.FAILED)
     assert verdict(db, "send_invoice", "i:4").kind is GuardKind.DENY_RECLAIM
+
+
+def test_block_uncertain_decision_carries_its_key(db: str) -> None:
+    # The decision table contract: every decision names the ledger key it is
+    # about, so protected_call can act on it. BLOCK_UNCERTAIN used to be built
+    # without the key, which turned the documented ReplayBlocked into a bare
+    # AssertionError at the `decision.key is not None` checkpoint (issue #735).
+    seed(db, "send_invoice", "i:3", ActionStatus.UNKNOWN)
+    assert verdict(db, "send_invoice", "i:3").key is not None
+
+
+def test_protected_call_raises_replayblocked_for_an_uncertain_action(db: str) -> None:
+    # The public contract: uncertain states raise ReplayBlocked rather than
+    # guessing. With the key missing the wrapper died on an AssertionError
+    # first, so callers could not catch the documented exception (issue #735).
+    seed(db, "send_invoice", "i:5", ActionStatus.UNKNOWN)
+    with pytest.raises(ReplayBlocked) as excinfo:
+        protected_call(
+            SQLiteStorage(db),
+            "run_1",
+            action_type="send_invoice",
+            key="i:5",
+            fn=lambda: "SHOULD_NOT_RUN",
+        )
+    assert excinfo.value.decision.kind is GuardKind.BLOCK_UNCERTAIN
+    assert excinfo.value.decision.key is not None
 
 
 def make_run(db: str) -> None:
