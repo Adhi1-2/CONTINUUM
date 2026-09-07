@@ -144,8 +144,8 @@ def test_granting_an_approval_that_was_never_requested_still_records_it() -> Non
 
 def test_naive_expires_at_is_folded_as_utc() -> None:
     """Issue #704: an expires_at payload without a UTC offset must not fold to
-    a naive datetime — everything downstream compares against the tz-aware
-    utcnow(), and a naive value would TypeError and brick validation."""
+    a naive datetime, because everything downstream compares against the
+    tz-aware utcnow(), and a naive value would TypeError and brick validation."""
     log = started(EventLog())
     log.append(
         "run_1",

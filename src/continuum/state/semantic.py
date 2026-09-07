@@ -198,7 +198,7 @@ def _as_utc(value: datetime) -> datetime:
 
     Event payloads are external input: an ``expires_at`` ISO string without a
     UTC offset (``"2027-01-01"``) parses to a naive datetime, and everything
-    downstream compares against the tz-aware ``utcnow()`` — which would raise
+    downstream compares against the tz-aware ``utcnow()``, which would raise
     TypeError and brick validation for the run (issue #704). The project
     convention is UTC everywhere, so a missing offset is read as UTC.
     """
