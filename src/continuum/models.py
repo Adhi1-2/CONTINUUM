@@ -917,6 +917,15 @@ class Action(BaseModel):
     consumed_inputs: ConsumedInputs = Field(default_factory=ConsumedInputs)
     """Commitment inputs consumed to produce this action (issue #295)."""
 
+    @field_validator("origin_digest")
+    @classmethod
+    def _origin_digest_is_sha256(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("origin_digest must be 64 lowercase hex characters")
+        return value
+
 
 class ActionRecordPayload(BaseModel):
     """Payload for ACTION_RECORDED (issue #551).
@@ -970,15 +979,6 @@ def validate_caused_by(caused_by: list[str] | None, known_ids: set[str] | None =
     if known_ids is not None:
         _validate_caused_by_known(caused_by, known_ids)
     return list(caused_by)
-
-    @field_validator("origin_digest")  # type: ignore[misc]
-    @classmethod
-    def _origin_digest_is_sha256(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if not _SHA256_PATTERN.fullmatch(value):
-            raise ValueError("origin_digest must be 64 lowercase hex characters")
-        return value
 
 
 class UnknownSideEffect(RuntimeError):

@@ -28,7 +28,7 @@ behaviour, not a leak.
 The optional dependency
 -----------------------
 
-The ``mcp`` SDK is an optional extra, but ``pip install continuum`` installs
+The ``mcp`` SDK is an optional extra, but ``pip install continuum-agent`` installs
 the ``continuum-mcp`` console script regardless. So the entry point exists in
 environments where its dependency does not, and importing the SDK at module
 scope makes that combination fail with a bare ``ModuleNotFoundError``.
@@ -1609,7 +1609,7 @@ def main(argv: list[str] | None = None) -> int:
             raise
         print(
             f"error: the MCP server needs the optional 'mcp' dependency, which is "
-            f"not importable ({exc}). Install it with: pip install 'continuum[mcp]'",
+            f"not importable ({exc}). Install it with: pip install continuum-agent[mcp]",
             file=sys.stderr,
         )
         return 1
