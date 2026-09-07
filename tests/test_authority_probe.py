@@ -265,3 +265,35 @@ def test_probe_payload_keeps_consumption_context_after_compaction(
         assert received["consumed_at"]
     finally:
         storage.close()
+
+
+def test_probe_for_an_authority_that_was_never_consumed_settles_with_a_bare_id(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No AUTHORITY_CONSUMED row at all: the scan exhausts and the probe still runs.
+
+    Covers the loop-exhaustion branch of the consumption scan (every other
+    test finds a row and breaks). The payload is intentionally bare: only
+    authority_id, with no consumption context to lose.
+    """
+    storage = _storage()
+    try:
+        cfg = tmp_path / "reconcilers.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "probes": {
+                        "auth-never-consumed": {
+                            "command": _probe_command('{"valid": true}'),
+                            "timeout": 5,
+                        }
+                    }
+                }
+            )
+        )
+        probes = load_reconcilers(cfg)
+        report = settle_authority(storage, "run_1", "auth-never-consumed", probes)
+        assert report.valid is True
+        assert report.settled is True
+    finally:
+        storage.close()
