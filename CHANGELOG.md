@@ -191,6 +191,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`reconcile --auto` settles archived actions and probes authorities with
+  full consumption context after compaction (#647).**
+  `ActionLedger.pending` folds archived plus live events, but
+  `reconcilers._key_for` folded only the live tail, so one action claimed
+  before a compaction aborted the whole settle report with `LookupError`;
+  `settle_authority` scanned only live events for the `AUTHORITY_CONSUMED`
+  row, silently handing the probe a bare `authority_id` payload without
+  `consumer_run_id`, `via_action_id`, or `sequence`. Both now read full
+  history via `read_all_events`, the same archive-aware pattern the library
+  reconciliation path already used. Covered by `tests/test_reconcilers.py`
+  and `tests/test_authority_probe.py`.
+
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
   forensic joins (#615, #616). Compaction no longer hides spent authority or

@@ -228,3 +228,40 @@ def test_authority_probe_no_probe_registered_leaves_blocked(tmp_path: pathlib.Pa
         assert "auth-no-probe" in consumed
     finally:
         storage.close()
+
+
+def test_probe_payload_keeps_consumption_context_after_compaction(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Post-compaction probes must still see how the authority was consumed (issue #647).
+
+    The AUTHORITY_CONSUMED row can predate a compaction. settle_authority used
+    to scan the live tail only, silently handing the probe a bare authority_id
+    payload with no consumer_run_id, via_action_id, or sequence.
+    """
+    storage = _storage()
+    try:
+        record_authority_consumed(storage, "run_1", "auth-compact-1", via_action_id="act-1")
+        storage.compact_run("run_1", through_sequence=storage.last_sequence("run_1"))
+        # Premise guard: the consumption row really is archived, not live.
+        live_types = [e.type for e in storage.read_events("run_1")]
+        assert EventType.AUTHORITY_CONSUMED not in live_types
+
+        payload_file = tmp_path / "payload.json"
+        # Single quotes inside the double-quoted -c argument survive both sh
+        # grouping and cmd's C-runtime unescaping (see _probe_command).
+        cmd = f"\"{sys.executable}\" -c \"import sys; open('{payload_file.as_posix()}', 'w').write(sys.stdin.read())\""
+        cfg = tmp_path / "reconcilers.json"
+        cfg.write_text(json.dumps({"probes": {"auth-compact-1": {"command": cmd, "timeout": 5}}}))
+        probes = load_reconcilers(cfg)
+        report = settle_authority(storage, "run_1", "auth-compact-1", probes)
+        assert report.settled is False  # prints no verdict line: stays unknown
+
+        received = json.loads(payload_file.read_text(encoding="utf-8"))
+        assert received["authority_id"] == "auth-compact-1"
+        assert received["consumer_run_id"] == "run_1"
+        assert received["via_action_id"] == "act-1"
+        assert isinstance(received["sequence"], int)
+        assert received["consumed_at"]
+    finally:
+        storage.close()
