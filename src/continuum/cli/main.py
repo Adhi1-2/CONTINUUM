@@ -4010,6 +4010,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="bind address (default: 127.0.0.1; 0.0.0.0 exposes recovery data).",
     )
 
+    def cmd_tui(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+        """Open the full-screen terminal dashboard (issue #782), q quits.
+
+        Read-only until an action is confirmed: browsing and refreshing never
+        write, and every mutating verb shows its exact write in the footer and
+        waits for a further y before performing it. Refuses rather than
+        half-rendering when curses is unavailable or stdout is not a TTY.
+        """
+        from continuum.tui import run_tui
+
+        return run_tui(storage, refresh_seconds=args.refresh, err=err)
+
+    tui = add(
+        "tui",
+        cmd_tui,
+        "Full-screen terminal dashboard: monitor and control runs (q quits).",
+    )
+    tui.add_argument(
+        "--refresh",
+        type=float,
+        default=0.0,
+        help="auto-refresh interval in seconds (default: 0, refresh on demand with r).",
+    )
+
     watch = with_run(
         add("watch", cmd_watch, "Watch a run for liveness breach, optionally notify via webhook.")
     )

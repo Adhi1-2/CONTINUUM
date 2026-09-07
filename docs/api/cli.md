@@ -47,6 +47,7 @@ continuum --json <command>                    # machine-readable output
 | `attest-verify <run_id> --attest <file>` | Verify a signed attestation against the live chain. |
 | `serve` | Run the Tier 0 newline-delimited JSON sidecar (no MCP dependency). |
 | `dashboard` | Serve the dashboard (presentation over run data). |
+| `tui [--refresh <seconds>]` | Full-screen terminal dashboard: monitor and control runs, read-only until an action is confirmed (`q` quits). |
 | `export-evidence` | Export evidence as content-addressed JSON lines. Read-only. |
 | `forget` | Enumerate and tombstone memory records for a tenant. Mutates unless --dry-run. |
 | `health` | Advisory prefix-trust health check. Read-only. |
