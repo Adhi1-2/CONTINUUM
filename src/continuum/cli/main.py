@@ -1408,7 +1408,10 @@ def cmd_budget(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         print(f"error: budget registry invalid: {exc}", file=err)
         return ExitCode.ERROR
 
-    events = storage.read_events(args.run_id)
+    # Archive-aware (issue #734): compaction moves attempts into the archive,
+    # so a live-tail-only count understates attempts and overstates remaining
+    # after every compaction.
+    events = storage.read_all_events(args.run_id)
     types_seen = sorted(
         {
             e.payload.get("action", {}).get("action_type")

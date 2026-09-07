@@ -1276,7 +1276,10 @@ def build_server(
         )
 
         if not settled:
-            events = ctx.storage.read_events(run_id)
+            # Archive-aware (issue #734): attempts live in the event log, and
+            # compaction moves failed attempts into the archive. Counting only
+            # the live tail reset an exhausted budget after every compaction.
+            events = ctx.storage.read_all_events(run_id)
             # Counted per key, so the budget caps retries of *this* operation
             # rather than the run's distinct work of this type (issue #368).
             claim_key = str(

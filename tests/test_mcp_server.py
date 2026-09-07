@@ -2277,6 +2277,65 @@ async def test_a_completed_action_still_deduplicates_at_budget(
 
 
 @pytest.mark.asyncio
+async def test_the_retry_budget_survives_compaction(
+    server_ctx: tuple[Any, Any],
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate counted attempts from the live log only (issue #734).
+
+    Compaction archives the ACTION_RECORDED events of the failed attempts, so a
+    live-tail-only count dropped to zero and an exhausted budget re-opened,
+    granting a fresh allowance to a model hammering a failing upstream after
+    every compaction.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".continuum").mkdir()
+    (tmp_path / ".continuum" / "budgets.json").write_text('{"default_max_attempts": 2}')
+    server, ctx = server_ctx
+    await seed_run(server)
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    for _ in range(2):
+        stuck = await call(
+            server,
+            "continuum_intercept_action",
+            run_id="run_1",
+            action_type="charge",
+            key="charge:stuck",
+        )
+        await call(
+            server,
+            "continuum_fail_action",
+            run_id="run_1",
+            action_key=stuck["action_key"],
+            error="500 from upstream",
+            certain=True,
+        )
+    with pytest.raises(ToolError, match="retry budget exhausted"):
+        await call(
+            server,
+            "continuum_intercept_action",
+            run_id="run_1",
+            action_type="charge",
+            key="charge:stuck",
+        )
+
+    # Compaction moves the failed attempts into the archive; the exhausted
+    # budget must survive that.
+    ctx.storage.compact_run("run_1")
+    with pytest.raises(ToolError, match="retry budget exhausted"):
+        await call(
+            server,
+            "continuum_intercept_action",
+            run_id="run_1",
+            action_type="charge",
+            key="charge:stuck",
+        )
+
+
+@pytest.mark.asyncio
 async def test_a_never_retried_operation_is_not_blocked_by_its_neighbours(
     server_ctx: tuple[Any, Any],
     tmp_path: Any,
