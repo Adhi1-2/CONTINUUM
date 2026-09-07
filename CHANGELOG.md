@@ -189,6 +189,17 @@ All notable changes to this project are documented here. The format follows
   `append_event`'s `Origin.DETERMINISTIC` default and a thin-adapter run is not
   held for review the way an MCP-reported one is. Docs-only, no runtime change.
 
+- **`src/continuum/adapters/thin.py` is fully documented (#680, follows #607).**
+  The thin hook adapters carried 12 undocumented public names (14 counting the
+  two async capability methods the issue's AST snippet misses because
+  `ast.AsyncFunctionDef` is not `ast.FunctionDef`), including the entry points
+  contributors actually call: the three `*_available` probes, the shared
+  guard's `ledger`, `claim`, `complete` and `fail`, the CrewAI `before`/`after`
+  hooks and their `uninstall`, the AutoGen `run_json_wrapped`, and
+  `ContinuumPydanticHooks`. Every docstring says what a caller needs: what the
+  name binds or settles, what it returns, and the pass-through/no-op rules that
+  keep wrapping durability-only. Docstrings only, no runtime change.
+
 ### Fixed
 
 - Preserve archived action history in grant and authority enforcement, CLI and
