@@ -125,10 +125,15 @@ class FileProvider(EnvironmentProvider):
             try:
                 stat = path.stat()
                 if self.max_bytes is not None and stat.st_size > self.max_bytes:
+                    # UNKNOWN_VERSION, not a synthetic "size:<n>" stamp: a size
+                    # is not an identity, but diff_environments compared the old
+                    # stamp as one, so a replaced file of the same byte size
+                    # verified as unchanged and the environment check failed
+                    # open (issue #738). The size stays in metadata.
                     captured[key] = EnvResource(
                         name=key,
                         kind="file",
-                        version=f"size:{stat.st_size}",
+                        version=UNKNOWN_VERSION,
                         metadata={"skipped": "larger than max_bytes", "size": stat.st_size},
                     )
                     continue
