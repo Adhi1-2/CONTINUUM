@@ -1104,8 +1104,27 @@ class ActionLedger:
         — a timeout after the request was sent, for instance. Those become
         ``UNKNOWN`` rather than ``FAILED``, because a timeout is not evidence of
         absence.
+
+        Only in-flight statuses settle here (issue #733). Re-reporting a
+        ``FAILED`` action is allowed, because a caller repeating itself after a
+        dropped response is not asserting anything new. Every other status is
+        refused, mirroring :meth:`complete` (issue #366): a late ``fail`` on a
+        ``COMPLETED`` action used to flip it to ``FAILED`` while its recorded
+        result stayed on the books, which reopened the key and let the next
+        claim re-fire a side effect that had already happened. ``UNKNOWN`` is
+        refused for the same reason ``complete`` refuses it: resolving an
+        uncertain outcome is a correction that needs evidence, which is what
+        :meth:`reconcile` records.
         """
         key, existing = self._require(key)
+        if existing.status not in (ActionStatus.STARTED, ActionStatus.FAILED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not in flight, so "
+                f"failing it would erase a recorded outcome. If a check confirmed "
+                f"the effect did not happen, call reconcile(occurred=False) "
+                f"(continuum_reconcile_action over MCP), which records the evidence "
+                f"and the note alongside the correction."
+            )
         action = existing.model_copy(
             update={
                 "status": ActionStatus.FAILED if certain else ActionStatus.UNKNOWN,
