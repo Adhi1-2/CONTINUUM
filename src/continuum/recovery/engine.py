@@ -229,8 +229,16 @@ class RecoveryEngine:
         # Scoped confirm (issue #394) narrows this to named components only;
         # the payload may carry "components" or "scope" as a list, a single
         # string, or be absent (legacy full confirm of both).
+        # The scan includes the archived prefix so compaction cannot silently
+        # discard a human's confirmation (same archive-blindness family as
+        # issue #553): without it, a confirmed run re-escalates to
+        # request_human after every compaction.
         confirmed_components: set[str] = set()
-        for _ev in self.storage.read_events(run_id):
+        try:
+            _confirm_events = self.storage.read_all_events(run_id)
+        except Exception:
+            _confirm_events = self.storage.read_events(run_id)
+        for _ev in _confirm_events:
             if _ev.type is not EventType.REVIEW_CONFIRMED:
                 continue
             # Only human confirmations clear self-certification; an agent
