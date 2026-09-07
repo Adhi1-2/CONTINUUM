@@ -537,6 +537,27 @@ def test_confirmation_survives_compaction(store: SQLiteStorage) -> None:
     assert after.safe
 
 
+def test_assess_degrades_when_the_archive_read_fails(store: SQLiteStorage) -> None:
+    """A failing archive read must not fail assess(): the shared fetch falls
+    back to the live log, so a broken archive view degrades to the live-only
+    verdict instead of bricking the assessment."""
+
+    class FlakyArchiveView:
+        """Raises on the first read_all_events call, like a broken archive."""
+
+        def __init__(self) -> None:
+            self._raised = False
+
+        def __getattr__(self, name: str) -> object:
+            if name == "read_all_events" and not self._raised:
+                self._raised = True
+                raise RuntimeError("archive unreadable")
+            return getattr(store, name)
+
+    decision = RecoveryEngine(FlakyArchiveView()).assess("run_1")  # type: ignore[arg-type]
+    assert decision.mode is RecoveryMode.RESUME
+
+
 # --- unprojectable logs (issue #383) ---------------------------------------- #
 
 
