@@ -1992,7 +1992,7 @@ raise SystemExit(main(["--db", "agent.db"]))
 
 
 def test_main_reports_a_missing_mcp_extra_instead_of_a_traceback(tmp_path: Any) -> None:
-    """Regression for #87: `pip install continuum` ships the script, not the SDK.
+    """Regression for #87: `pip install continuum-agent` ships the script, not the SDK.
 
     Run in a subprocess because blocking an already-imported package in-process
     would corrupt the import state of every later test.
@@ -2014,7 +2014,7 @@ def test_main_reports_a_missing_mcp_extra_instead_of_a_traceback(tmp_path: Any) 
     assert proc.returncode == 1, proc.stderr
     assert proc.stdout == "", "the protocol stream must stay clean"
     assert "Traceback" not in proc.stderr
-    assert "continuum[mcp]" in proc.stderr, "the operator needs the fix, not just the fault"
+    assert "continuum-agent[mcp]" in proc.stderr, "the operator needs the fix, not just the fault"
     assert not (tmp_path / "agent.db").exists(), "a server that never started created a database"
 
 
@@ -2024,7 +2024,7 @@ def test_a_missing_unrelated_module_keeps_its_traceback(
     """The extra is blamed only when the extra is what is missing.
 
     A broken install of something else must not be reported as "install
-    continuum[mcp]", which would send the operator after the wrong fix.
+    continuum-agent[mcp]", which would send the operator after the wrong fix.
     """
     monkeypatch.chdir(tmp_path)
 
