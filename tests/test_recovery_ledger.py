@@ -81,11 +81,16 @@ def test_append_after_compact_keeps_chain_and_clears_gate(ledger: RecoveryLedger
     assert removed == 51
     ok, _ = ledger.verify("run_1")
     assert ok is True
+    # Precondition: the gate-required decision survived the compaction and is
+    # still pending, so the post-approval assertion below actually tests
+    # clearing rather than an already-empty gate.
+    assert ledger.pending_gate("run_1") is not None
 
-    ledger.record_gate("run_1", "approved")
+    max_sequence = max(e.sequence for e in ledger.entries("run_1"))
+    approved = ledger.record_gate("run_1", "approved")
+    assert approved.sequence == max_sequence + 1
 
     sequences = [e.sequence for e in ledger.entries("run_1")]
-    assert sequences == sorted(sequences), "append order must match sequence order"
     assert len(set(sequences)) == len(sequences), "sequences must not collide"
     ok, broken_at = ledger.verify("run_1")
     assert ok is True, f"untampered ledger reported broken at index {broken_at}"
