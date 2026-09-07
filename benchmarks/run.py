@@ -199,11 +199,11 @@ def _append_continuum_bench(out_dir: str | Path) -> None:
 
 
 _SUITES: dict[str, str] = {
-    "phase6": "recovery-correctness scenarios -> out/report.{json,md}",
-    "continuum-bench": "crash-recovery byte counts -> merged into out/report.json",
-    "fault-injection": "chaos suite (#397) -> out/fault_injection_report.{json,md}",
+    "phase6": "recovery-correctness scenarios -> benchmarks/out/report.{json,md}",
+    "continuum-bench": "crash-recovery byte counts -> merged into benchmarks/out/report.json",
+    "fault-injection": "chaos suite (#397) -> benchmarks/out/fault_injection_report.{json,md}",
     "horizon": (
-        "horizon-scale suite (#398) -> out/horizon_report.{json,md}; "
+        "horizon-scale suite (#398) -> benchmarks/out/horizon_report.{json,md}; "
         "also regenerates the README bench table"
     ),
 }
