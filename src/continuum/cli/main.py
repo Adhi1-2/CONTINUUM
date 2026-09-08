@@ -1225,7 +1225,16 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
     text = decision.render()
     if family_blocked and decision.mode.value == "resume":
         # House rule: the most cautious signal wins (#243). A clean parent
-        # with an unsafe child is presented as request_human.
+        # with an unsafe child is presented as request_human on every surface:
+        # this text, the JSON payload and the exit code. The engine's per-run
+        # verdict stays visible in the rationale, but it must not read as
+        # permission to continue (issue #741).
+        text = text.replace(
+            "Recovery decision: RESUME", "Recovery decision: REQUEST_HUMAN"
+        ).replace(
+            "Next permitted action: continue",
+            "Next permitted action: none (settle the children below first)",
+        )
         text += "\n\nFAMILY BLOCKED: children of this run are not resumable.\n" + "\n".join(
             f"  !! {r}" for r in family_rationale
         )
@@ -1259,12 +1268,18 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             print(f"error: --pinning: {exc}", file=err)
             return ExitCode.ERROR
 
-    presented_mode = (
-        "request_human"
-        if (family_blocked and decision.mode.value == "resume")
-        else decision.mode.value
+    # The same house rule, as a mode: what the exit code and the JSON report.
+    # Following the engine's per-run mode here let `resume "$PARENT" &&
+    # ./start-agent.sh` exit 0 onto a family holding an unreconciled side
+    # effect, breaking the only-a-verified-safe-run-exits-0 contract
+    # (issue #741).
+    effective_mode = (
+        RecoveryMode.REQUEST_HUMAN
+        if (family_blocked and decision.mode is RecoveryMode.RESUME)
+        else decision.mode
     )
-    presented_safe = decision.safe and not (family_blocked and decision.mode.value == "resume")
+    presented_mode = effective_mode.value
+    presented_safe = decision.safe and effective_mode is decision.mode
     # Advisory prefix-trust (issue #401): deterministic, read-only, never gates.
     try:
         from continuum.analysis.prefix_trust import trust_over_prefix
@@ -1311,7 +1326,7 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         palette=getattr(args, "_palette", None),
     )
 
-    if decision.mode is not RecoveryMode.RESUME and not args.repair:
+    if effective_mode is not RecoveryMode.RESUME and not args.repair:
         print(
             "\nRun with --repair to record the repair plan, or resolve the items above first.",
             file=err,
@@ -1339,7 +1354,7 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             file=err,
         )
 
-    return exit_code_for(decision.mode)
+    return exit_code_for(effective_mode)
 
 
 def cmd_confirm(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:

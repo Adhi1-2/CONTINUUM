@@ -153,6 +153,55 @@ def test_staleness_propagates_from_dependency_to_decision() -> None:
     assert original.decisions[0].status is StateStatus.VALID
 
 
+def test_staleness_cascades_along_finding_to_finding_citations() -> None:
+    """A finding citing another finding is supported by it (issue #739).
+
+    Taint used to stop at the first finding: a finding resting entirely on a
+    now-stale finding, and the decision built on it, kept VALID in the revised
+    state, so a repair plan driven by that state skipped the downstream work.
+    """
+    outcome = validate_state(
+        state(
+            external_dependencies=[ExternalDependency(resource="dataset", version="v3")],
+            evidence=[Evidence(evidence_id="paper_128", source="dataset")],
+            findings=[
+                Finding(finding_id="f_raw", claim="rows shifted", evidence=["paper_128"]),
+                Finding(finding_id="f_derived", claim="X holds", evidence=["f_raw"]),
+            ],
+            decisions=[Decision(decision_id="d_1", decision="Publish X", evidence=["f_derived"])],
+        ),
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+        current_environment=capture("run_4821", StaticProvider(dataset="v4")),
+    )
+    revised = outcome.state
+    assert revised.evidence[0].status is StateStatus.STALE
+    assert revised.findings[0].status is StateStatus.STALE
+    assert revised.findings[1].status is StateStatus.STALE
+    assert revised.decisions[0].status is StateStatus.STALE
+    assert not outcome.safe
+
+
+def test_finding_citation_cascade_is_independent_of_list_order() -> None:
+    """A forward citation (a finding citing one listed after it) taints the
+    same set, so the cascade must not depend on list order (issue #739)."""
+    outcome = validate_state(
+        state(
+            external_dependencies=[ExternalDependency(resource="dataset", version="v3")],
+            evidence=[Evidence(evidence_id="paper_128", source="dataset")],
+            findings=[
+                # Listed before the raw finding it rests on.
+                Finding(finding_id="f_derived", claim="X holds", evidence=["f_raw"]),
+                Finding(finding_id="f_raw", claim="rows shifted", evidence=["paper_128"]),
+            ],
+        ),
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+        current_environment=capture("run_4821", StaticProvider(dataset="v4")),
+    )
+    revised = {f.finding_id: f.status for f in outcome.state.findings}
+    assert revised["f_raw"] is StateStatus.STALE
+    assert revised["f_derived"] is StateStatus.STALE
+
+
 def test_propagation_spares_state_that_did_not_depend_on_the_change() -> None:
     outcome = validate_state(
         state(

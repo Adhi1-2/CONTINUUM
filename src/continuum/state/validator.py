@@ -434,19 +434,44 @@ class StateValidator:
             else:
                 evidence.append(item)
 
+        # A finding's support may be evidence or another finding
+        # (`dangling_evidence` blesses citing finding ids), so taint has to
+        # cascade along finding-to-finding edges too, and the pass repeats
+        # until no new finding is affected: a finding can cite one listed
+        # after it, which a single ordered pass would miss (issue #739).
         tainted_findings: set[str] = set()
+        finding_details: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            for finding in state.findings:
+                if finding.finding_id in tainted_findings:
+                    continue
+                if finding.status is not StateStatus.VALID:
+                    continue
+                affected_evidence = sorted(set(finding.evidence) & tainted_evidence)
+                affected_findings = sorted(set(finding.evidence) & tainted_findings)
+                if not (affected_evidence or affected_findings):
+                    continue
+                changed = True
+                tainted_findings.add(finding.finding_id)
+                parts = []
+                if affected_evidence:
+                    parts.append(f"changed evidence: {', '.join(affected_evidence)}")
+                if affected_findings:
+                    parts.append(f"stale finding: {', '.join(affected_findings)}")
+                finding_details[finding.finding_id] = "; ".join(parts)
+
         findings = []
         for finding in state.findings:
-            affected = sorted(set(finding.evidence) & tainted_evidence)
-            if affected and finding.status is StateStatus.VALID:
-                tainted_findings.add(finding.finding_id)
+            if finding.finding_id in tainted_findings:
                 findings.append(finding.model_copy(update={"status": StateStatus.STALE}))
                 entries.append(
                     ComponentValidationEntry(
                         component=Component.FINDING,
                         component_id=finding.finding_id,
                         status=StateStatus.STALE,
-                        detail=f"rests on changed evidence: {', '.join(affected)}",
+                        detail=f"rests on {finding_details[finding.finding_id]}",
                     )
                 )
             else:

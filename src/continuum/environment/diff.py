@@ -159,6 +159,8 @@ def diff_environments(
             reason = str(
                 current.metadata.get("error")
                 or previous.metadata.get("error")
+                or current.metadata.get("skipped")
+                or previous.metadata.get("skipped")
                 or "resource could not be inspected"
             )
             deltas.append(
