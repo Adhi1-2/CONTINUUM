@@ -212,6 +212,8 @@ All notable changes to this project are documented here. The format follows
   history via `read_all_events`, the same archive-aware pattern the library
   reconciliation path already used. Covered by `tests/test_reconcilers.py`
   and `tests/test_authority_probe.py`.
+- The missing-MCP-extra subprocess test now imports the working tree even when
+  CONTINUUM is not installed or an older copy is installed (#810).
 
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
