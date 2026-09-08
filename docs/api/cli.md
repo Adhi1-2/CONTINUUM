@@ -142,6 +142,8 @@ per-client notes for Gemini and Codex):
   (`^Bash$|^shell$`).
 - **`SessionStart` (`briefing`)**: runs `continuum briefing` to inject the active
   run id, goal, progress, and recovery next steps at session start or resume.
+  For a ready-made out-of-band alternative that prints `continuum --json resume`
+  (no model turn), see [`scripts/session_start_resume.sh`](../../scripts/session_start_resume.sh).
 - **`PreCompact` (`precompact`)**: runs `continuum precompact` to seal a
   checkpoint before context compaction discards unverified transcript state
   (configured by default on clients with a compaction event, such as Claude Code).
