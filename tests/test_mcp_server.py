@@ -203,6 +203,73 @@ async def test_progress_accumulates_across_calls(server_ctx: tuple[Any, Any]) ->
 
 
 @pytest.mark.asyncio
+async def test_record_plan_upserts_units_and_rejects_bad_payloads(
+    server_ctx: tuple[Any, Any],
+) -> None:
+    """Exercise continuum_record_plan the way the MCP audit claims (issue #759)."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    server, ctx = server_ctx
+    await seed_run(server)
+    units = [
+        {"id": "u2", "title": "second", "status": "pending"},
+        {"id": "u1", "title": "first", "status": "working", "depends_on": []},
+    ]
+    payload = await call(
+        server,
+        "continuum_record_plan",
+        run_id="run_1",
+        plan_id="plan-a",
+        units=units,
+    )
+    assert payload["plan_id"] == "plan-a"
+    assert payload["units"] == 2
+    assert [step["id"] for step in payload["plan"]] == ["u1", "u2"]
+    assert {step["id"]: step["status"] for step in payload["plan"]}["u1"] in {
+        "working",
+        "in_progress",
+    }
+    assert {step["id"]: step["status"] for step in payload["plan"]}["u2"] == "pending"
+    assert any(e.type == EventType.PLAN_UPSERT for e in ctx.storage.read_events("run_1"))
+
+    with pytest.raises(ToolError, match="plan_id"):
+        await server.call_tool(
+            "continuum_record_plan",
+            {"run_id": "run_1", "plan_id": "  ", "units": units},
+            context=_ctx(TEST_CLIENT),
+        )
+    with pytest.raises(ToolError, match="units"):
+        await server.call_tool(
+            "continuum_record_plan",
+            {"run_id": "run_1", "plan_id": "plan-a", "units": []},
+            context=_ctx(TEST_CLIENT),
+        )
+    with pytest.raises(ToolError, match="duplicate"):
+        await server.call_tool(
+            "continuum_record_plan",
+            {
+                "run_id": "run_1",
+                "plan_id": "plan-a",
+                "units": [
+                    {"id": "u1", "title": "a", "status": "pending"},
+                    {"id": "u1", "title": "b", "status": "pending"},
+                ],
+            },
+            context=_ctx(TEST_CLIENT),
+        )
+    with pytest.raises(ToolError, match="status"):
+        await server.call_tool(
+            "continuum_record_plan",
+            {
+                "run_id": "run_1",
+                "plan_id": "plan-a",
+                "units": [{"id": "u1", "title": "a", "status": "nope"}],
+            },
+            context=_ctx(TEST_CLIENT),
+        )
+
+
+@pytest.mark.asyncio
 async def test_over_total_progress_is_rejected_before_being_written(
     server_ctx: tuple[Any, Any],
 ) -> None:
