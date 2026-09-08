@@ -179,6 +179,67 @@ def test_protected_call_executes_once_then_returns_cached_result(db: str) -> Non
     assert len(calls) == 1, "side effect must not re-fire"
 
 
+def test_replay_returns_the_callers_own_dict_even_with_a_return_key(db: str) -> None:
+    # A dict result containing the literal key "return" used to be journalled
+    # as-is and then unwrapped on replay, so the second call returned one
+    # member of the dict while the first returned the whole thing (issue #736).
+    payload = {"return": "receipt-1", "amount": 100}
+
+    kind1, result1 = protected_call(
+        SQLiteStorage(db),
+        "run_1",
+        action_type="send_invoice",
+        key="inv:9",
+        fn=lambda: payload,
+    )
+    kind2, result2 = protected_call(
+        SQLiteStorage(db),
+        "run_1",
+        action_type="send_invoice",
+        key="inv:9",
+        fn=lambda: payload,
+    )
+    assert kind1 is GuardKind.ALLOW and kind2 is GuardKind.SKIP_DUPLICATE
+    assert result2 == result1 == payload, "replay must answer as the first call did"
+
+
+def test_non_dict_results_round_trip_through_the_envelope(db: str) -> None:
+    kind1, result1 = protected_call(
+        SQLiteStorage(db),
+        "run_1",
+        action_type="charge_card",
+        key="card:2",
+        fn=lambda: "charged",
+    )
+    kind2, result2 = protected_call(
+        SQLiteStorage(db),
+        "run_1",
+        action_type="charge_card",
+        key="card:2",
+        fn=lambda: "charged",
+    )
+    assert kind1 is GuardKind.ALLOW and result1 == "charged"
+    assert kind2 is GuardKind.SKIP_DUPLICATE and result2 == "charged"
+
+
+def test_a_legacy_return_journal_still_unwraps_on_replay(db: str) -> None:
+    # Records written before the envelope (issue #736) wrap non-dict results
+    # as {"return": ...}; replay must keep unwrapping those.
+    with SQLiteStorage(db) as store:
+        ledger = ActionLedger(store, "run_1")
+        outcome = ledger.claim("legacy_call", {}, key="legacy:1")
+        ledger.complete(outcome.key, result={"return": "legacy-value"})
+    kind, value = protected_call(
+        SQLiteStorage(db),
+        "run_1",
+        action_type="legacy_call",
+        key="legacy:1",
+        fn=lambda: "SHOULD_NOT_RUN",
+    )
+    assert kind is GuardKind.SKIP_DUPLICATE
+    assert value == "legacy-value"
+
+
 def test_exception_marks_uncertain_failure_and_reraises(db: str) -> None:
     with pytest.raises(RuntimeError):
         protected_call(
