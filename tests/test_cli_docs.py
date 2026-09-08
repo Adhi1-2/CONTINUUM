@@ -33,7 +33,7 @@ def _hooks_section() -> str:
     """The ## hooks section of the CLI reference, where profiles live."""
     text = TABLE.read_text(encoding="utf-8")
     start = text.index("## hooks")
-    rest = text[start + len("## hooks"):]
+    rest = text[start + len("## hooks") :]
     end = rest.find("\n## ")
     return rest if end == -1 else rest[:end]
 
