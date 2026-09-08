@@ -201,6 +201,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Dashboard HITL actions remain visible after compaction (#809).** The dashboard
+  now folds the full archived and live event history when listing uncertain
+  actions, so an operator can still see and reconcile a claim whose action
+  events moved into the archive.
+
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
   `ActionLedger.pending` folds archived plus live events, but
