@@ -93,6 +93,7 @@ def evaluate(
         return GuardDecision(
             GuardKind.BLOCK_UNCERTAIN,
             f"{action_type!r} {rendered_key!r} has an unknown outcome; reconcile first",
+            key=key,
         )
     return GuardDecision(
         GuardKind.DENY_RECLAIM,
