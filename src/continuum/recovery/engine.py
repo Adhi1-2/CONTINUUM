@@ -229,8 +229,20 @@ class RecoveryEngine:
         # Scoped confirm (issue #394) narrows this to named components only;
         # the payload may carry "components" or "scope" as a list, a single
         # string, or be absent (legacy full confirm of both).
+        # The scan includes the archived prefix so compaction cannot silently
+        # discard a human's confirmation (same archive-blindness family as
+        # issue #553): without it, a confirmed run re-escalates to
+        # request_human after every compaction.
         confirmed_components: set[str] = set()
-        for _ev in self.storage.read_events(run_id):
+        # Both archive-aware scans below (confirmations and provenance) share
+        # this one fetch: read_all_events walks the archived prefix too, and
+        # re-walking it twice per assess() doubles the archive scan for no
+        # gain.
+        try:
+            archive_aware_events = self.storage.read_all_events(run_id)
+        except Exception:
+            archive_aware_events = self.storage.read_events(run_id)
+        for _ev in archive_aware_events:
             if _ev.type is not EventType.REVIEW_CONFIRMED:
                 continue
             # Only human confirmations clear self-certification; an agent
@@ -253,11 +265,8 @@ class RecoveryEngine:
             else:
                 confirmed_components.update(["goal", "progress"])
 
-        # Provenance N-hop staleness (issue #553): include archived events so compaction does not launder
-        try:
-            provenance_events = self.storage.read_all_events(run_id)
-        except Exception:
-            provenance_events = self.storage.read_events(run_id)
+        # Provenance N-hop staleness (issue #553): the shared archive-aware
+        # fetch above feeds the validator so compaction does not launder it.
         validation = self.validator.validate(
             restored.state,
             current_environment=current_environment,
@@ -266,7 +275,7 @@ class RecoveryEngine:
             expected_model=expected_model,
             confirmed=confirmed_components,
             scope=scope,
-            events=provenance_events,
+            events=archive_aware_events,
         )
 
         ledger = ActionLedger(self.storage, run_id)

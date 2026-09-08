@@ -507,6 +507,57 @@ def test_self_certified_runs_are_confirmable(store: SQLiteStorage) -> None:
     )
 
 
+def test_confirmation_survives_compaction(store: SQLiteStorage) -> None:
+    """A human confirmation must survive compaction: the confirm event sits in
+    the pre-anchor prefix, so the confirm scan has to read the archived
+    prefix too, or a confirmed run silently re-escalates to request_human."""
+    store.create_run(Run(run_id="r1", goal="do X"))
+    store.append_event("r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT)
+    store.append_event(
+        "r1", EventType.TASK_UPDATED, {"completed": 1, "failed": 0}, source=Origin.EXTERNAL_AGENT
+    )
+    store.append_event(
+        "r1",
+        EventType.REVIEW_CONFIRMED,
+        {"components": ["goal", "progress"]},
+        source=Origin.HUMAN,
+    )
+
+    confirmed = RecoveryEngine(store).assess("r1")
+    assert confirmed.mode is RecoveryMode.RESUME
+
+    store.compact_run("r1")
+    # The confirm event is archived out of the live tail by the compaction.
+    assert not any(e.type is EventType.REVIEW_CONFIRMED for e in store.read_events("r1")), (
+        "precondition failed: confirm event still live"
+    )
+
+    after = RecoveryEngine(store).assess("r1")
+    assert after.mode is RecoveryMode.RESUME
+    assert after.safe
+
+
+def test_assess_degrades_when_the_archive_read_fails(store: SQLiteStorage) -> None:
+    """A failing archive read must not fail assess(): the shared fetch falls
+    back to the live log, so a broken archive view degrades to the live-only
+    verdict instead of bricking the assessment."""
+
+    class FlakyArchiveView:
+        """Raises on the first read_all_events call, like a broken archive."""
+
+        def __init__(self) -> None:
+            self._raised = False
+
+        def __getattr__(self, name: str) -> object:
+            if name == "read_all_events" and not self._raised:
+                self._raised = True
+                raise RuntimeError("archive unreadable")
+            return getattr(store, name)
+
+    decision = RecoveryEngine(FlakyArchiveView()).assess("run_1")  # type: ignore[arg-type]
+    assert decision.mode is RecoveryMode.RESUME
+
+
 # --- unprojectable logs (issue #383) ---------------------------------------- #
 
 
