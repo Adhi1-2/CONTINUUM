@@ -543,9 +543,10 @@ Thanks to our community contributors, ordered by contributions:
 [@timothyanderson096-ocdealcheck](https://github.com/timothyanderson096-ocdealcheck),
 [@unmoha](https://github.com/unmoha), [@aastha-m22](https://github.com/aastha-m22),
 [@as950118](https://github.com/as950118), [@asarakhatun17-lgtm](https://github.com/asarakhatun17-lgtm),
-[@challenge456](https://github.com/challenge456), [@ItzSaurav](https://github.com/ItzSaurav),
+[@challenge456](https://github.com/challenge456),
+[@gouthamkrishnak2003](https://github.com/gouthamkrishnak2003), [@ItzSaurav](https://github.com/ItzSaurav),
 [@mhaye9545](https://github.com/mhaye9545), [@Newer1107](https://github.com/Newer1107),
-[@okestroHjJeong](https://github.com/okestroHjJeong), [@quangshuynh](https://github.com/quangshuynh),
+[@okestroHjJeong](https://github.com/okestroHjJeong), [@quangshuynh](https://github.com/quangshuynh), [@Rahul-pamula](https://github.com/Rahul-pamula),
 [@Shaisolaris](https://github.com/Shaisolaris), [@VedantMadane](https://github.com/VedantMadane),
 [@zynx-real](https://github.com/zynx-real).
 
