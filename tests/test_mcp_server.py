@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -2004,9 +2005,13 @@ def test_main_reports_a_missing_mcp_extra_instead_of_a_traceback(tmp_path: Any) 
     stdio the client parses that stream as protocol frames, so diagnostics must
     never be printed there, however tempting it is.
     """
+    env = os.environ.copy()
+    source_path = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [source_path, env.get("PYTHONPATH")]))
     proc = subprocess.run(
         [sys.executable, "-c", _WITHOUT_MCP_SDK],
         cwd=tmp_path,
+        env=env,
         capture_output=True,
         text=True,
     )
