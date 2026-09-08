@@ -56,7 +56,7 @@ instead if you want the compaction boundary to report without writing:
 
 Replace `/absolute/path/to/.venv/bin/continuum` with `which continuum`.
 
-For an explicit `resume --json` variant (pairs with #394):
+For an explicit `--json resume` variant (pairs with #394):
 
 ```json
 {

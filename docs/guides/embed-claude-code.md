@@ -141,7 +141,7 @@ What this gives:
 - `.continuum/precompact-resume.json` with the recovery decision as of that checkpoint (inspect `contract.verified` and `contract.invalidated`)
 - `.continuum/precompact-verify.json` proving the chain is intact up to the checkpoint
 
-Constraint verification: if your run pins constraints by digest (see below), `resume --json` surfaces `pinning_drift` when the current environment pins differ from the recorded set. A non-empty drift does not block resume, it is informational. Check it in PreCompact:
+Constraint verification: if your run pins constraints by digest (see below), `--json resume` surfaces `pinning_drift` when the current environment pins differ from the recorded set. A non-empty drift does not block resume, it is informational. Check it in PreCompact:
 
 ```bash
 continuum --json resume my-task --pinning '{"prompt_sha256":"abc...","tool_schema_sha256":"def..."}' | python -c "import json,sys; j=json.load(sys.stdin); print(j['pinning_drift'])"
@@ -295,7 +295,7 @@ Expected contract (real output from this repo, ids vary per run):
 
 Exit code is 20 (`REQUIRES_HUMAN`), not 0, so a guarded launch stops. Resolve by reconciling or, if the effect indeed never landed, retrying with a budget-aware claim, then `continuum resume` returns `resume` with `safe: true`.
 
-With a clean run (no uncertain actions), the same `resume --json` reports:
+With a clean run (no uncertain actions), the same `--json resume` reports:
 
 ```json
 {

@@ -75,7 +75,7 @@ Interrupted run my-task – resume pending
   run: continuum --json resume my-task
 ```
 
-Example `resume --json` contract while safe:
+Example `--json resume` contract while safe:
 
 ```json
 {
