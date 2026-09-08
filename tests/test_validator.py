@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from continuum.environment import CallableProvider, StaticProvider, capture
 from continuum.models import (
@@ -348,6 +348,25 @@ def test_an_expired_approval_is_caught_by_its_timestamp() -> None:
     )
     assert status_for(outcome, Component.APPROVAL, "ap_1") is StateStatus.EXPIRED
     assert not outcome.safe
+
+
+def test_a_naive_expires_at_grades_instead_of_raising() -> None:
+    """Issue #704: a naive expires_at (persisted before the fold normalized
+    offsets, or constructed directly) must grade as EXPIRED, not raise
+    TypeError comparing naive against the tz-aware utcnow()."""
+    outcome = validate_state(
+        state(
+            approvals=[
+                Approval(
+                    approval_id="ap_1",
+                    subject="publish",
+                    status=ApprovalStatus.GRANTED,
+                    expires_at=datetime(2020, 1, 1),  # naive, and in the past
+                )
+            ]
+        )
+    )
+    assert status_for(outcome, Component.APPROVAL, "ap_1") is StateStatus.EXPIRED
 
 
 def test_a_live_approval_passes() -> None:

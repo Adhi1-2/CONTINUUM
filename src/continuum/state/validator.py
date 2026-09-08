@@ -5,7 +5,7 @@ trustworthy merely because it was persisted.** Before an agent resumes, every
 component is checked against the environment as it is *now*.
 
 Staleness propagates. If a dataset moves from v3 to v4, the dependency is not
-the only casualty — every finding whose evidence came from that dataset, and
+the only casualty: every finding whose evidence came from that dataset, and
 every decision resting on those findings, is now suspect. Marking only the
 dependency would leave the agent reasoning from conclusions it can no longer
 justify. Propagation walks:
@@ -17,14 +17,15 @@ Uncertainty degrades rather than resolves. An unverifiable resource yields
 resume. The system is allowed to say "I cannot tell"; it is not allowed to
 guess in its own favour.
 
-This module decides *status*. Choosing what to do about it — resume, repair,
-abort — is the recovery engine's job in Phase 7.
+This module decides *status*. Choosing what to do about it (resume, repair,
+abort) is the recovery engine's job in Phase 7.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 from continuum.environment.diff import EnvironmentDiff, ResourceChange, diff_environments
@@ -58,7 +59,7 @@ __all__ = [
 #: reporting "safe to resume" while that is outstanding is precisely the false
 #: assurance this layer exists to prevent. The recovery engine already refused
 #: to resume in these cases via the repair plan, but the validator's own
-#: `safe_to_resume` disagreed with it — so anything reading the validation
+#: `safe_to_resume` disagreed with it, so anything reading the validation
 #: report directly got the wrong answer.
 _UNUSABLE = frozenset(
     {
@@ -892,14 +893,21 @@ class StateValidator:
     def _check_approvals(state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
         now = utcnow()
         for approval in state.approvals:
+            # A naive expires_at (persisted by versions before issue #704, or
+            # constructed directly) must grade, not raise: comparing it against
+            # the tz-aware `now` would TypeError and take down the whole
+            # validation pass. Read a missing offset as UTC, as the fold does.
+            expires_at = approval.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
             if approval.status is ApprovalStatus.REVOKED:
                 status, detail = StateStatus.INVALID, "approval was revoked"
             elif approval.status is ApprovalStatus.EXPIRED:
                 status, detail = StateStatus.EXPIRED, "approval expired"
-            elif approval.expires_at is not None and approval.expires_at <= now:
+            elif expires_at is not None and expires_at <= now:
                 status, detail = (
                     StateStatus.EXPIRED,
-                    f"expired at {approval.expires_at.isoformat()}",
+                    f"expired at {expires_at.isoformat()}",
                 )
             elif approval.status is ApprovalStatus.PENDING:
                 status, detail = StateStatus.REQUIRES_REVIEW, "approval never granted"
