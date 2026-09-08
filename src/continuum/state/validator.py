@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 from continuum.environment.diff import EnvironmentDiff, ResourceChange, diff_environments
@@ -867,14 +868,21 @@ class StateValidator:
     def _check_approvals(state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
         now = utcnow()
         for approval in state.approvals:
+            # A naive expires_at (persisted by versions before issue #704, or
+            # constructed directly) must grade, not raise: comparing it against
+            # the tz-aware `now` would TypeError and take down the whole
+            # validation pass. Read a missing offset as UTC, as the fold does.
+            expires_at = approval.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
             if approval.status is ApprovalStatus.REVOKED:
                 status, detail = StateStatus.INVALID, "approval was revoked"
             elif approval.status is ApprovalStatus.EXPIRED:
                 status, detail = StateStatus.EXPIRED, "approval expired"
-            elif approval.expires_at is not None and approval.expires_at <= now:
+            elif expires_at is not None and expires_at <= now:
                 status, detail = (
                     StateStatus.EXPIRED,
-                    f"expired at {approval.expires_at.isoformat()}",
+                    f"expired at {expires_at.isoformat()}",
                 )
             elif approval.status is ApprovalStatus.PENDING:
                 status, detail = StateStatus.REQUIRES_REVIEW, "approval never granted"
