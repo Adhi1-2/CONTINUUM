@@ -6,7 +6,7 @@ Every other MCP test drives the server in-process (``tests/mcp_helpers.py``) or 
 the ``continuum-mcp`` console script that ``[project.scripts]`` installs unconditionally.
 That gap is why #697 shipped to PyPI (the entry point existed where its dependency did
 not) and why #699 reached users before CI (PATH resolution of the entry point was never
-under test) — the failures live between the entry point and the protocol, a stretch of
+under test). The failures live between the entry point and the protocol, a stretch of
 road the suite had never driven.
 
 Three behaviours are pinned here:
@@ -14,11 +14,11 @@ Three behaviours are pinned here:
 1. the console script, spawned by absolute path, completes the ``initialize``
    handshake and serves ``tools/list`` over real stdio (issue #834's baseline);
 2. on Windows, a bare ``continuum-mcp`` cannot be spawned even when its directory is on
-   the *child's* PATH — ``CreateProcess`` resolves the calling process's PATH, not the
+   the *child's* PATH, since ``CreateProcess`` resolves the calling process's PATH, not the
    environment it passes (the mechanism behind ``CONNECTION_CLOSED``, and the reason
    registration must bake resolved paths rather than rely on the host's PATH);
-3. ``python -m continuum.mcp`` — the form ``continuum mcp install`` falls back to when
-   no executable is on PATH — completes the same handshake.
+3. ``python -m continuum.mcp`` (the form ``continuum mcp install`` falls back to when
+   no executable is on PATH) completes the same handshake.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _entrypoint() -> str | None:
 
     ``shutil.which`` first, so the test uses whatever the environment would find;
     the sibling-of-interpreter fallback covers environments where the Scripts
-    directory is not on PATH (GitHub Actions runners, unactivated venvs) — the
+    directory is not on PATH (GitHub Actions runners, unactivated venvs), the
     same two-step resolution ``continuum mcp install`` performs.
     """
     found = shutil.which("continuum-mcp")
@@ -133,7 +133,7 @@ def test_console_script_handshake_over_stdio(tmp_path: Any) -> None:
 
 
 def test_module_fallback_handshake_over_stdio(tmp_path: Any) -> None:
-    """``python -m continuum.mcp`` — the no-executable fallback ``mcp install`` bakes."""
+    """``python -m continuum.mcp`` (the no-executable fallback ``mcp install`` bakes)."""
     _handshake([sys.executable, "-u", "-m", "continuum.mcp"], tmp_path / "module.db")
 
 
@@ -147,7 +147,7 @@ def test_bare_name_ignores_child_path_on_windows(
     the server a constructed environment whose PATH may contain the Scripts
     directory, but ``CreateProcess`` ignores it and searches the calling process's
     own PATH. A venv that is not activated in the shell that launched the host
-    therefore cannot be reached by bare name — which is why registration must
+    therefore cannot be reached by bare name, which is why registration must
     bake an absolute path (issue #834) rather than trust the host's environment.
     """
     script = _entrypoint()
