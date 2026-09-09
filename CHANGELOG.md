@@ -10,7 +10,7 @@ All notable changes to this project are documented here. The format follows
 
 - **The installed `continuum-mcp` entry point is exercised over real stdio (#834).**
   `tests/test_mcp_entrypoint.py` spawns the console script a host actually
-  spawns — by absolute path, through pipes, no shell — and drives
+  spawns (by absolute path, through pipes, no shell) and drives
   `initialize` plus `tools/list`; the `python -m continuum.mcp` fallback form
   gets the same handshake. A Windows-only test pins the mechanism behind
   `CONNECTION_CLOSED` (#699): `CreateProcess` resolves a bare command name
