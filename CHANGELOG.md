@@ -17,6 +17,14 @@ All notable changes to this project are documented here. The format follows
   against the calling process's PATH, never the environment passed to the
   child, so the suite can now tell a broken entry point (#697) from an
   unreachable one.
+- **Completed actions record consumed inputs for restore-point admissibility (#558).**
+  `ActionLedger.complete` and `reconcile` accept an optional `consumed_inputs`
+  mapping (`checkpoint_seq`, `event_positions`, `component_ids`, `action_ids`),
+  validated and stored on the action row and in the `action_index` projection.
+  Rows written before the field existed load as empty and stay admissible. The
+  MCP `complete` and `reconcile` tools and the sidecar `complete_action` and
+  `reconcile_action` handlers forward the field, so agent-driven callers can
+  declare what state an effect was computed from.
 
 - **Documented three-file ruff rev lockstep (#689).** CONTRIBUTING.md now
   names all three places the ruff version lives (the `ruff==` pin in
