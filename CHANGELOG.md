@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The installed `continuum-mcp` entry point is exercised over real stdio (#834).**
+  `tests/test_mcp_entrypoint.py` spawns the console script a host actually
+  spawns — by absolute path, through pipes, no shell — and drives
+  `initialize` plus `tools/list`; the `python -m continuum.mcp` fallback form
+  gets the same handshake. A Windows-only test pins the mechanism behind
+  `CONNECTION_CLOSED` (#699): `CreateProcess` resolves a bare command name
+  against the calling process's PATH, never the environment passed to the
+  child, so the suite can now tell a broken entry point (#697) from an
+  unreachable one.
+
 - **Documented three-file ruff rev lockstep (#689).** CONTRIBUTING.md now
   names all three places the ruff version lives (the `ruff==` pin in
   `pyproject.toml`, `rev` in `.pre-commit-config.yaml`, and the `rev` quoted
