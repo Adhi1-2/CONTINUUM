@@ -239,6 +239,12 @@ All notable changes to this project are documented here. The format follows
   `continuum provenance` and `continuum impact` truncate the rendered nodes
   (JSON carries nodes_total/nodes_hidden and downstream totals) while the
   in-memory graph behind staleness stays whole. `--limit 0` is refused.
+- FINDING_ADDED accepts caused_by causal links like decisions and actions (#597).
+  Findings derived from evidence link back under the same 32-id, 1-128-char
+  caps and unknown-id refusal, validated on every append path (memory log,
+  SQLite, Postgres) behind one shared CAUSED_BY_TYPES constant. The graph
+  fold already edges any node type, so finding-to-evidence edges appear with
+  no projection change. PLAN_UPSERT nodes stay a separate design question.
 
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
