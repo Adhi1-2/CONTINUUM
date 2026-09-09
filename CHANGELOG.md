@@ -229,6 +229,10 @@ All notable changes to this project are documented here. The format follows
   provenance hid the writer. `ActionLedger` accepts a `source` (default
   unchanged) and the guard stamps `EXTERNAL_AGENT`, matching its docstring
   and the OpenAI adapter. Denial records stay deterministic as ledger verdicts.
+- Provenance listings paginate with --limit/--offset, display only (#597).
+  `continuum provenance` and `continuum impact` truncate the rendered nodes
+  (JSON carries nodes_total/nodes_hidden and downstream totals) while the
+  in-memory graph behind staleness stays whole. `--limit 0` is refused.
 
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
