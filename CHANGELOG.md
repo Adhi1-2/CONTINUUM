@@ -245,6 +245,10 @@ All notable changes to this project are documented here. The format follows
   SQLite, Postgres) behind one shared CAUSED_BY_TYPES constant. The graph
   fold already edges any node type, so finding-to-evidence edges appear with
   no projection change. PLAN_UPSERT nodes stay a separate design question.
+- `watch --max-silence` override wins without an open claim (#670).
+  The override kept the default phase scopes, so the `otherwise` scope
+  (3600s) silently replaced the flag value. The override contract now
+  carries empty scopes and falls back to the requested seconds.
 
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
