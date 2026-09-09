@@ -31,6 +31,11 @@ All notable changes to this project are documented here. The format follows
   resume would, and asserts units 1-2 never re-execute while 3-5 remain,
   recording the duplicate count in the report metrics. It runs in CI through
   the parametrized phase-6 suite.
+- Shared signed webhook delivery primitive for human notification (#305).
+  `continuum.recovery.notify` posts JSON with an HMAC-SHA256 signature when
+  `CONTINUUM_WEBHOOK_SECRET` is set and plain JSON otherwise, always
+  fail-open. The liveness watch webhook path now routes through it with
+  identical wire behavior when unconfigured.
 
 - **Documented three-file ruff rev lockstep (#689).** CONTRIBUTING.md now
   names all three places the ruff version lives (the `ruff==` pin in

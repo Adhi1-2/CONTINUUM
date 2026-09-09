@@ -1153,19 +1153,11 @@ def cmd_watch(args: argparse.Namespace, storage: Storage, out: Any, err: Any) ->
         else f"Liveness ok for {run_id}: {advisory.get('silence_seconds')}"
     )
     if breached and on_breach == "webhook" and webhook_url:
-        try:
-            import json as _json
-            import urllib.request
+        from continuum.recovery.notify import post_webhook
 
-            data = _json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=5):
-                pass
-        except Exception as exc:
-            # Fail-open delivery, like dashboard token path
-            print(f"warning: webhook delivery failed: {exc}", file=err)
+        # Fail-open delivery, like dashboard token path
+        if not post_webhook(webhook_url, payload):
+            print("warning: webhook delivery failed", file=err)
     # Emit result
     _emit(
         payload,
