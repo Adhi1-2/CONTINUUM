@@ -223,6 +223,12 @@ All notable changes to this project are documented here. The format follows
   now folds the full archived and live event history when listing uncertain
   actions, so an operator can still see and reconcile a claim whose action
   events moved into the archive.
+- Thin-adapter ledger writes carry EXTERNAL_AGENT provenance (#612).
+  `ContinuumToolGuard` claims about framework-executed tools were recorded
+  `deterministic`, so agent-asserted effects laundered to trusted and derived
+  provenance hid the writer. `ActionLedger` accepts a `source` (default
+  unchanged) and the guard stamps `EXTERNAL_AGENT`, matching its docstring
+  and the OpenAI adapter. Denial records stay deterministic as ledger verdicts.
 
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
