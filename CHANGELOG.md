@@ -25,6 +25,12 @@ All notable changes to this project are documented here. The format follows
   MCP `complete` and `reconcile` tools and the sidecar `complete_action` and
   `reconcile_action` handlers forward the field, so agent-driven callers can
   declare what state an effect was computed from.
+- **Plan-aware bench scenario reports zero duplicate work (#468).**
+  `plan_aware_resume_skips_completed_units` starts a 5-unit linear plan via
+  `PLAN_UPSERT`, completes 2 units, reprojects from the log as a post-crash
+  resume would, and asserts units 1-2 never re-execute while 3-5 remain,
+  recording the duplicate count in the report metrics. It runs in CI through
+  the parametrized phase-6 suite.
 
 - **Documented three-file ruff rev lockstep (#689).** CONTRIBUTING.md now
   names all three places the ruff version lives (the `ruff==` pin in
