@@ -237,6 +237,10 @@ All notable changes to this project are documented here. The format follows
   and `tests/test_authority_probe.py`.
 - The missing-MCP-extra subprocess test now imports the working tree even when
   CONTINUUM is not installed or an older copy is installed (#810).
+- Runs compact more than once: the anchor checkpoint folds full history (#648).
+  It read only the live tail, so after the first compaction RUN_STARTED lived
+  in the archive and the second compact died with ValueError: could not be
+  anchored. Checkpointing a compacted run works again.
 
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and

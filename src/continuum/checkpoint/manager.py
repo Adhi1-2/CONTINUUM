@@ -162,8 +162,13 @@ class CheckpointManager:
     # -- writing ---------------------------------------------------------- #
 
     def project_current(self, run_id: str) -> SemanticState:
-        """Fold the run's full event history into state."""
-        return project(run_id, self.storage.read_events(run_id))
+        """Fold the run's full event history into state.
+
+        Full history, not the live tail: after compaction RUN_STARTED and
+        other foundation events live in the archive, and projecting the
+        tail alone concludes the run never started (issue #648).
+        """
+        return project(run_id, self.storage.read_all_events(run_id))
 
     def checkpoint(
         self,
