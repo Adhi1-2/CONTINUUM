@@ -254,6 +254,11 @@ All notable changes to this project are documented here. The format follows
   The override kept the default phase scopes, so the `otherwise` scope
   (3600s) silently replaced the flag value. The override contract now
   carries empty scopes and falls back to the requested seconds.
+- `health` and `watch` honor the global `--json` flag (#677).
+  Both re-registered the flag on their subparser, whose default silently
+  replaced the global value, so machine output never appeared. The subparser
+  defaults are now SUPPRESS: both flag positions work and trailing `--json`
+  keeps working.
 
 - **`reconcile --auto` settles archived actions and probes authorities with
   full consumption context after compaction (#647).**
