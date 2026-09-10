@@ -35,7 +35,14 @@ from continuum.cli.colour import Palette
 from continuum.cli.exitcodes import ExitCode, exit_code_for
 from continuum.environment import StaticProvider, capture
 from continuum.events import EventType
-from continuum.models import ActionStatus, EnvironmentSnapshot, EnvResource, Origin, RecoveryMode
+from continuum.models import (
+    ActionStatus,
+    EnvironmentSnapshot,
+    EnvResource,
+    Origin,
+    RecoveryMode,
+    Run,
+)
 from continuum.observability import render_dashboard
 from continuum.recovery import RecoveryEngine, render_contract
 from continuum.security.attestation import (
@@ -51,6 +58,7 @@ from continuum.storage import (
     CheckpointNotFound,
     CorruptedRecord,
     RunNotFound,
+    SchemaVersionError,
     Storage,
     StorageError,
     open_storage,
@@ -182,6 +190,30 @@ def cmd_init(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> 
         f"Initialised CONTINUUM storage at {args.db}",
         as_json=args.json,
         stream=out,
+    )
+    return ExitCode.OK
+
+
+def cmd_start(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Create a run and its initial RUN_STARTED event."""
+    run = Run(run_id=args.run_id, goal=args.goal, metadata={"parent_run_id": args.parent} if args.parent else {})
+    try:
+        storage.create_run(run)
+        storage.append_event(
+            run.run_id,
+            EventType.RUN_STARTED,
+            {"goal": args.goal},
+            source=Origin.HUMAN,
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    _emit(
+        {"run_id": run.run_id, "goal": run.goal},
+        f"Started run {run.run_id}: {run.goal}",
+        as_json=args.json,
+        stream=out,
+        palette=getattr(args, "_palette", None),
     )
     return ExitCode.OK
 
@@ -785,6 +817,54 @@ def cmd_attest_verify(args: argparse.Namespace, storage: Storage, out: Any, err:
 # --------------------------------------------------------------------------- #
 
 
+def _stream_is_a_tty(stream: Any) -> bool:
+    """Return whether a stream can safely host a full-screen interface."""
+    isatty = getattr(stream, "isatty", None)
+    return callable(isatty) and bool(isatty())
+
+
+def _curses_available() -> bool:
+    """Check for curses without importing it on the non-interactive path."""
+    from importlib.util import find_spec
+
+    return find_spec("curses") is not None
+
+
+def _bare_invocation(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, out: Any, err: Any
+) -> int:
+    """Open the dashboard for a terminal, otherwise preserve help output."""
+    if args.json or not _stream_is_a_tty(out) or not _curses_available():
+        parser.print_help(file=out)
+        return ExitCode.OK
+
+    from continuum.tui import run_tui
+
+    try:
+        storage = open_storage(args.db)
+    except SchemaVersionError as exc:
+        # A newer database must never be downgraded or silently replaced. Keep
+        # the branded launcher usable, but make the incompatibility visible in
+        # the splash and direct the operator to a compatible --db path.
+        return int(run_tui(None, database_error=str(exc), err=err))
+    except (StorageError, ValueError, NotImplementedError) as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    except sqlite3.Error as exc:
+        print(f"error: cannot open storage at {args.db!r}: {exc}", file=err)
+        return ExitCode.ERROR
+
+    try:
+        return int(run_tui(storage, err=err))
+    finally:
+        storage.close()
+
+
+# --------------------------------------------------------------------------- #
+# parser
+# --------------------------------------------------------------------------- #
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="continuum",
@@ -834,6 +914,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("init", cmd_init, "Create storage.")
     add("runs", cmd_runs, "List runs.").add_argument("--limit", type=int, default=20)
+
+    start = add("start", cmd_start, "Create a run with a goal.")
+    start.add_argument("run_id")
+    start.add_argument("--goal", required=True)
+    start.add_argument("--parent", default=None)
 
     inspect = with_run(add("inspect", cmd_inspect, "Show semantic state."))
     inspect.add_argument("--version", type=int, dest="version", help="inspect a past version")
@@ -912,6 +997,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("stdio",),
         help="wire transport (default: stdio)",
     )
+
+    def cmd_tui(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+        """Open the full-screen terminal dashboard (q quits)."""
+        from continuum.tui import run_tui
+
+        return run_tui(storage, refresh_seconds=args.refresh, err=err)
+
+    tui = add(
+        "tui",
+        cmd_tui,
+        "Full-screen terminal dashboard: monitor and control runs (q quits).",
+    )
+    tui.add_argument(
+        "--refresh",
+        type=float,
+        default=0.0,
+        help="auto-refresh interval in seconds (default: 0, refresh on demand with r).",
+    )
+
     return parser
 
 
@@ -940,8 +1044,7 @@ def main(
         Palette(False) if args.json else Palette.for_stream(out, force=getattr(args, "color", None))
     )
     if getattr(args, "func", None) is None:
-        parser.print_help(file=out)
-        return ExitCode.OK
+        return _bare_invocation(parser, args, out, err)
 
     if args.command in ("benchmark", "attest-keygen", "serve"):
         return int(args.func(args, None, out, err))
