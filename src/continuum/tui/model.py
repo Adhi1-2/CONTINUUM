@@ -11,24 +11,68 @@ Origin.HUMAN provenance, exactly like the dashboard HITL buttons (#242).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import cast
 
 from continuum.actions import ActionLedger
-from continuum.actions.ledger import fold_action_events
-from continuum.budgets import (
-    DEFAULT_BUDGETS_PATH,
-    attempts_for_type,
-    evaluate_budget,
-    load_budgets,
-)
 from continuum.checkpoint import CheckpointManager
-from continuum.events import EventType
-from continuum.models import Action, ActionStatus, Origin, RunStatus, StateStatus
+from continuum.events import Event, EventType
+from continuum.models import Action, ActionStatus, Origin, Run, RunStatus
 from continuum.recovery import RecoveryEngine
-from continuum.recovery.family import children_of, roll_up_children
 from continuum.storage.base import Storage
+
+_DEFAULT_MAX_ATTEMPTS = 3
+
+
+def _fold_action_events(events: Sequence[Event]) -> dict[str, Action]:
+    """Fold action records locally because the current ledger exposes no fold helper."""
+    actions: dict[str, Action] = {}
+    for event in events:
+        if event.type not in (
+            EventType.ACTION_RECORDED,
+            EventType.ACTION_RECONCILED,
+            EventType.ACTION_COMPENSATED,
+        ):
+            continue
+        payload = dict(event.payload)
+        key = str(payload.get("key", ""))
+        action_payload = payload.get("action")
+        if key and isinstance(action_payload, dict):
+            actions[key] = Action.model_validate(action_payload)
+    return actions
+
+
+def _all_events(storage: Storage, run_id: str) -> list[Event]:
+    """Read full history when an archive-capable store provides it."""
+    reader = getattr(storage, "read_all_events", None)
+    if callable(reader):
+        read_all_events = cast(Callable[[str], Sequence[Event]], reader)
+        return list(read_all_events(run_id))
+    return list(storage.read_events(run_id))
+
+
+def _children(storage: Storage, run_id: str) -> list[Run]:
+    """Find child runs using the current metadata-based run schema."""
+    return [
+        run
+        for run in storage.list_runs(limit=None)
+        if dict(run.metadata).get("parent_run_id") == run_id
+    ]
+
+
+def _attempts_for_type(events: Sequence[Event], action_type: str) -> int:
+    """Return the highest retry count for one operation in the event log."""
+    attempts: dict[str, int] = {}
+    for event in events:
+        if event.type is not EventType.ACTION_RECORDED:
+            continue
+        action = event.payload.get("action")
+        if not isinstance(action, dict) or action.get("action_type") != action_type:
+            continue
+        key = str(event.payload.get("key", ""))
+        attempts[key] = attempts.get(key, 0) + 1
+    return max(attempts.values(), default=0)
 
 __all__ = [
     "ActionRow",
@@ -139,12 +183,8 @@ def run_rows(storage: Storage) -> list[RunRow]:
 
 
 def overview_lines(storage: Storage, run_id: str) -> list[str]:
-    """The `inspect` view: semantic state, degraded folds included.
-
-    A run whose tail does not fold still answers, naming the break, because
-    the operator needs to see *that* before anything else.
-    """
-    state = CheckpointManager(storage).restore(run_id, on_unprojectable="degrade").state
+    """The `inspect` view: semantic state restored from the current event model."""
+    state = CheckpointManager(storage).restore(run_id).state
     lines = [
         f"run:         {state.run_id}",
         f"goal:        {state.goal.description} (v{state.goal.version})",
@@ -167,78 +207,42 @@ def overview_lines(storage: Storage, run_id: str) -> list[str]:
             f"  - {d.resource}: {d.version or 'unversioned'} [{d.status}]"
             for d in state.external_dependencies
         ]
-    if state.status is StateStatus.INVALID:
-        lines += [
-            "",
-            f"PROJECTION FAILURE: the log stops folding at sequence "
-            f"{state.unprojectable_at_sequence} ({state.unprojectable_event_type})",
-            f"  {state.unprojectable_reason}",
-            "  Figures cover events through the break only; `continuum verify` "
-            "reports the offending event.",
-        ]
     return lines
 
 
-def _human_steps(decision: Any, run_id: str) -> list[str]:
-    """Executable next steps, mirroring the CLI's read-only probe of config."""
-    from continuum.gate import DEFAULT_GATE_CONFIG_PATH
-    from continuum.reconcilers import DEFAULT_RECONCILERS_PATH, load_reconcilers
-    from continuum.recovery.guidance import human_steps_for
-
-    try:
-        probed: list[str] = list(load_reconcilers(Path(DEFAULT_RECONCILERS_PATH)))
-    except Exception:
-        probed = []
-    return human_steps_for(
-        decision,
-        run_id=run_id,
-        probed_types=probed,
-        gate_configured=Path(DEFAULT_GATE_CONFIG_PATH).exists(),
-    )
-
-
 def recovery_lines(storage: Storage, run_id: str) -> list[str]:
-    """The `resume` view without --repair: verdict, family roll-up, advisories.
+    """The `resume` view without --repair: verdict and family roll-up.
 
-    Read-only. The family section repeats the CLI's presentation: a parent may
-    not RESUME while any child is unsafe, and the most cautious signal wins.
+    Read-only. A parent may not RESUME while any child is unsafe, and the most
+    cautious signal wins.
     """
     decision = RecoveryEngine(storage).assess(run_id)
     lines = decision.render().split("\n")
-    steps = _human_steps(decision, run_id)
-    if steps:
-        lines += ["", "Next steps:"] + [f"  {i}. {step}" for i, step in enumerate(steps, 1)]
+    child_statuses: list[tuple[Run, str, bool, int]] = []
+    for child in _children(storage, run_id):
+        try:
+            child_decision = RecoveryEngine(storage).assess(child.run_id)
+            child_statuses.append(
+                (
+                    child,
+                    child_decision.mode.value,
+                    child_decision.safe,
+                    len(child_decision.uncertain_actions),
+                )
+            )
+        except Exception as exc:  # presentation must not drop the child
+            child_statuses.append((child, f"error: {exc}", False, 0))
 
-    child_statuses, family_blocked = roll_up_children(storage, run_id)
-    if family_blocked:
+    blocked = any(not safe or mode != "resume" for _, mode, safe, _ in child_statuses)
+    if blocked:
         lines += [
             "",
             "FAMILY BLOCKED: children of this run are not resumable.",
         ] + [
-            f"  !! child run {c.run_id} is {c.mode} (uncertain={c.uncertain_actions})"
-            for c in child_statuses
-            if not c.safe or c.mode != "resume"
+            f"  !! child run {child.run_id} is {mode} (uncertain={uncertain})"
+            for child, mode, safe, uncertain in child_statuses
+            if not safe or mode != "resume"
         ]
-
-    try:
-        from continuum.recovery.health import advisory_for_storage, advisory_text
-
-        lines += ["", advisory_text(advisory_for_storage(storage, run_id))]
-    except Exception:
-        pass
-    try:
-        from continuum.analysis.prefix_trust import trust_over_prefix
-
-        advisory = trust_over_prefix(decision.state)
-        breakdown = advisory.get("breakdown", {})
-        lines += [
-            f"Prefix trust: {advisory.get('trust_score', 1.0):.3f} "
-            f"(role={breakdown.get('role', 1.0):.3f} "
-            f"goal={breakdown.get('goal', 1.0):.3f} "
-            f"evidence={breakdown.get('evidence', 1.0):.3f})"
-        ]
-    except Exception:
-        pass
     return lines
 
 
@@ -266,7 +270,7 @@ def action_rows(storage: Storage, run_id: str) -> list[ActionRow]:
     so the key offered here is the key that would settle the action.
     """
     storage.get_run(run_id)
-    folded: dict[str, Action] = fold_action_events(storage.read_events(run_id))
+    folded: dict[str, Action] = _fold_action_events(storage.read_events(run_id))
     return [
         ActionRow(
             key=key,
@@ -289,7 +293,7 @@ def event_rows(storage: Storage, run_id: str) -> list[EventRow]:
             type=event.type.value,
             summary=json.dumps(dict(event.payload), default=str),
         )
-        for event in storage.read_all_events(run_id)
+        for event in _all_events(storage, run_id)
     ]
 
 
@@ -298,7 +302,7 @@ def family_lines(storage: Storage, run_id: str) -> list[str]:
     storage.get_run(run_id)
     run = storage.get_run(run_id)
     lines = [f"{run_id}  [{run.status.value}]  {run.goal[:60]}"]
-    children = children_of(storage, run_id)
+    children = _children(storage, run_id)
     if not children:
         lines.append("  (no children)")
     for child in children:
@@ -316,32 +320,33 @@ def family_lines(storage: Storage, run_id: str) -> list[str]:
 
 
 def budget_rows(storage: Storage, run_id: str) -> list[BudgetRow]:
-    """The `budget` view, archive-aware: attempts are counted over the whole
-    log, so compaction does not hand a run a fresh budget (#734)."""
+    """Show event-log retry usage for each action type.
+
+    The current core does not ship a separate budget registry. The dashboard
+    therefore reports the durable attempt count and the conservative default
+    maximum used by this view.
+    """
     storage.get_run(run_id)
-    try:
-        raw = load_budgets(Path(DEFAULT_BUDGETS_PATH))
-    except Exception:
-        raw = {}
-    events = storage.read_all_events(run_id)
-    types_seen = sorted(
-        {
-            e.payload.get("action", {}).get("action_type")
-            for e in events
-            if e.type is EventType.ACTION_RECORDED and isinstance(e.payload.get("action"), dict)
-        }
-        | set((raw.get("action_types") or {}).keys())
-    )
+    events = _all_events(storage, run_id)
+    types_seen: set[str] = set()
+    for event in events:
+        if event.type is not EventType.ACTION_RECORDED:
+            continue
+        action = event.payload.get("action")
+        if not isinstance(action, dict):
+            continue
+        action_type = action.get("action_type")
+        if isinstance(action_type, str):
+            types_seen.add(action_type)
     rows: list[BudgetRow] = []
-    for action_type in types_seen:
-        used = attempts_for_type(events, action_type)
-        _, _, maximum = evaluate_budget(raw, action_type, 0)
+    for action_type in sorted(types_seen):
+        used = _attempts_for_type(events, action_type)
         rows.append(
             BudgetRow(
                 action_type=action_type,
                 attempts=used,
-                max_attempts=maximum,
-                remaining=max(0, maximum - used),
+                max_attempts=_DEFAULT_MAX_ATTEMPTS,
+                remaining=max(0, _DEFAULT_MAX_ATTEMPTS - used),
             )
         )
     return rows

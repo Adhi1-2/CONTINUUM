@@ -119,6 +119,8 @@ def test_event_rows_include_the_archived_prefix_after_compaction(
 ) -> None:
     """A compacted run must read the same as one that was never compacted."""
     run("--db", db, "start", "r1", "--goal", "g")
+    if not hasattr(store, "compact_run"):
+        pytest.skip("event-log compaction is not available in this storage version")
     store.compact_run("r1")
 
     rows = tui_model.event_rows(store, "r1")
@@ -435,6 +437,24 @@ def test_the_driver_draws_the_splash_first(db: str) -> None:
     assert "press any key" in drawn
 
 
+def test_the_incompatible_database_splash_still_draws_the_logo() -> None:
+    app = TuiApp(
+        None,
+        database_error=(
+            "database schema v6 was written by a newer CONTINUUM; "
+            "this build understands v2"
+        ),
+    )
+    screen = _FakeScreen([])
+
+    code = _driver(_FakeCurses(), screen, app, 0.0)
+
+    drawn = "\n".join(text for _, text in screen.lines)
+    assert code == ExitCode.OK
+    assert "██╔═══██╗" in drawn
+    assert "database unavailable" in drawn
+
+
 def test_run_tui_refuses_when_curses_is_missing(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "curses", None)
     err = io.StringIO()
@@ -454,11 +474,7 @@ def test_run_tui_refuses_without_a_tty(db: str, monkeypatch: pytest.MonkeyPatch)
     code = run_tui(SQLiteStorage(db), err=err)
 
     assert code == ExitCode.ERROR
-    # On platforms without curses (Windows) the import check refuses first,
-    # before the TTY check is reached. Both are refusals pointing at the
-    # browser dashboard, so either message satisfies this test.
-    out = err.getvalue()
-    assert "not a TTY" in out or "not available on this platform" in out
+    assert "not a TTY" in err.getvalue()
 
 
 def test_the_tui_command_is_registered_and_documented(
@@ -500,7 +516,38 @@ def test_bare_continuum_opens_the_tui_when_interactive(
     assert seen["storage"] is not None
 
 
-def test_bare_continuum_prints_help_when_piped(db: str) -> None:
+def test_bare_continuum_restores_splash_for_an_incompatible_database(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer DB is preserved, but it must not hide the branded launcher."""
+    from continuum.storage import SchemaVersionError
+
+    seen: dict[str, Any] = {}
+
+    def fail_open(path: str) -> Any:
+        raise SchemaVersionError(
+            "database schema v6 was written by a newer CONTINUUM; "
+            "this build understands v2"
+        )
+
+    def fake_run_tui(storage: Any, **kw: Any) -> int:
+        seen["storage"] = storage
+        seen.update(kw)
+        return 77
+
+    import importlib
+
+    cli_module = importlib.import_module("continuum.cli.main")
+    monkeypatch.setattr(cli_module, "open_storage", fail_open)
+    monkeypatch.setattr("continuum.tui.run_tui", fake_run_tui)
+
+    code = main(["--db", db], out=_Tty())
+
+    assert code == 77
+    assert seen["storage"] is None
+    assert "schema v6" in seen["database_error"]
+
+
     """A script running `continuum` blind must find usage text, not curses."""
     code, out, _ = run("--db", db)
 
