@@ -74,6 +74,8 @@ class ProvenanceGraph:
     reverse_edges: dict[str, list[str]] = field(default_factory=dict)
 
     def add_node(self, node: ProvenanceNode) -> None:
+        """Insert or replace a node and initialise its adjacency lists."""
+
         self.nodes[node.event_id] = node
         self.edges.setdefault(node.event_id, [])
         self.reverse_edges.setdefault(node.event_id, [])
