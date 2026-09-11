@@ -30,7 +30,7 @@ from continuum.replayguard import (  # noqa: E402
     langgraph_protected_node,
     protected_call,
 )
-from continuum.storage import SQLiteStorage  # noqa: E402
+from continuum.storage import SQLiteStorage
 
 
 @pytest.fixture
