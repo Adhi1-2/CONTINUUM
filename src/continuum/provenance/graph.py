@@ -81,6 +81,8 @@ class ProvenanceGraph:
         self.reverse_edges.setdefault(node.event_id, [])
 
     def add_edge(self, parent_id: str, child_id: str) -> None:
+        """Link two known nodes, ignoring edges with an unknown endpoint."""
+
         if parent_id not in self.nodes or child_id not in self.nodes:
             return
         if child_id not in self.edges.get(parent_id, []):
