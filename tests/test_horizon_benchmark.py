@@ -139,6 +139,41 @@ def test_table_regenerates_from_runner_no_invented_numbers(tmp_path: Path) -> No
 
 
 @pytest.mark.slow
+def test_publish_flag_refreshes_bench_md() -> None:
+    # --publish refreshes the latest-results block in references/bench.md
+    # without touching the default-run behavior above. Same anchoring and
+    # restore discipline as the README test (issue #837).
+    root = Path(__file__).resolve().parents[1]
+    bench_md = root / "references" / "bench.md"
+    readme = root / "README.md"
+    if bench_md.exists():
+        original_bench = bench_md.read_text(encoding="utf-8")
+        original_readme = readme.read_text(encoding="utf-8") if readme.exists() else None
+        import subprocess
+        import sys
+
+        try:
+            result = subprocess.run(
+                [sys.executable, str(root / "benchmarks/run.py"), "--publish"],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                cwd=root,
+            )
+            assert result.returncode == 0, result.stderr
+            regenerated = bench_md.read_text(encoding="utf-8")
+            assert "<!-- BENCH:START -->" in regenerated
+            assert "<!-- BENCH:END -->" in regenerated
+            assert regenerated.count("<!-- BENCH:START -->") == 1
+        finally:
+            # The subprocess also rewrites README.md with a fresh timestamp,
+            # so restore both files and never leave the tree dirty.
+            bench_md.write_text(original_bench, encoding="utf-8")
+            if original_readme is not None:
+                readme.write_text(original_readme, encoding="utf-8")
+
+
+@pytest.mark.slow
 def test_shared_emitter_schema_with_fault_injection() -> None:
     # Both suites share the same BenchmarkReport envelope
     import json
