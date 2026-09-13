@@ -57,13 +57,13 @@ CONTINUUM asks a narrower, harder question: can an agent resume from a compact s
 
 ## Quick Start
 
-Published to PyPI as `continuum-agent` 0.1.0: `pip install continuum-agent` (`pip install continuum-agent==0.1.0` to pin). Release tags additionally ship built wheels attached to [GitHub Releases](https://github.com/Cyrax321/CONTINUUM/releases).
+Published to PyPI as `continuum-agent` 0.1.2: `pip install continuum-agent` (`pip install continuum-agent==0.1.2` to pin). Release tags additionally ship built wheels attached to [GitHub Releases](https://github.com/Cyrax321/CONTINUUM/releases).
 
 Paths that need no clone and no local install:
 
 | Path | How |
 |:--|:--|
-| Install from PyPI | `pip install continuum-agent==0.1.0`, then `continuum --help` |
+| Install from PyPI | `pip install continuum-agent==0.1.2`, then `continuum --help` |
 | Watch crash recovery happen end to end | `docker run --rm ghcr.io/cyrax321/continuum` |
 | Use the CLI through Docker | `docker run --rm ghcr.io/cyrax321/continuum continuum --help` |
 | Run the CLI without cloning | `uvx --from git+https://github.com/Cyrax321/CONTINUUM.git continuum --help` |
@@ -99,7 +99,7 @@ Verify:
 ```bash
 continuum --help                 # CLI entrypoint
 continuum-mcp --help             # MCP server entrypoint (needs [mcp] or [dev])
-pytest -q                        # ~2,163 collected, ~2,030 passed, ~23 skipped on a minimal env (exact counts vary)
+pytest -q                        # ~2,195 collected, ~2,030 passed, ~23 skipped on a minimal env (exact counts vary)
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # the three gates CI enforces
 ```
@@ -232,7 +232,7 @@ CONTINUUM is verified against real LLM agents, live protocol boundaries, and har
 - **Third-party clients**: Gemini CLI and Kilo Code connected over stdio JSON-RPC against the live SQLite store, validating multi-agent co-existence and authorization isolation.
 - **Protocol compliance**: driven end to end with `@modelcontextprotocol/inspector --cli` across process deaths; mutating tools deny by default behind `CONTINUUM_MCP_MUTATING_CLIENTS`; external claims degrade to `REQUIRES_REVIEW` (`safe: false`).
 - **Self-healing**: hard-killed servers recover from orphaned SQLite `-wal`/`-shm` sidecars via single-retry cleanup at startup.
-- **Scale**: roughly 2,163 tests collected (~2,030 passing; the rest skip without optional services) on Python 3.11, 3.12, and 3.13 (unit, `hypothesis` property-based, concurrency, adversarial). CONTINUUM-Bench runs five crash scenarios plus a dedicated argument-drift scenario, measuring 0 duplicate work and 0 duplicate side effects for CONTINUUM against full duplication for naive replay; a separate 14-scenario recovery-correctness suite (`continuum.benchmark.phase6`) encodes the crash points from the durable-execution survey as executable assertions, and an 8-fault risk-injection suite (`benchmarks/fault_injection/`) grades failure handling.
+- **Scale**: roughly 2,195 tests collected (~2,030 passing; the rest skip without optional services) on Python 3.11, 3.12, and 3.13 (unit, `hypothesis` property-based, concurrency, adversarial). CONTINUUM-Bench runs five crash scenarios plus a dedicated argument-drift scenario, measuring 0 duplicate work and 0 duplicate side effects for CONTINUUM against full duplication for naive replay; a separate 14-scenario recovery-correctness suite (`continuum.benchmark.phase6`) encodes the crash points from the durable-execution survey as executable assertions, and an 8-fault risk-injection suite (`benchmarks/fault_injection/`) grades failure handling.
 - **Adversarial audit**: the full MCP surface was audited over the live protocol; three defects were found and fixed. Method and reproduction steps in [test.md](test.md).
 
 <!-- BENCH:START -->
@@ -425,7 +425,7 @@ Schema v6. SQLite is primary, Postgres is CI verified. One log, many projections
 
 ### Module map: one library, many surfaces
 
-CONTINUUM is one library (`src/continuum`, 124 modules) plus a large test suite (161 test files, ~2,163 tests). All modules append to and replay one hash chained event log:
+CONTINUUM is one library (`src/continuum`, 124 modules) plus a large test suite (161 test files, ~2,195 tests). All modules append to and replay one hash chained event log:
 
 | Module | Role |
 |:--|:--|
@@ -530,7 +530,7 @@ CONTINUUM sits at the overlap of durable execution, idempotent side-effect track
 ## Status and limitations
 
 - **Tested**: 1,360 passed + 23 skipped in a full run at the 2026-08-24 audit of this tree; CI enforces the suite on Python 3.11, 3.12, and 3.13, and counts vary by platform and optional services such as Postgres (see [STATUS.md](STATUS.md)). The MCP surface has also been audited adversarially over the live protocol; see [test.md](test.md).
-- **On PyPI as `continuum-agent` 0.1.0** (`pip install continuum-agent`; clone still works via `pip install .` see Quick Start).
+- **On PyPI as `continuum-agent` 0.1.2** (`pip install continuum-agent`; clone still works via `pip install .` see Quick Start).
 - **MCP caller authentication is opt-in per deployment.** When `CONTINUUM_MCP_TOKEN` is set, the server refuses every mutating tool unless the caller presents that shared secret in the `initialize` handshake's `_meta.authToken`; per-caller secrets are available via `CONTINUUM_MCP_CLIENT_TOKENS` (`name:secret` pairs). Without any token configured, authorization is by declared identity only (the historical default, preserved for local single-user use).
 - **Confirming self-reported state over MCP requires a separate secret.** `continuum_confirm` refuses every caller until the operator sets `CONTINUUM_MCP_CONFIRM_TOKEN`, because an agent allowed to record progress must not also be able to confirm it. The default path stays human-driven: run `continuum confirm <run_id>` on the host.
 - **Unbuilt components**: Cloud API (Phase 13).

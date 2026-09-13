@@ -55,13 +55,13 @@ O CONTINUUM faz uma pergunta mais estreita e mais difícil: um agente pode retom
 
 ## Início rápido
 
-Publicado no PyPI como `continuum-agent` 0.1.0, execute `pip install continuum-agent` (`pip install continuum-agent==0.1.0` para fixar a versão). As tags de release também anexam wheels construídos em [GitHub Releases](https://github.com/Cyrax321/CONTINUUM/releases).
+Publicado no PyPI como `continuum-agent` 0.1.2, execute `pip install continuum-agent` (`pip install continuum-agent==0.1.2` para fixar a versão). As tags de release também anexam wheels construídos em [GitHub Releases](https://github.com/Cyrax321/CONTINUUM/releases).
 
 Caminhos sem configuração (sem clonar, sem instalar, sem publicar nada):
 
 | Caminho | Como |
 |:--|:--|
-| Instalar do PyPI | `pip install continuum-agent==0.1.0` e depois `continuum --help` |
+| Instalar do PyPI | `pip install continuum-agent==0.1.2` e depois `continuum --help` |
 | Ver a recuperação de falha de ponta a ponta | `docker run --rm ghcr.io/cyrax321/continuum` |
 | Usar a CLI via Docker | `docker run --rm ghcr.io/cyrax321/continuum continuum --help` |
 | Executar a CLI sem clonar | `uvx --from git+https://github.com/Cyrax321/CONTINUUM.git continuum --help` |
@@ -96,7 +96,7 @@ Verifique:
 ```bash
 continuum --help                 # ponto de entrada CLI
 continuum-mcp --help             # ponto de entrada do servidor MCP (precisa de [mcp] ou [dev])
-pytest -q                        # ~2,163 coletados, ~2,030 passando, ~23 pulados em um ambiente mínimo (as contagens exatas variam)
+pytest -q                        # ~2,195 coletados, ~2,030 passando, ~23 pulados em um ambiente mínimo (as contagens exatas variam)
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # os três portões que o CI exige
 ```
@@ -229,7 +229,7 @@ O CONTINUUM é verificado contra agentes LLM reais, limites de protocolo ao vivo
 - **Clientes de terceiros**: Gemini CLI e Kilo Code conectados via stdio JSON-RPC contra o armazenamento SQLite ao vivo, validando coexistência multiagente e isolamento de autorização.
 - **Conformidade de protocolo**: conduzido de ponta a ponta com `@modelcontextprotocol/inspector --cli` através de mortes de processo, ferramentas mutantes negam por padrão atrás de `CONTINUUM_MCP_MUTATING_CLIENTS`, reivindicações externas degradam para `REQUIRES_REVIEW` (`safe: false`).
 - **Auto reparo**: servidores mortos de forma brusca se recuperam de sidecars órfãos `-wal`/`-shm` do SQLite por meio de limpeza de uma única tentativa ao iniciar.
-- **Escala**: cerca de 2,163 testes coletados (~2,030 passando, o resto pula sem serviços opcionais) em Python 3.11, 3.12 e 3.13 (unitários, baseados em propriedades com `hypothesis`, concorrência, adversariais). O CONTINUUM-Bench executa cinco cenários de queda mais um cenário dedicado de deriva de argumentos, medindo 0 trabalho duplicado e 0 efeitos colaterais duplicados para o CONTINUUM frente à duplicação total para a reprodução ingênua, mais uma suíte separada de 12 cenários de correção de recuperação (`continuum.benchmark.phase6`) que codifica os pontos de queda do estudo de execução durável como asserções executáveis.
+- **Escala**: cerca de 2,195 testes coletados (~2,030 passando, o resto pula sem serviços opcionais) em Python 3.11, 3.12 e 3.13 (unitários, baseados em propriedades com `hypothesis`, concorrência, adversariais). O CONTINUUM-Bench executa cinco cenários de queda mais um cenário dedicado de deriva de argumentos, medindo 0 trabalho duplicado e 0 efeitos colaterais duplicados para o CONTINUUM frente à duplicação total para a reprodução ingênua, mais uma suíte separada de 14 cenários de correção de recuperação (`continuum.benchmark.phase6`) que codifica os pontos de queda do estudo de execução durável como asserções executáveis.
 - **Auditoria adversarial**: a superfície MCP completa foi auditada sobre o protocolo ao vivo, três defeitos foram encontrados e corrigidos. Método e passos de reprodução em [test.md](test.md).
 
 ## Integração MCP
@@ -395,7 +395,7 @@ Esquema v6. SQLite é primário, Postgres verificado por CI. Um log, muitas proj
 
 ### Mapa de módulos, uma biblioteca, muitas superfícies
 
-O CONTINUUM é uma biblioteca (`src/continuum`, 124 módulos) mais uma suíte de testes grande (161 arquivos de teste, ~2,163 testes). Todos os módulos acrescentam e reproduzem um log de eventos encadeado:
+O CONTINUUM é uma biblioteca (`src/continuum`, 124 módulos) mais uma suíte de testes grande (161 arquivos de teste, ~2,195 testes). Todos os módulos acrescentam e reproduzem um log de eventos encadeado:
 
 | Módulo | Papel |
 |:--|:--|
@@ -419,7 +419,7 @@ O CONTINUUM é uma biblioteca (`src/continuum`, 124 módulos) mais uma suíte de
 | `dashboard/` | Dashboard web `app.py` `hitl.py` com botões HITL confirmar/reconciliar/completar, aviso de confiança de prefixo, fixações |
 | `cli/` | 38 comandos argparse, códigos de saída como veredito, `runs, start, inspect, resume, verify, health, tree, benchmark, attest, dashboard` |
 | `otel.py` | Ponte de processador de spans do OpenTelemetry |
-| `benchmark/` | Harness do CONTINUUM-Bench, 5 cenários de queda + deriva de argumentos + suíte de recuperação de 12 cenários |
+| `benchmark/` | Harness do CONTINUUM-Bench, 5 cenários de queda + deriva de argumentos + suíte de recuperação de 14 cenários |
 
 ### Limitações honestas
 
@@ -500,7 +500,7 @@ O CONTINUUM se situa na interseção de execução durável, rastreamento idempo
 ## Status e limitações
 
 - **Testado**: 1,360 passados + 23 pulados em uma execução completa na auditoria de 2026-08-24 desta árvore, CI impõe a suíte em Python 3.11, 3.12 e 3.13, e as contagens variam por plataforma e serviços opcionais como Postgres (ver [STATUS.md](STATUS.md)). A superfície MCP também foi auditada de forma adversarial sobre o protocolo ao vivo, ver [test.md](test.md).
-- **No PyPI como `continuum-agent` 0.1.0** (`pip install continuum-agent`, o clone ainda funciona via `pip install .` ver Início rápido).
+- **No PyPI como `continuum-agent` 0.1.2** (`pip install continuum-agent`, o clone ainda funciona via `pip install .` ver Início rápido).
 - **Autenticação de chamador MCP é opcional por implantação.** Quando `CONTINUUM_MCP_TOKEN` é definido, o servidor recusa cada ferramenta mutante a menos que o chamador apresente esse segredo compartilhado no `_meta.authToken` do handshake `initialize`, segredos por chamador disponíveis via `CONTINUUM_MCP_CLIENT_TOKENS` (pares `name:secret`). Sem nenhum token configurado, a autorização é apenas por identidade declarada (o valor histórico padrão, preservado para uso local de usuário único).
 - **Confirmar estado auto reportado via MCP requer um segredo separado.** `continuum_confirm` recusa cada chamador até que o operador defina `CONTINUUM_MCP_CONFIRM_TOKEN`, porque um agente com permissão para registrar progresso não deve também ter permissão para confirmá-lo. O caminho padrão permanece conduzido por humano: execute `continuum confirm <run_id>` no host.
 - **Componentes não construídos**: API na nuvem (Fase 13).

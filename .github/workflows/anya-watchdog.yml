@@ -1,0 +1,47 @@
+name: Anya watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Catches silently dropped review assignments: if Anya is a pending
+# reviewer with no run and no formal review behind her, re-request the
+# review to refire the assignment event. Re-request is proven to work
+# where the original event was dropped.
+jobs:
+  nudge:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Refire stuck assignments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          for PR in $(gh pr list --limit 50 --json number,headRefName,reviewRequests --jq '.[] | select([.reviewRequests[].login] | index("anya-research")) | "\(.number) \(.headRefName)"' | tr '\n' ';'); do
+            N="${PR%% *}"
+            BR="${PR##* }"
+            FORMAL=$(gh api "repos/${{ github.repository }}/pulls/$N/reviews" --jq '[.[] | select(.user.login == "anya-research" and .state != "COMMENTED" and .state != "DISMISSED") | .state] | length')
+            if [ "$FORMAL" != "0" ]; then
+              echo "#$N already has Anya formal review, skipping."
+              continue
+            fi
+            RECENT=$(gh run list --workflow=anya-review.yml --limit 30 --json conclusion,status,createdAt,event,headBranch --jq --arg br "$BR" '
+              [.[]
+               | select(.headBranch == $br)
+               | select(.event == "pull_request" or .status == "in_progress" or .status == "queued")
+               | select(.status == "in_progress" or .status == "queued" or .createdAt > (now - 2700 | todate))
+              ] | length')
+            if [ "$RECENT" != "0" ]; then
+              echo "#$N has recent Anya activity, skipping."
+              continue
+            fi
+            gh pr edit "$N" --remove-reviewer anya-research > /dev/null
+            sleep 10
+            gh pr edit "$N" --add-reviewer anya-research > /dev/null
+            echo "Refired assignment on #$N."
+          done

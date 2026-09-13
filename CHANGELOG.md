@@ -27,6 +27,17 @@ All notable changes to this project are documented here. The format follows
   `ruff check`, `ruff format --check`, `mypy src/continuum`, and the pytest
   suite remain green.
 
+### Changed
+
+- **Unified StateExtractor protocol (#783).** `plugins/seams.py` previously
+  declared its own `StateExtractor` Protocol with a `(trajectory, environment)`
+  signature that was incompatible with the canonical `(ExtractionContext)`
+  Protocol in `state/extractor.py`. The seams module now re-exports the
+  canonical protocol from `state/extractor.py`, so the plugin registry and the
+  core library share one contract. The `ExtractionContext` dataclass (with
+  `base` for composite chaining) is now the single shape every extractor
+  accepts. Covered by `tests/test_plugins.py` and `tests/test_extractor.py`.
+
 ### Added
 
 - **Nightly bench publish CI (#570).** New `.github/workflows/bench-nightly.yml`
@@ -734,7 +745,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,163 collected, ~2,030 passed, ~23 skipped on a minimal env).
+  (~2,195 collected, ~2,030 passed, ~23 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
