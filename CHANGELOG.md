@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead `observations_evidence_lines` helper (#867).** The function in
+  `src/continuum/recovery/observations.py` was defined once and called
+  nowhere: leftover scaffolding from #208 whose engine-side rendering at
+  `recovery/engine.py` formats the same evidence its own way. Dead code in a
+  safety-critical path misled the next reader into thinking contract evidence
+  flows through it. No callers, not exported through `__all__`; recoverable
+  from history (355ba76) if a future surface needs that exact rendering.
+
 ### Fixed
 
 - **MCP and sidecar ledger writes now carry `EXTERNAL_AGENT` (#653).**
