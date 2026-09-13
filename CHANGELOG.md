@@ -196,12 +196,15 @@ All notable changes to this project are documented here. The format follows
   folded only the live tail. After the first compaction that tail begins at
   the anchor markers with no `RUN_STARTED`, so every later compact failed
   with `ValueError: ... could not be anchored: ... has no goal` and
-  long-lived runs — the ones compaction exists for — accumulated an
+  long-lived runs, the ones compaction exists for, accumulated an
   unbounded live tail. The anchor path in `compact_run` now projects over
   full history via `project_current(run_id, full_history=True)`; per-turn
   checkpoint evaluation and `restore` deliberately keep the bounded live-tail
   read, and the anchor checkpoint shape and the single-transaction archive
-  marker are unchanged. Covered by `tests/test_compaction.py`.
+  marker are unchanged. Both engines fix the same defect: SQLite and
+  Postgres `compact_run` take the anchor through the same full-history
+  projection. Covered by `tests/test_compaction.py` and its Postgres twin
+  in `tests/test_storage_postgres.py`.
 
 - Preserve archived action history in grant and authority enforcement, CLI and
   gateway gate decisions, cross-run action scans, and memory enumeration and
