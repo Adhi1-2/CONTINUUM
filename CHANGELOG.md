@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Curated briefing by provenance (#742).** `continuum briefing` no longer
+  rehydrates the newest agent-authored reasoning summary verbatim. A pure,
+  deterministic curation layer (`continuum.recovery.briefing_curation`) builds
+  the resume context from the sealed recovery contract, validated semantic
+  state, system-derived attempt lessons (#313), trajectory reports (#393) and
+  the engine-recorded informed-retry block (#265), each section labeled
+  `verified` / `system` / `agent` with an inclusion reason, most trusted
+  first. Stale, invalidated and requires-review evidence and findings are
+  quarantined under a "do not trust" header with reasons instead of silently
+  disappearing; agent summaries whose environment pins no longer hold are
+  omitted from the rehydrated context and noted with the reason. The verbatim
+  summary remains reachable through the explicit `continuum briefing
+  --raw-summary` diagnostic. `tests/test_briefing_curation.py` pins ordering,
+  provenance labels, quarantine, omission, determinism and the size caps;
+  recovery verdicts and safety semantics are unchanged.
+
 ### Fixed
 
 - **MCP and sidecar ledger writes now carry `EXTERNAL_AGENT` (#653).**

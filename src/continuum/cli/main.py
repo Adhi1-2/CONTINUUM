@@ -2296,6 +2296,20 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
     contract = decision.contract
     state = decision.state
 
+    # Diagnostic path (issue #742): the raw agent summary stays reachable,
+    # verbatim, for an operator debugging the curation. Explicit opt-in, so
+    # the default briefing is the curated one.
+    if getattr(args, "raw_summary", False):
+        summaries = [
+            e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY
+        ]
+        if not summaries:
+            print(f"No reasoning summary recorded for {run_id}.", file=out)
+            return ExitCode.OK
+        payload = dict(summaries[-1].payload)
+        print(json.dumps(payload, indent=2, ensure_ascii=False), file=out)
+        return ExitCode.OK
+
     lines: list[str] = []
     # Instant resume banner (issue #394): when .continuum/resume.json exists
     # it was written on the last checkpoint and names the interrupted run.
@@ -2313,28 +2327,14 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
             pass
     lines += [
         f"CONTINUUM active run: {run_id}",
-        f"goal: {state.goal.description}",
-        f"progress: {state.progress.completed}/{state.progress.total or '?'} completed"
-        + (f", {state.progress.failed} failed" if state.progress.failed else ""),
-        f"recovery: {decision.mode.value} (safe={decision.safe})",
     ]
-    # Newest reasoning summary (#235): the resumed agent inherits the dead
-    # session's plan state, not just its progress counters.
-    summaries = [e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY]
-    if summaries:
-        summary = summaries[-1].payload.get("summary", {})
-        lines.append("where the last session left off (self-authored):")
-        for item in summary.get("plan_stack", [])[:3]:
-            lines.append(f"  plan: {item}")
-        for d in summary.get("decisions", [])[-3:]:
-            what = d.get("what", "")
-            why = d.get("why", "")
-            lines.append(f"  decision: {what}" + (f" ({why})" if why else ""))
-        for q in summary.get("open_questions", [])[:3]:
-            lines.append(f"  open: {q}")
-        ws = summary.get("working_set", [])
-        if ws:
-            lines.append(f"  working set: {', '.join(map(str, ws[:5]))}")
+    # Curated resume context (issue #742): provenance-labeled sections,
+    # verified first, agent material last, stale items quarantined with
+    # reasons. Pure and deterministic; the verdict is an input, never changed.
+    from continuum.recovery.briefing_curation import curate_briefing, render_curated_briefing
+
+    curated = curate_briefing(storage, run_id, decision)
+    lines += render_curated_briefing(curated)
 
     obs = contract.post_checkpoint_observations[:5]
     if obs:
@@ -2342,27 +2342,6 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
         lines += [
             f"  [{o.get('status', '?')}] {o.get('path', '')}" for o in obs if not o.get("truncated")
         ]
-    # Informed retry (#265): the engine's account of prior attempts, next to
-    # the agent's own summary above. Absent history means no section.
-    if decision.informed_retry:
-        from continuum.recovery.summary import render_informed_retry
-
-        lines.append("what previous attempts changed (engine-recorded):")
-        lines += [f"  {line}" for line in render_informed_retry(decision.informed_retry)]
-    # Structured attempt memory (issue #313): after verified state before open questions.
-    if state.attempt_lessons:
-        from continuum.recovery.summary import render_attempt_lesson
-
-        lines.append("attempt lessons (system-derived):")
-        for lesson in state.attempt_lessons:
-            lines += [f"  {line}" for line in render_attempt_lesson(lesson)]
-    # Sleep-time trajectory reports (issue #393): distilled from archived history
-    if getattr(state, "trajectory_reports", None):
-        from continuum.analysis.trajectory_report import render_trajectory_report
-
-        lines.append("trajectory reports (sleep-time, system-derived):")
-        for report in state.trajectory_reports:
-            lines += [f"  {line}" for line in render_trajectory_report(report)]
     if steps:
         lines.append("next steps:")
         lines += [f"  {i}. {t}" for i, t in enumerate(steps, 1)]
@@ -2376,6 +2355,9 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
             "safe": decision.safe,
             "context": context,
             "human_steps": steps,
+            "curated_sections": curated["sections"],
+            "quarantine": curated["quarantine"],
+            "omitted": curated["omitted"],
             "attempt_lessons": [lesson.model_dump(mode="json") for lesson in state.attempt_lessons],
             "trajectory_reports": [
                 report.model_dump(mode="json") for report in state.trajectory_reports
@@ -3930,6 +3912,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="hook_event_name",
         default="SessionStart",
         help=argparse.SUPPRESS,
+    )
+    briefing.add_argument(
+        "--raw-summary",
+        dest="raw_summary",
+        action="store_true",
+        default=False,
+        help="print the raw agent reasoning summary verbatim (diagnostic; default is the curated briefing).",
     )
 
     precompact = with_env(
