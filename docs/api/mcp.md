@@ -247,6 +247,12 @@ repository does instead:
   framing in its output: a Windows run reports `CRLF (\r\n)`, a Linux run
   reports `LF (\n)`. Run it when a Windows client fails in a way a Linux one
   does not.
+- The suite pins the framing on the raw wire
+  (`tests/test_mcp_entrypoint.py`): binary pipes, no newline translation, an
+  assert that every response frame ends `b"\r\n"` on Windows and `b"\n"`
+  elsewhere. If the SDK ever fixes #2433, that assert is what turns the change
+  into a visible CI failure instead of a silent behaviour shift, and this
+  section follows it.
 - A strict client has to tolerate both terminators or fail everywhere on
   Windows; if yours does not, that is the client side of the upstream issue,
   not a CONTINUUM configuration.

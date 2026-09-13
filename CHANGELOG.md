@@ -57,6 +57,19 @@ All notable changes to this project are documented here. The format follows
   against the calling process's PATH, never the environment passed to the
   child, so the suite can now tell a broken entry point (#697) from an
   unreachable one.
+- **Raw-wire framing is pinned by the suite (#839).** The smoke script already
+  reports whether response frames end `LF` or `CRLF`; the gap was that no test
+  asserted it. `tests/test_mcp_entrypoint.py` now drives `initialize` +
+  `tools/list` over binary pipes (a text-mode pipe applies universal newlines
+  and rewrites `\r\n` to `\n`, hiding the difference) and asserts every
+  response frame ends `b"\r\n"` on Windows (the upstream SDK defect,
+  modelcontextprotocol/python-sdk#2433, documented in `docs/api/mcp.md`) and
+  `b"\n"` elsewhere, so an upstream fix or a local regression becomes a CI
+  failure instead of a Windows-only user report. The frame parser accepts
+  either terminator, pinning that client-side tolerance too. With the framing
+  assertions the issue's test plan is complete: entry-point realism landed in
+  #881, the install matrix (#837) runs the smoke over the console script on
+  all three OSes, and this closes the raw-bytes half.
 - **Completed actions record consumed inputs for restore-point admissibility (#558).**
   `ActionLedger.complete` and `reconcile` accept an optional `consumed_inputs`
   mapping (`checkpoint_seq`, `event_positions`, `component_ids`, `action_ids`),
@@ -745,7 +758,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,195 collected, ~2,030 passed, ~23 skipped on a minimal env).
+  (~2,198 collected, ~2,030 passed, ~23 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
