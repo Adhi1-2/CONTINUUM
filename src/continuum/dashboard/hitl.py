@@ -42,6 +42,16 @@ class HitlUnauthorized(Exception):
 
 
 def authorize_hitl(token_from_request: str | None) -> None:
+    """Refuse the call unless the operator token matches, fail-closed.
+
+    Mutating dashboard endpoints are unusable until ``CONTINUUM_DASHBOARD_TOKEN``
+    is set in the server's environment: a missing variable is a refusal, not an
+    open door, matching the MCP authz posture (issue #242). The comparison is
+    plain equality - the token rides in an Authorization header over a channel
+    the operator owns; when it is absent or wrong, :class:`HitlUnauthorized`
+    names which of the two failed so the operator is told to fix the server,
+    not their client.
+    """
     import os
 
     expected = os.environ.get(DEFAULT_HITL_TOKEN_ENV)
@@ -52,6 +62,14 @@ def authorize_hitl(token_from_request: str | None) -> None:
 
 
 def confirm_run(storage: Storage, run_id: str) -> None:
+    """Record a human review confirmation, clearing self-certification gates.
+
+    Appends ``REVIEW_CONFIRMED`` with ``Origin.HUMAN`` - the same event the
+    ``continuum confirm`` CLI verb lands - so a run parked in ``request_human``
+    by agent-asserted evidence can resume. A missing run raises from
+    ``get_run`` before anything is written; the confirmation is scoped to
+    ``goal`` and ``progress`` components, mirroring what the CLI seals.
+    """
     storage.get_run(run_id)
     storage.append_event(
         run_id,
@@ -62,6 +80,15 @@ def confirm_run(storage: Storage, run_id: str) -> None:
 
 
 def complete_run(storage: Storage, run_id: str, summary: str = "") -> None:
+    """Close the run as completed, from a human, with the log to match.
+
+    Appends ``RUN_COMPLETED`` (``Origin.HUMAN``) and flips the run row to
+    ``COMPLETED`` - the same pairing as ``continuum complete``. The optional
+    summary is embedded in the event payload and omitted entirely when empty,
+    so the log never carries a ``""`` placeholder that reads as a truncated
+    note. A missing run raises from ``get_run`` first; a run already terminal
+    is still closable the way the CLI allows it.
+    """
     run = storage.get_run(run_id)
     note = {"closed_by": "dashboard"}
     if summary:
@@ -78,6 +105,16 @@ def reconcile_action(
     occurred: bool,
     external_id: str | None = None,
 ) -> None:
+    """Settle one uncertain side effect from real-world evidence (issue #29).
+
+    Delegates to :meth:`ActionLedger.reconcile` so the dashboard button and
+    ``continuum reconcile`` land the identical ``ACTION_RECONCILED`` event:
+    ``occurred=True`` records the effect was found in the world (intent and
+    world had drifted), ``occurred=False`` confirms absence. An unknown
+    ``ledger_key`` raises ``UnknownActionKey`` from the ledger rather than
+    silently recording a settlement about a key that never existed; the
+    optional ``external_id`` names the outside-world object for later audit.
+    """
     ActionLedger(storage, run_id).reconcile(
         ledger_key,
         occurred=occurred,
