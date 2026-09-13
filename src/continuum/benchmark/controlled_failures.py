@@ -105,7 +105,7 @@ SCENARIOS: tuple[ControlledScenario, ...] = (
 
 
 def by_name(name: str) -> ControlledScenario:
-    """Look up a controlled failure scenario by name."""
+    """Look up a controlled failure scenario by name, raising KeyError when unknown."""
 
     for scenario in SCENARIOS:
         if scenario.scenario == name:
