@@ -447,7 +447,7 @@ CONTINUUM is one library (`src/continuum`, 124 modules) plus a large test suite 
 | `mcp/` | 12 stdio tools plus authz `authz.py` token auth, allowlist, confirmation token |
 | `serve/` | Sidecar stdio JSON wire + HTTP `CONTINUUM_SERVE_TOKEN` |
 | `dashboard/` | Web dashboard `app.py` `hitl.py` with HITL buttons confirm/reconcile/complete, prefix trust advisory, pins |
-| `cli/` | 45 argparse commands, exit codes as verdict: `runs, start, inspect, resume, verify, health, tree, benchmark, attest, dashboard` |
+| `cli/` | 46 argparse commands, exit codes as verdict: `runs, start, inspect, resume, verify, health, tree, benchmark, attest, dashboard` |
 | `otel.py` | OpenTelemetry span processor bridge |
 | `benchmark/` | CONTINUUM-Bench harness: 5 crash scenarios + argument drift + 14 scenario recovery suite + 8 fault risk injection |
 
@@ -455,7 +455,6 @@ CONTINUUM is one library (`src/continuum`, 124 modules) plus a large test suite 
 
 - Gate does not see inside shell commands (Bash/curl bypass structured tool claims)
 - Postgres backend is CI tested but not battle tested in production
-- No webhook out for `request_human` notifications yet (#305)
 - One level of multi agent hierarchy v1
 - Large payload offloading (#254) not yet implemented
 - Weeks scale benchmark with token cost table lands in #550 board (#568 to #570)
@@ -507,7 +506,7 @@ Every command accepts `--json`, and read-only commands never write, so they are 
 | 13 | Cloud API (FastAPI + PostgreSQL) | Partial: the PostgreSQL storage backend and the HTTP sidecar transport (`continuum serve --transport http`) are shipped and CI-tested; the hosted multi-tenant service is not started |
 | 14 | Dashboard | Complete (`continuum dashboard`) |
 | 15+ | Enforced durability: observation hooks, gate, session briefing, reconciler probes, enforcing gateway, OTel bridge, action index, executable guidance, multi-client installers, semantic replay detection, version pinning, retry budgets, log compaction, HITL surface, fork semantics, informed retry, multi-agent aggregation | Complete (see issue #213) |
-| Next | Months-scale durability plane: milestone-anchored plans (#312), structured attempt memory (#313), atomic dual-state rewind (#292), public recovery-correctness benchmark (#293), webhook-out notifications (#305) | Planned (draft spec in [docs/UPGRADE_SPEC.md](docs/UPGRADE_SPEC.md)) |
+| Next | Months-scale durability plane: milestone-anchored plans (#312), structured attempt memory (#313), atomic dual-state rewind (#292), public recovery-correctness benchmark (#293) | Planned (draft spec in [docs/UPGRADE_SPEC.md](docs/UPGRADE_SPEC.md)); webhook-out notifications (#305) shipped |
 
 Beyond the original plan: the MCP server, MCP authorization and caller-authentication layers, provenance and anti-self-certification, community files, schema versioning with forward migrations, a bounded recovery context, consumed-grant tracking, Ed25519 event-chain attestation, the native LangGraph checkpointer, and wheel artifacts on every push to `main` are shipped. See [STATUS.md](STATUS.md) for the verified-vs-believed breakdown and open correctness bugs.
 

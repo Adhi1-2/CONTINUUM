@@ -1244,6 +1244,97 @@ def cmd_health(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
     return ExitCode.OK
 
 
+def _notify_blocked_run(
+    storage: Storage,
+    run_id: str,
+    mode: str,
+    payload: dict[str, Any],
+    decision: Any,
+    args: argparse.Namespace,
+    err: Any,
+) -> None:
+    """Deliver blocked-run notifications per the webhook registry (issue #305).
+
+    Never raises and never changes the caller's verdict: a malformed registry
+    warns and skips, delivery outcomes print one line each, and every
+    failure is already dead-lettered in the event log by ``notify_blocked``.
+    """
+    from continuum.recovery.webhooks import (
+        DEFAULT_WEBHOOKS_PATH,
+        WebhookConfigError,
+        load_webhook_registry,
+        notify_blocked,
+    )
+
+    config = Path(getattr(args, "webhooks_config", None) or DEFAULT_WEBHOOKS_PATH)
+    try:
+        registry = load_webhook_registry(config)
+    except WebhookConfigError as exc:
+        print(f"warning: {exc}; notification skipped", file=err)
+        return
+    if not registry.endpoints:
+        return
+    records = notify_blocked(
+        storage, run_id, mode=mode, payload=payload, contract=decision.contract, registry=registry
+    )
+    for record in records:
+        if record.status == "sent":
+            print(f"notification sent: {record.url}", file=err)
+        elif record.status == "failed":
+            print(f"warning: {record.url}: {record.detail}", file=err)
+        # A skipped record stays silent: dedup doing its job is not news.
+
+
+def cmd_notify_test(args: argparse.Namespace, storage: None, out: Any, err: Any) -> int:
+    """POST a test notification to every configured webhook endpoint (issue #305).
+
+    A wiring probe, not a state transition: it bypasses dedup by design,
+    writes nothing to the event log, and requires no run, so an operator can
+    verify the registry, the network path, and the receiver's signature check
+    without manufacturing a real blockage. Exits non-zero when any endpoint
+    refuses, because a bell that cannot ring is the failure being probed for.
+    """
+    from continuum.recovery.notify import post_webhook
+    from continuum.recovery.webhooks import (
+        DEFAULT_WEBHOOKS_PATH,
+        NOTIFY_TEST_EVENT,
+        WebhookConfigError,
+        load_webhook_registry,
+    )
+
+    config = Path(args.webhooks_config) if args.webhooks_config else Path(DEFAULT_WEBHOOKS_PATH)
+    try:
+        registry = load_webhook_registry(config)
+    except WebhookConfigError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    if not registry.endpoints:
+        print(
+            f"error: no endpoints registered in {config}; "
+            "see docs/guides/webhooks.md for the registry format",
+            file=err,
+        )
+        return ExitCode.ERROR
+
+    payload: dict[str, Any] = {"event": NOTIFY_TEST_EVENT}
+    if args.run_id:
+        payload["run_id"] = args.run_id
+    if registry.dashboard_base_url and args.run_id:
+        payload["dashboard_url"] = f"{registry.dashboard_base_url}/runs/{args.run_id}"
+
+    failed = False
+    for endpoint in registry.endpoints:
+        if post_webhook(endpoint.url, payload, secret=endpoint.secret, timeout=endpoint.timeout):
+            print(f"delivered: {endpoint.url}", file=out)
+        else:
+            failed = True
+            print(f"failed: {endpoint.url}", file=err)
+    if failed:
+        print("one or more endpoints refused the test notification", file=err)
+        return ExitCode.ERROR
+    return ExitCode.OK
+
+
 def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
     """Report how a run may resume. Read-only unless ``--repair`` is given."""
     run_id = args.run_id
@@ -1377,6 +1468,15 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         stream=out,
         palette=getattr(args, "_palette", None),
     )
+
+    # The bell next to the HITL door (issue #305): a blocked run pushes its
+    # verdict to the operator's webhook endpoints so nobody has to poll to
+    # learn a run is parked. Opt-in via .continuum/webhooks.json; dedup on
+    # (run_id, mode, contract hash) keeps a cron re-running resume from
+    # spamming, and delivery failure is dead-lettered, never raised - the
+    # verdict above is already final.
+    if presented_mode == RecoveryMode.REQUEST_HUMAN.value:
+        _notify_blocked_run(storage, run_id, presented_mode, payload, decision, args, err)
 
     if effective_mode is not RecoveryMode.RESUME and not args.repair:
         print(
@@ -3757,6 +3857,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="JSON object of environment pins to diff against the run (issue #241).",
     )
+    resume.add_argument(
+        "--webhooks-config",
+        dest="webhooks_config",
+        default=None,
+        help="webhook registry to notify on request_human (default: .continuum/webhooks.json).",
+    )
+
+    notify_test = add(
+        "notify-test", cmd_notify_test, "POST a test notification to every configured webhook."
+    )
+    notify_test.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        help="optional run id to include in the test payload's deep link.",
+    )
+    notify_test.add_argument(
+        "--webhooks-config",
+        dest="webhooks_config",
+        default=None,
+        help="webhook registry to probe (default: .continuum/webhooks.json).",
+    )
 
     confirm = with_env(
         with_run(add("confirm", cmd_confirm, "Confirm self-reported state so the run may resume."))
@@ -4256,7 +4378,7 @@ def main(
 
     # hooks never touches a run, so it must not create an empty database as a
     # side effect of editing a settings file.
-    if args.command in ("benchmark", "attest-keygen", "serve", "hooks"):
+    if args.command in ("benchmark", "attest-keygen", "serve", "hooks", "notify-test"):
         return int(args.func(args, None, out, err))
 
     # Instant resume detection (issue #394): SessionStart hook reads

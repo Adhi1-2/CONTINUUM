@@ -65,6 +65,7 @@ continuum --json <command>                    # machine-readable output
 | `restore` | Restore a run to an anchor checkpoint. Mutates storage. |
 | `rewind` | Rewind workspace and projection to a checkpoint. |
 | `watch` | Watch a run for liveness breach, optionally notify via webhook. See [liveness watch](../guides/liveness-watch.md). |
+| `notify-test [run_id]` | POST a test notification to every endpoint in the webhook registry. Verifies wiring without a real blockage. See [webhooks](../guides/webhooks.md). |
 
 ## Examples
 

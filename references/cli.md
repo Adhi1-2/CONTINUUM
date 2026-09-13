@@ -31,6 +31,7 @@ continuum compact <run_id>                       # archive pre-anchor log prefix
 continuum precompact <run_id>                    # checkpoint before context compaction. mutates
 continuum rewind <run_id> --to <checkpoint>      # revert workspace and projection [--force] [--dry-run]
 continuum observe                                # record one tool completion (hook). mutates
+continuum notify-test [run_id]                  # probe webhook wiring without a blockage
 continuum gate                                   # pre-tool-use verdict: allow or deny
 continuum briefing                               # session-start context injection
 continuum gateway --port 8765                    # enforcing proxy for registered upstreams. mutates
