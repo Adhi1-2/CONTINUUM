@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import sys
+import types
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -468,6 +469,9 @@ def test_run_tui_refuses_without_a_tty(db: str, monkeypatch: pytest.MonkeyPatch)
         def isatty(self) -> bool:
             return False
 
+    # stub curses so the import succeeds on Windows too: this test is about
+    # the TTY refusal, not the platform's curses availability
+    monkeypatch.setitem(sys.modules, "curses", types.ModuleType("curses"))
     monkeypatch.setattr(sys, "stdout", _NotATty())
     err = io.StringIO()
     code = run_tui(SQLiteStorage(db), err=err)
