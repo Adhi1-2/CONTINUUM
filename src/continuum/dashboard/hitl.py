@@ -1,0 +1,135 @@
+"""Human-in-the-loop actions over the dashboard (issue #242).
+
+request_human walls are correct but their only door was a CLI. This module
+adds three operator verbs served as authenticated POST endpoints and rendered
+as buttons on the run page:
+
+- confirm      : REVIEW_CONFIRMED (Origin.HUMAN), clearing self-certification gates
+- reconcile    : ACTION_RECONCILED through ActionLedger.reconcile, settling an
+                 uncertain side effect from real evidence
+- complete     : RUN_COMPLETED plus a COMPLETED run row
+
+Audit parity is the invariant: every button maps 1:1 onto the human CLI verb,
+lands the same event types with the same provenance, and nothing here widens
+what agents may certify themselves. Mutating endpoints are refused unless
+``CONTINUUM_DASHBOARD_TOKEN`` is set - fail-closed by default, matching the
+MCP authz posture.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from continuum.actions import ActionLedger
+from continuum.events import EventType
+from continuum.models import ActionStatus, Origin, RunStatus
+from continuum.storage.base import Storage
+
+__all__ = [
+    "DEFAULT_HITL_TOKEN_ENV",
+    "pending_actions_with_keys",
+    "confirm_run",
+    "complete_run",
+    "reconcile_action",
+    "authorize_hitl",
+]
+
+DEFAULT_HITL_TOKEN_ENV = "CONTINUUM_DASHBOARD_TOKEN"
+
+
+class HitlUnauthorized(Exception):
+    """Mutating endpoint called without the operator token."""
+
+
+def authorize_hitl(token_from_request: str | None) -> None:
+    """Refuse the call unless the operator token matches, fail-closed.
+
+    Mutating dashboard endpoints are unusable until ``CONTINUUM_DASHBOARD_TOKEN``
+    is set in the server's environment: a missing variable is a refusal, not an
+    open door, matching the MCP authz posture (issue #242). The comparison is
+    plain equality - the token rides in an Authorization header over a channel
+    the operator owns; when it is absent or wrong, :class:`HitlUnauthorized`
+    names which of the two failed so the operator is told to fix the server,
+    not their client.
+    """
+    import os
+
+    expected = os.environ.get(DEFAULT_HITL_TOKEN_ENV)
+    if not expected:
+        raise HitlUnauthorized(f"set {DEFAULT_HITL_TOKEN_ENV} to enable dashboard mutations")
+    if not token_from_request or token_from_request != expected:
+        raise HitlUnauthorized("invalid dashboard token")
+
+
+def confirm_run(storage: Storage, run_id: str) -> None:
+    """Record a human review confirmation, clearing self-certification gates.
+
+    Appends ``REVIEW_CONFIRMED`` with ``Origin.HUMAN`` - the same event the
+    ``continuum confirm`` CLI verb lands - so a run parked in ``request_human``
+    by agent-asserted evidence can resume. A missing run raises from
+    ``get_run`` before anything is written; the confirmation is scoped to
+    ``goal`` and ``progress`` components, mirroring what the CLI seals.
+    """
+    storage.get_run(run_id)
+    storage.append_event(
+        run_id,
+        EventType.REVIEW_CONFIRMED,
+        {"components": ["goal", "progress"], "via": "dashboard"},
+        source=Origin.HUMAN,
+    )
+
+
+def complete_run(storage: Storage, run_id: str, summary: str = "") -> None:
+    """Close the run as completed, from a human, with the log to match.
+
+    Appends ``RUN_COMPLETED`` (``Origin.HUMAN``) and flips the run row to
+    ``COMPLETED`` - the same pairing as ``continuum complete``. The optional
+    summary is embedded in the event payload and omitted entirely when empty,
+    so the log never carries a ``""`` placeholder that reads as a truncated
+    note. A missing run raises from ``get_run`` first; a run already terminal
+    is still closable the way the CLI allows it.
+    """
+    run = storage.get_run(run_id)
+    note = {"closed_by": "dashboard"}
+    if summary:
+        note["summary"] = summary
+    storage.append_event(run_id, EventType.RUN_COMPLETED, note, source=Origin.HUMAN)
+    storage.update_run(run.touch(status=RunStatus.COMPLETED))
+
+
+def reconcile_action(
+    storage: Storage,
+    run_id: str,
+    ledger_key: str,
+    *,
+    occurred: bool,
+    external_id: str | None = None,
+) -> None:
+    """Settle one uncertain side effect from real-world evidence (issue #29).
+
+    Delegates to :meth:`ActionLedger.reconcile` so the dashboard button and
+    ``continuum reconcile`` land the identical ``ACTION_RECONCILED`` event:
+    ``occurred=True`` records the effect was found in the world (intent and
+    world had drifted), ``occurred=False`` confirms absence. An unknown
+    ``ledger_key`` raises ``UnknownActionKey`` from the ledger rather than
+    silently recording a settlement about a key that never existed; the
+    optional ``external_id`` names the outside-world object for later audit.
+    """
+    ActionLedger(storage, run_id).reconcile(
+        ledger_key,
+        occurred=occurred,
+        external_id=external_id,
+        note="settled from the dashboard",
+    )
+
+
+def pending_actions_with_keys(storage: Storage, run_id: str) -> list[tuple[str, Any]]:
+    """Uncertain actions paired with their full ledger key (for buttons)."""
+    from continuum.actions.ledger import fold_action_events
+
+    folded = fold_action_events(storage.read_all_events(run_id))
+    out: list[tuple[str, Any]] = []
+    for key, action in folded.items():
+        if action.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+            out.append((key, action))
+    return out

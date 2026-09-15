@@ -1,0 +1,39 @@
+adapter:
+  - changed-files:
+      - any-glob-to-any-file: "src/continuum/adapters/**"
+
+state:
+  - changed-files:
+      - any-glob-to-any-file: ["src/continuum/state/**", "src/continuum/projection*"]
+
+detector:
+  - changed-files:
+      - any-glob-to-any-file: "src/continuum/detector/**"
+
+cli:
+  - changed-files:
+      - any-glob-to-any-file: ["src/continuum/cli*", "src/continuum/**/*cli*"]
+
+mcp:
+  - changed-files:
+      - any-glob-to-any-file: "src/continuum/mcp*/**"
+
+benchmark:
+  - changed-files:
+      - any-glob-to-any-file: ["benchmarks/**", "**/*bench*"]
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ["docs/**", "**/*.md"]
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file: "tests/**"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: [".github/workflows/**", ".github/dependabot.yml"]
+
+research:
+  - changed-files:
+      - any-glob-to-any-file: ["references/**", "**/*paper*", "**/*.bib"]

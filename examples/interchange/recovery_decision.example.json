@@ -1,0 +1,269 @@
+{
+  "data": {
+    "contract": {
+      "checkpoint_version": 3,
+      "created_at": "2026-08-19T21:23:06.715233Z",
+      "integrity_hash": null,
+      "invalidated": [],
+      "next_allowed_action": null,
+      "recovery_status": "safe_to_resume",
+      "required_actions": [],
+      "run_id": "run_demo",
+      "verified": [
+        "goal",
+        "progress"
+      ]
+    },
+    "mode": "resume",
+    "plan": {
+      "steps": [
+        {
+          "blocking": true,
+          "kind": "revalidate_dependency",
+          "reason": "version moved since checkpoint",
+          "requires_human": false,
+          "target": "q3_dataset"
+        }
+      ]
+    },
+    "rationale": [
+      "Goal verified",
+      "Progress intact",
+      "Environment stable"
+    ],
+    "restored": {
+      "checkpoint": {
+        "checkpoint_id": "checkpoint_a00f4285acb3fade5feff7620cddbcff",
+        "created_at": "2026-08-19T21:23:06.715220Z",
+        "environment": null,
+        "integrity_hash": null,
+        "run_id": "run_demo",
+        "state": {
+          "approvals": [],
+          "created_at": "2026-08-19T21:23:06.715163Z",
+          "decisions": [],
+          "evidence": [],
+          "external_dependencies": [
+            {
+              "checksum": null,
+              "kind": "dataset",
+              "last_verified_at": null,
+              "metadata": {},
+              "provenance": {
+                "extractor": null,
+                "origin": "deterministic",
+                "source_event_id": null,
+                "source_sequence": null
+              },
+              "resource": "q3_dataset",
+              "status": "valid",
+              "version": "sha256:aaaa1111"
+            }
+          ],
+          "findings": [],
+          "goal": {
+            "constraints": [
+              "beginner audience",
+              "one command per part"
+            ],
+            "description": "Write the Git guide",
+            "provenance": {
+              "extractor": null,
+              "origin": "deterministic",
+              "source_event_id": null,
+              "source_sequence": null
+            },
+            "version": 1
+          },
+          "model": null,
+          "pending_work": [],
+          "plan": [],
+          "progress": {
+            "completed": 2,
+            "failed": 1,
+            "pending": 2,
+            "provenance": {
+              "extractor": null,
+              "origin": "deterministic",
+              "source_event_id": null,
+              "source_sequence": null
+            },
+            "total": 5
+          },
+          "run_id": "run_demo",
+          "source_sequence": 0,
+          "updated_at": "2026-08-19T21:23:06.715163Z",
+          "version": 0
+        },
+        "trigger": "manual",
+        "version": 3
+      },
+      "pending_events": 0,
+      "replayed": true,
+      "run_id": "run_demo",
+      "state": {
+        "approvals": [],
+        "created_at": "2026-08-19T21:23:06.715163Z",
+        "decisions": [],
+        "evidence": [],
+        "external_dependencies": [
+          {
+            "checksum": null,
+            "kind": "dataset",
+            "last_verified_at": null,
+            "metadata": {},
+            "provenance": {
+              "extractor": null,
+              "origin": "deterministic",
+              "source_event_id": null,
+              "source_sequence": null
+            },
+            "resource": "q3_dataset",
+            "status": "valid",
+            "version": "sha256:aaaa1111"
+          }
+        ],
+        "findings": [],
+        "goal": {
+          "constraints": [
+            "beginner audience",
+            "one command per part"
+          ],
+          "description": "Write the Git guide",
+          "provenance": {
+            "extractor": null,
+            "origin": "deterministic",
+            "source_event_id": null,
+            "source_sequence": null
+          },
+          "version": 1
+        },
+        "model": null,
+        "pending_work": [],
+        "plan": [],
+        "progress": {
+          "completed": 2,
+          "failed": 1,
+          "pending": 2,
+          "provenance": {
+            "extractor": null,
+            "origin": "deterministic",
+            "source_event_id": null,
+            "source_sequence": null
+          },
+          "total": 5
+        },
+        "run_id": "run_demo",
+        "source_sequence": 0,
+        "updated_at": "2026-08-19T21:23:06.715163Z",
+        "version": 0
+      }
+    },
+    "run_id": "run_demo",
+    "uncertain_actions": [
+      {
+        "action_id": "action_b61f01700091b2e1e103b5b89e58ad96",
+        "action_type": "charge",
+        "arguments": {
+          "amount": 100,
+          "currency": "USD"
+        },
+        "arguments_hash": null,
+        "compensated_by": [],
+        "completed_at": null,
+        "created_at": "2026-08-19T21:23:06.715229Z",
+        "external_id": null,
+        "last_error": null,
+        "result": null,
+        "result_hash": null,
+        "run_id": "run_demo",
+        "side_effect_uncertain": false,
+        "started_at": null,
+        "status": "completed"
+      }
+    ],
+    "validation": {
+      "environment_diff": {
+        "deltas": [
+          {
+            "after": "sha256:aaaa1111",
+            "before": null,
+            "change": "added",
+            "detail": "",
+            "resource": "q3_dataset"
+          }
+        ]
+      },
+      "report": {
+        "checkpoint_version": 3,
+        "reason": "all components verified against the current environment",
+        "recovery_mode": null,
+        "run_id": "run_demo",
+        "safe_to_resume": true,
+        "statuses": [],
+        "validated_at": "2026-08-19T21:23:06.715190Z"
+      },
+      "state": {
+        "approvals": [],
+        "created_at": "2026-08-19T21:23:06.715163Z",
+        "decisions": [],
+        "evidence": [],
+        "external_dependencies": [
+          {
+            "checksum": null,
+            "kind": "dataset",
+            "last_verified_at": null,
+            "metadata": {},
+            "provenance": {
+              "extractor": null,
+              "origin": "deterministic",
+              "source_event_id": null,
+              "source_sequence": null
+            },
+            "resource": "q3_dataset",
+            "status": "valid",
+            "version": "sha256:aaaa1111"
+          }
+        ],
+        "findings": [],
+        "goal": {
+          "constraints": [
+            "beginner audience",
+            "one command per part"
+          ],
+          "description": "Write the Git guide",
+          "provenance": {
+            "extractor": null,
+            "origin": "deterministic",
+            "source_event_id": null,
+            "source_sequence": null
+          },
+          "version": 1
+        },
+        "model": null,
+        "pending_work": [],
+        "plan": [],
+        "progress": {
+          "completed": 2,
+          "failed": 1,
+          "pending": 2,
+          "provenance": {
+            "extractor": null,
+            "origin": "deterministic",
+            "source_event_id": null,
+            "source_sequence": null
+          },
+          "total": 5
+        },
+        "run_id": "run_demo",
+        "source_sequence": 0,
+        "updated_at": "2026-08-19T21:23:06.715163Z",
+        "version": 0
+      }
+    }
+  },
+  "generated_at": "2026-08-19T21:23:06.715293+00:00",
+  "kind": "recovery_decision",
+  "schema": "continuum.interchange/v1",
+  "version": 1
+}

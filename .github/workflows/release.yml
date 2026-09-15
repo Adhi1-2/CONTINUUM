@@ -11,10 +11,11 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'Cyrax321/CONTINUUM'
     name: Build distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7.0.0
@@ -31,13 +32,17 @@ jobs:
         run: uv build
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
 
   publish-pypi:
     name: Publish to PyPI
+    # Opt-in: set the PUBLISH_PYPI repository variable to "true" once the
+    # trusted-publisher environment is configured. Until then releases build
+    # wheels, attach them to the GitHub Release, and skip PyPI.
+    if: github.repository == 'Cyrax321/CONTINUUM' && vars.PUBLISH_PYPI == 'true'
     runs-on: ubuntu-latest
     needs: build
     environment:
@@ -45,7 +50,7 @@ jobs:
       url: https://pypi.org/project/continuum-agent/
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -58,16 +63,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3.0.2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           files: dist/*
           generate_release_notes: true

@@ -1,0 +1,154 @@
+"""Tests for the committed pre-commit configuration (issue #537).
+
+The hooks are a convenience, but a hook that disagrees with CI is worse than no
+hook: it formats a file one way locally and the same file fails
+`ruff format --check` on the PR. These pin the two agreements that keep the
+local gate and the CI gate honest about each other:
+
+* **One ruff version.** `rev` in `.pre-commit-config.yaml`, and the copy of it
+  quoted in `CONTRIBUTING.md`, name the same ruff the `dev` extra pins in
+  `pyproject.toml`.
+* **The same paths.** Every directory the CI lint job hands to ruff is in scope
+  for both hooks, and a directory CI does not lint stays out of scope, so
+  `pre-commit run --all-files` on an untouched tree has nothing to say.
+* **No pre-commit ecosystem in dependabot.** Dependabot groups cannot cross
+  ecosystems, so a pre-commit update would land alone and break the ruff
+  agreement above in its own PR (issue #627, #689).
+"""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PRECOMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+CONTRIBUTING = REPO_ROOT / "CONTRIBUTING.md"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+DEPENDABOT = REPO_ROOT / ".github" / "dependabot.yml"
+
+
+# --------------------------------------------------------------------------- #
+# Readers
+# --------------------------------------------------------------------------- #
+
+
+def _pinned_ruff_version() -> str:
+    """Return the exact ruff version pinned by pyproject's ``dev`` extra."""
+    data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    dev = data["project"]["optional-dependencies"]["dev"]
+    pins = [spec.split("==", 1)[1] for spec in dev if spec.startswith("ruff==")]
+    assert len(pins) == 1, f"expected exactly one ruff== pin in the dev extra, got {dev}"
+    return pins[0]
+
+
+def _hook_file_patterns() -> dict[str, str]:
+    """Map each configured hook id to its ``files`` pattern.
+
+    Parsed by line rather than with a YAML library: the config is four keys
+    deep, and the dev extra installs no YAML parser.
+    """
+    patterns: dict[str, str] = {}
+    hook_id: str | None = None
+    for line in PRECOMMIT_CONFIG.read_text(encoding="utf-8").splitlines():
+        identifier = re.match(r"\s*- id:\s*(\S+)\s*$", line)
+        if identifier:
+            hook_id = identifier.group(1)
+            continue
+        scope = re.match(r"\s*files:\s*(\S+)\s*$", line)
+        if scope and hook_id is not None:
+            patterns[hook_id] = scope.group(1)
+    return patterns
+
+
+def _ci_lint_directories() -> set[str]:
+    """Return the directories the CI lint job passes to ruff."""
+    directories: set[str] = set()
+    for line in CI_WORKFLOW.read_text(encoding="utf-8").splitlines():
+        invocation = re.match(r"\s*run:\s*ruff\s+(?:check|format)\s+(?P<rest>.+)$", line)
+        if invocation:
+            directories.update(
+                token.rstrip("/")
+                for token in invocation.group("rest").split()
+                if token.endswith("/")
+            )
+    return directories
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+
+def test_precommit_pins_the_ruff_version_from_the_dev_extra() -> None:
+    expected = f"v{_pinned_ruff_version()}"
+    mismatches = []
+    for path in (PRECOMMIT_CONFIG, CONTRIBUTING):
+        revisions = re.findall(r"^\s*rev:\s*(\S+)\s*$", path.read_text(encoding="utf-8"), re.M)
+        if revisions != [expected]:
+            mismatches.append(f"{path.name} says {revisions}")
+    assert not mismatches, (
+        f"ruff version skew, not a broken test: pyproject's dev extra pins "
+        f"ruff=={expected[1:]}, but {'; '.join(mismatches)}. Bump all three pins "
+        "in the same PR: the ruff== pin in pyproject.toml, rev in "
+        ".pre-commit-config.yaml, and the rev quoted in CONTRIBUTING.md "
+        "(the lockstep note there lists them)."
+    )
+
+
+def test_install_reference_pins_the_same_ruff() -> None:
+    """The dependency table in references/install.md is a fourth ruff pin.
+
+    It read ``ruff==0.16.3`` for two releases after the other three pins moved
+    to 0.16.5 (#840), because no test watched it, so a contributor following
+    the install reference installed a different ruff than CI enforced.
+    """
+    expected = _pinned_ruff_version()
+    text = (REPO_ROOT / "references" / "install.md").read_text(encoding="utf-8")
+    pins = re.findall(r"ruff==([0-9.]+)", text)
+    assert pins == [expected], (
+        f"references/install.md pins ruff=={pins}, but pyproject's dev extra "
+        f"pins ruff=={expected}. Bump all four pins in the same PR; the "
+        "lockstep note in CONTRIBUTING.md lists them."
+    )
+
+
+def test_dependabot_does_not_watch_the_pre_commit_ecosystem() -> None:
+    """The pre-commit ecosystem is deliberately absent from dependabot (#689).
+
+    Dependabot groups cannot cross ecosystems, so a pre-commit update would
+    arrive as its own PR bumping only ``rev`` in ``.pre-commit-config.yaml``,
+    leaving the pyproject pin and the CONTRIBUTING quote stale and failing
+    the pin test above in that PR: the #627 failure in reverse. Re-adding the
+    ecosystem should be a deliberate decision that also solves the lockstep,
+    not a drive-by completeness fix.
+    """
+    text = DEPENDABOT.read_text(encoding="utf-8")
+    ecosystems = set(re.findall(r"^\s*- package-ecosystem:\s*\"?([\w-]+)\"?\s*$", text, re.M))
+    assert "pre-commit" not in ecosystems, (
+        "dependabot watches the pre-commit ecosystem, but its updates cannot be "
+        "grouped with the pip bumps and would break the three-file ruff rev "
+        "lockstep in their own PR (see the comment in .github/dependabot.yml)"
+    )
+
+
+def test_hooks_are_scoped_to_the_directories_ci_lints() -> None:
+    patterns = _hook_file_patterns()
+    assert set(patterns) == {"ruff-check", "ruff-format"}, (
+        f"expected a scoped ruff-check and ruff-format hook, got {patterns}"
+    )
+    linted = _ci_lint_directories()
+    assert linted, "found no ruff invocation in the CI lint job"
+    # benchmarks/ is not ruff-clean and CI does not lint it: in scope, the hooks
+    # would fail on a tree nobody touched.
+    assert "benchmarks" not in linted
+    for hook_id, pattern in patterns.items():
+        for directory in linted:
+            assert re.match(pattern, f"{directory}/module.py"), (
+                f"{hook_id} does not cover {directory}/, which CI lints"
+            )
+        assert not re.match(pattern, "benchmarks/run.py"), (
+            f"{hook_id} covers benchmarks/, which CI does not lint"
+        )

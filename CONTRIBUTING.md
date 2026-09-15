@@ -2,6 +2,7 @@
 
 Thank you for helping make CONTINUUM better. This document covers everything you
 need to go from a fresh clone to a passing test suite and a clean pull request.
+Maintainers cutting a release follow the manual gate in [docs/release-checklist.md](docs/release-checklist.md), including the pre-tag clean-tree and remote-tag collision checks.
 
 ---
 
@@ -17,7 +18,7 @@ need to go from a fresh clone to a passing test suite and a clean pull request.
 ```bash
 # 1. Clone the repo
 git clone https://github.com/Cyrax321/CONTINUUM.git
-cd continuum
+cd CONTINUUM
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
@@ -26,7 +27,31 @@ source .venv/bin/activate        # macOS / Linux
 
 # 3. Install in editable mode with all dev extras
 pip install -e ".[dev]"
+
+# 4. Install the pre-commit hooks (recommended, see below)
+pip install pre-commit
+pre-commit install
 ```
+
+On **Windows PowerShell**, use the same steps with these commands instead:
+
+```powershell
+# 1. Clone the repo
+git clone https://github.com/Cyrax321/CONTINUUM.git
+cd CONTINUUM
+
+# 2. Create and activate a virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 3. Install in editable mode with all dev extras
+pip install -e ".[dev]"
+
+# Optional: run the Windows demo launcher
+powershell -ExecutionPolicy Bypass -File .\try-it.ps1
+```
+
+Local CONTINUUM data lives in `.continuum/` (budgets, local `*.db` files). It is already listed in `.gitignore`, so do not commit it. If you cloned before this was added, run `echo ".continuum/" >> .gitignore`.
 
 ---
 
@@ -48,6 +73,26 @@ pytest tests/test_hashing.py tests/test_models.py -v
 
 ---
 
+## Troubleshooting
+
+### `pip show` reports an old editable project location
+
+An editable install records the repository path used when it was installed.
+Moving or renaming the clone does not update that metadata. If
+`python -m pip show continuum-agent` reports an old path, reinstall from the
+current project root:
+
+```bash
+python -m pip uninstall --yes continuum-agent
+python -m pip install -e ".[mcp]"
+python -m pip show continuum-agent
+```
+
+The final command's `Editable project location` should be the current project
+root.
+
+---
+
 ## Linting & Type-Checking
 
 ```bash
@@ -66,11 +111,71 @@ mypy src/continuum
 
 The CI pipeline runs all three on every PR. A clean PR must pass all checks.
 
+### Pre-commit hooks (optional but recommended)
+
+To catch lint and formatting issues automatically before you commit, use
+[pre-commit](https://pre-commit.com/):
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+`.pre-commit-config.yaml` is committed at the repo root, so there is nothing to
+write yourself. It runs the same two ruff steps as the CI `Lint & Type-check`
+job, pinned to the same ruff version as the `dev` extra in `pyproject.toml` and
+scoped to the same three directories CI lints (`src/`, `tests/`, `examples/`):
+
+```yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        files: ^(src|tests|examples)/
+      - id: ruff-format
+        files: ^(src|tests|examples)/
+```
+
+Now `ruff check --fix` and `ruff format` run automatically on every `git commit`.
+A hook that rewrites a file fails the commit and leaves the fix unstaged, so
+`git add` the changed files and commit again.
+
+To run it manually against all files:
+
+```bash
+pre-commit run --all-files
+```
+
+The ruff version lives in four places that must move together in one PR.
+`tests/test_precommit_config.py` fails any PR where they drift, which is how a
+dependabot `pip` bump surfaces (as a red test, not a version skew, so read a
+failure there as drift before anything else):
+
+1. the `ruff==` pin in the `dev` extra of `pyproject.toml`,
+2. `rev:` in `.pre-commit-config.yaml`,
+3. the `rev:` quoted in the yaml block above. This file is itself one of the
+   pins, which is easy to miss because you are editing prose, not
+   configuration.
+4. the `ruff==` row in the dependency table in `references/install.md` (#840:
+   this one drifted two releases before anything watched it).
+
+A hook running a different ruff than CI is how a locally formatted file still
+fails `ruff format --check` on the PR.
+
+**Note on mypy:** mypy is intentionally not included in this pre-commit setup.
+Pre-commit hooks run in isolated environments without the project's installed
+dependencies, so a mypy hook there would produce inaccurate results. Instead,
+mypy runs in CI (`mypy src/continuum`, strict mode) against a full environment.
+To check locally, run `pip install -e ".[dev]"` once, then run
+`mypy src/continuum` yourself, or rely on the CI check on your PR.
+
 ---
 
 ## Project Structure
 
-```
+```text
 src/continuum/
 ├── __init__.py          # Public API surface
 ├── models.py            # Immutable Pydantic data models
@@ -131,5 +236,5 @@ added to the release workflow.
 
 ## Code of Conduct
 
-Be kind. Review others' PRs as you would want yours reviewed. Participation in
+Be kind. Review others' PRs as you would want yours reviewed. Pair programming is welcome, please use `Co-authored-by` trailers to credit your pair. Participation in
 this project is governed by the [Contributor Covenant](CODE_OF_CONDUCT.md).

@@ -1,0 +1,63 @@
+{
+  "data": {
+    "approvals": [],
+    "created_at": "2026-08-19T21:23:06.713652Z",
+    "decisions": [],
+    "evidence": [],
+    "external_dependencies": [
+      {
+        "checksum": null,
+        "kind": "dataset",
+        "last_verified_at": null,
+        "metadata": {},
+        "provenance": {
+          "extractor": null,
+          "origin": "deterministic",
+          "source_event_id": null,
+          "source_sequence": null
+        },
+        "resource": "q3_dataset",
+        "status": "valid",
+        "version": "sha256:aaaa1111"
+      }
+    ],
+    "findings": [],
+    "goal": {
+      "constraints": [
+        "beginner audience",
+        "one command per part"
+      ],
+      "description": "Write the Git guide",
+      "provenance": {
+        "extractor": null,
+        "origin": "deterministic",
+        "source_event_id": null,
+        "source_sequence": null
+      },
+      "version": 1
+    },
+    "model": null,
+    "pending_work": [],
+    "plan": [],
+    "progress": {
+      "completed": 2,
+      "failed": 1,
+      "pending": 2,
+      "provenance": {
+        "extractor": null,
+        "origin": "deterministic",
+        "source_event_id": null,
+        "source_sequence": null
+      },
+      "total": 5
+    },
+    "run_id": "run_demo",
+    "source_sequence": 0,
+    "updated_at": "2026-08-19T21:23:06.713954Z",
+    "version": 0
+  },
+  "generated_at": "2026-08-19T21:23:06.714536+00:00",
+  "kind": "semantic_state",
+  "schema": "continuum.interchange/v1",
+  "version": 1
+}

@@ -401,3 +401,178 @@ unformatted on `main` (pre-existing, from `4605c00`); left alone to keep this
 change reviewable. Issue #34 was a documentation fix only: `scoped_to_run=False`
 still cannot enforce cross-run uniqueness, since the ledger only replays its own
 run; a store-wide lookup remains unimplemented.
+
+## Session: enforced durability sprint (2026-08-22 to 2026-08-24)
+
+The largest working session in the project's history. Closed every issue on
+the enforced-durability roadmap (#213), the original durability gap (#207),
+and eight supporting issues. Shipped 20+ PRs, all reviewed and merged to
+`main`.
+
+### The core insight
+
+CONTINUUM is a verification-and-enforcement plane that does not carry the
+agent's mind. Its differentiator is three guarantees nobody else provides:
+
+1. No self-certification: agent-reported state degrades to human review.
+2. Side effects require claims: unclaimed effects are blocked at the harness
+   boundary, not by convention.
+3. Recovery decisions verify against reality before declaring safety.
+
+Everything built this session extends those three guarantees to where agents
+actually run.
+
+### What shipped (chronological)
+
+**Observation hooks (#207, PR #210).** `continuum observe` reads one tool-call
+payload from stdin and appends a TOOL_COMPLETED event with the file path,
+byte count and SHA-256 as it exists right now. `hooks install claude-code`
+wires it via PostToolUse. Verified live against real Claude Code sessions:
+files written by the agent appear in the event log with correct digests even
+after `kill -9`.
+
+**Dashboard bind hardening (#270).** The dashboard bound to all interfaces,
+exposing recovery contracts unauthenticated. Default changed to loopback;
+operators opt into exposure via `--host 0.0.0.0`.
+
+**Lazy adapter imports (#214).** Importing `continuum.adapters` eagerly
+pulled openai (~1.3s) and langgraph (~0.8s) into every process. Optional SDK
+adapters now resolve lazily via PEP 562. MCP startup dropped from ~3 s to
+~0.1 s.
+
+**Enforcing gate (#217).** Pre-tool-use hook denies side-effect calls without
+a live ledger claim. Keys derived from configuration templates against
+structured arguments, never from LLM-authored text. Decision table mirrors
+the ledger exactly: unclaimed denies with instructions; completed refuses as
+duplicate; unknown demands reconciliation.
+
+**Action index (#216).** Schema v3 adds an action_index projection for
+cross-run idempotency lookups, replacing O(total events) scans with indexed
+reads (~1000x at 300 runs). Postgres parity shipped.
+
+**Reconciler probes (#218).** `.continuum/reconcilers.json` registers one
+probe per action type; `continuum reconcile` settles uncertain actions
+automatically from external-system checks. Definitive verdicts land as
+DETERMINISTIC-sourced ACTION_RECONCILED events.
+
+**Reasoning summaries (#235).** `continuum_record_summary` stores a bounded
+self-authored plan summary (4096-char cap); briefing serves it at session
+start so resumed sessions inherit plan state instead of guessing from
+counters.
+
+**Native LangGraph checkpointer (#236).** CONTINUUM implements
+BaseCheckpointSaver over its own storage (schema v4). thread_id maps to
+`lg-<thread>` runs; every put lands provenance-tagged STATE_CHECKPOINTED
+events into the hash chain.
+
+**Replay-safety guard (#237).** The gate decision table extracted into
+`replayguard.evaluate()`, shared by gate, gateway and adapters.
+`langgraph_protected_node` wraps graph nodes so interrupt/crash replays
+become cache hits. Chaos matrix encoded as executable tests.
+
+**Production server mode (#238).** Live-Postgres CI job running contract
+tests against Postgres 16. HTTP transport for `continuum serve`. Gateway
+backfill SQL corrected to jsonb operators.
+
+**Event-log compaction (#239).** `continuum compact <run>` archives the
+pre-anchor prefix verbatim into events_archive (schema v5). Live chain stays
+append-only; verify walks anchored logs natively. Compact auto-creates a
+forced checkpoint at current head because anchoring at an ancient version
+left nearly everything live.
+
+**Retry budgets (#240).** `.continuum/budgets.json` caps attempts per action
+type at claim time. Every claim slot counts; settlements do not.
+`intercept_action` refuses beyond-budget claims.
+
+**Version pinning (#241).** Closed-set pinning dict (prompt_sha256,
+tool_schema_sha256, model_id, policy_version) stored verbatim on claims and
+summaries. Resume diffs caller-supplied pins against newest recorded set.
+
+**HITL dashboard surface (#242).** Run page renders operator buttons for
+confirm/reconcile/complete whenever a run is blocked or holds uncertain
+actions. Fail-closed until CONTINUUM_DASHBOARD_TOKEN is set.
+
+**Multi-agent parent/child runs (#243).** Schema v6 adds parent_run_id.
+Parent resume composes family worst state: uncertain child blocks parent.
+`continuum tree` renders hierarchy. A2A task ids ride on metadata.
+
+**Informed retry (#265).** Engine-authored failure summaries injected into
+post-recovery resumes via human_steps.
+
+**Fork semantics (#259).** Fork detection at the gate, approve_fork with
+lineage events, independently resumable children.
+
+**Semantic replay-or-fork (#291).** Three similarity backends (exact/fuzzy/
+embedding) classify post-restore calls as replay/fork/fresh using configurable
+thresholds. Fuzzy backend catches LLM paraphrasing without external services.
+
+**Dashboard bind hardening (#270).** Dashboard bound to all interfaces,
+exposing contracts unauthenticated. Changed to loopback default;
+`--host 0.0.0.0` available for explicit opt-in.
+
+**Windows portability (#211).** External PR #212 merged fixing child-env
+inheritance in test helpers.
+
+### Issues closed
+
+#207, #208, #209, #214, #216, #217, #218, #235, #236, #237, #238, #239,
+#240, #241, #242, #243
+
+### Issues still open
+
+#215 PyPI (maintainer-blocked), #211 Windows CI runner, #213 umbrella,
+#244 novelty umbrella, #254 payload offloading, #258/#259/#265 community
+features, #266-#285 contributor good-first-issues, #288 provenance graph
+(deferred), #289 authority lifecycle (backlog)
+
+### Final numbers
+
+1348 passing, 24 skipped. Ruff clean, strict mypy clean across ~100 source
+files. Five integration seams, six schema migrations, eleven MCP tools,
+twenty-five CLI commands. Every feature verified against real Claude Code
+sessions with hard kills and live protocol boundaries.
+
+## Session 18, 2026-08-25 (issue #383: degrade instead of die, PR #385)
+
+Fixed #383 in a dedicated worktree (`/tmp/wt-383`, branch
+`fix/degrade-unprojectable-fold`, self-assigned before starting). Three
+commits, each answering one review round.
+
+**The fix (3f2b769).** `project`/`project_incremental` gained
+`on_unprojectable="raise"|"degrade"` (default unchanged). Degrade stops at the
+earliest refused event and returns the last-good prefix marked
+`SemanticState.status=INVALID` with `unprojectable_at_sequence/_event_type/
+_reason`; it never skips past the break, and raises if nothing folds before
+it. Opt-ins limited to diagnostic surfaces (engine restore path, CLI
+status/inspect/replay, serve progress report and dep dedup, benchmark
+readout); the #364 write guard `_project_candidate` and every checkpoint
+capture path deliberately stay on raise. Recovery decides REQUEST_HUMAN.
+Reproduction used the `_poison` helper from tests/test_cli.py; all four dead
+commands confirmed failing before any change.
+
+**Review round 1: the contract must carry the break (0768e38).** Resume's
+prose named the break but `required_actions` was empty and `next_allowed`
+rendered as "continue" over a requires_human verdict. New `RepairKind.
+REPAIR_LOG` step (sorted first) gives the contract real work, qualified
+`verified` entries (`goal (through sequence N)`), a `projection (invalid)`
+entry in `invalidated`, and honest fallbacks at all three `or 'continue'`
+sites (contract render, engine render, dashboard).
+
+**Review round 2: cross-version checkpoint break (39b0756, ddbb6bd).** The
+four added fields changed `StateCheckpoint.content()`, so every pre-existing
+checkpoint failed verification as tampered, and new bodies carried fields old
+readers (`extra="forbid"`) reject. `PROJECTION_BOOKKEEPING` now excludes them
+from the digest and from all four persisted-body write sites (sqlite and
+postgres, checkpoints and versions). Lesson recorded for next time: no
+same-process round-trip can catch a hash-compatibility break, and a naive
+strip-and-reread fixture passes against broken code because pydantic
+re-injects defaults on reload; the fixture must also re-seal the hash over
+the reduced payload, exactly as the old writer did.
+
+Red-before-green proven per round by checking out earlier trees over `src/`
+(stash alone is insufficient once changes are committed). Final gates:
+1425 passed, 23 skipped, ruff clean, 206 files formatted, strict mypy clean
+on 104 files, mcp pinned to 2.1.0 first. All CI checks green on the branch.
+Options 2 (repair/amend) and 3 (fork-from-last-good-prefix) remain open by
+design; the reviewer floated moving the bookkeeping fields off
+`SemanticState` entirely as follow-up scope.

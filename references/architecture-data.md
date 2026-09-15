@@ -46,23 +46,26 @@ Optional installs. An agent may also call the SDK or MCP server directly.
 
 ## 4. MCP server (stdio, deny by default) `src/continuum/mcp/`
 
-Server name: `continuum` (`server.py:212`). Nine tools, all names prefixed.
+Server name: `continuum-mcp` (`server.py`). Twelve tools, all names prefixed,
+recounted from the tool registrations on 2026-08-24.
 
 | Tool (exact name) | Kind | Source |
 |--|--|--|
-| `continuum_validate` | read-only | `server.py:353`, annotation `read_only` at `:360` |
-| `continuum_resume` | read-only | `server.py:397`, annotation `read_only` at `:404` |
-| `continuum_list_actions` | read-only | `server.py:626`, annotation `read_only` at `:631` |
-| `continuum_record_progress` | mutating | `server.py:263` |
-| `continuum_checkpoint` | mutating | `server.py:314` |
-| `continuum_intercept_action` | mutating | `server.py:457` |
-| `continuum_complete_action` | mutating | `server.py:536` |
-| `continuum_fail_action` | mutating | `server.py:565` |
-| `continuum_reconcile_action` | mutating | `server.py:594` |
+| `continuum_validate` | read-only | `server.py:618`, annotation `read_only` at `:625` |
+| `continuum_resume` | read-only | `server.py:662`, annotation `read_only` at `:671` |
+| `continuum_list_actions` | read-only | `server.py:1041`, annotation `read_only` at `:1047` |
+| `continuum_record_progress` | mutating | `server.py:468` |
+| `continuum_checkpoint` | mutating | `server.py:516` |
+| `continuum_record_summary` | mutating | `server.py:556` |
+| `continuum_confirm` | mutating | `server.py:763` |
+| `continuum_intercept_action` | mutating | `server.py:804` |
+| `continuum_complete_action` | mutating | `server.py:951` |
+| `continuum_fail_action` | mutating | `server.py:980` |
+| `continuum_reconcile_action` | mutating | `server.py:1009` |
 
-Read-only annotation is `ToolAnnotations(read_only_hint=True)` (`server.py:223`);
-mutating is `read_only_hint=False` (`server.py:224`). Read-only count = 3,
-mutating count = 6.
+Read-only annotation is `ToolAnnotations(read_only_hint=True)`
+(`server.py:386`); mutating is `read_only_hint=False` (`server.py:387`).
+Read-only count = 3, mutating count = 8.
 
 Auth gate (allowlist for mutating tools):
 - Primary env var: `CONTINUUM_MCP_ALLOW` (`authz.py:57`).
@@ -321,7 +324,7 @@ Vertical, tiered. Group boxes by the tiers in section 1.
   - Row 2: State Engine, Checkpoint Manager, Environment
   - Row 3: Validator, Recovery Engine, Security
   - Pill at top-right of the SDK container:
-    "MCP server: deny by default, 10 tools (3 read-only, 7 mutating)".
+    "MCP server: deny by default, 12 tools (3 read-only, 9 mutating)".
 - Fourth tier: two boxes side by side: "Durable Storage (SQLite, WAL)" and
   "External Systems (GitHub, email, APIs)".
 - Bottom tier: one centered box "Resume (bounded recovery context)".

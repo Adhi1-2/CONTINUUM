@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from continuum.environment import CallableProvider, StaticProvider, capture
 from continuum.models import (
@@ -66,6 +66,57 @@ def test_the_goal_and_progress_are_always_reported() -> None:
 # --- the headline case: a dataset moved ------------------------------------ #
 
 
+def test_omitting_the_current_environment_names_the_missing_side() -> None:
+    """The diagnostic pointed at the wrong side of the comparison (issue #307).
+
+    "no environment snapshot to compare against" says the stored snapshot is
+    missing. It is not: the checkpoint recorded one, and supplying `env` proves
+    it. What is absent is the caller's current observation, and a caller told the
+    wrong thing is missing cannot act on the message.
+
+    The UNKNOWN status is deliberate and stays: never validated is not the same
+    as validated clean.
+    """
+    pinned = state(external_dependencies=[ExternalDependency(resource="dataset", version="v3")])
+    outcome = validate_state(
+        pinned,
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+    )
+    detail = next(
+        e.detail
+        for e in outcome.report.statuses
+        if e.component is Component.EXTERNAL_DEPENDENCY and e.component_id == "dataset"
+    )
+    assert "no current version supplied" in detail
+    assert 'env={"dataset": "<version>"}' in detail
+    assert status_for(outcome, Component.EXTERNAL_DEPENDENCY, "dataset") is StateStatus.UNKNOWN
+
+
+def test_a_dependency_absent_from_both_snapshots_blames_the_snapshot() -> None:
+    """The caller did observe; this resource was in neither side of the diff.
+
+    A resource the environment provider never reported is unverifiable, and the
+    message must not claim the caller supplied nothing when it plainly did.
+    """
+    outcome = validate_state(
+        state(
+            external_dependencies=[
+                ExternalDependency(resource="dataset", version="v3"),
+                ExternalDependency(resource="registry", version="r1"),
+            ]
+        ),
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+        current_environment=capture("run_4821", StaticProvider(dataset="v4")),
+    )
+    assert status_for(outcome, Component.EXTERNAL_DEPENDENCY, "registry") is StateStatus.UNKNOWN
+    detail = next(
+        e.detail
+        for e in outcome.report.statuses
+        if e.component is Component.EXTERNAL_DEPENDENCY and e.component_id == "registry"
+    )
+    assert "not present in the current environment snapshot" in detail
+
+
 def test_a_changed_dependency_conflicts_and_blocks_resume() -> None:
     outcome = validate_state(
         state(external_dependencies=[ExternalDependency(resource="dataset", version="v3")]),
@@ -100,6 +151,55 @@ def test_staleness_propagates_from_dependency_to_decision() -> None:
 
     # the original state object is untouched
     assert original.decisions[0].status is StateStatus.VALID
+
+
+def test_staleness_cascades_along_finding_to_finding_citations() -> None:
+    """A finding citing another finding is supported by it (issue #739).
+
+    Taint used to stop at the first finding: a finding resting entirely on a
+    now-stale finding, and the decision built on it, kept VALID in the revised
+    state, so a repair plan driven by that state skipped the downstream work.
+    """
+    outcome = validate_state(
+        state(
+            external_dependencies=[ExternalDependency(resource="dataset", version="v3")],
+            evidence=[Evidence(evidence_id="paper_128", source="dataset")],
+            findings=[
+                Finding(finding_id="f_raw", claim="rows shifted", evidence=["paper_128"]),
+                Finding(finding_id="f_derived", claim="X holds", evidence=["f_raw"]),
+            ],
+            decisions=[Decision(decision_id="d_1", decision="Publish X", evidence=["f_derived"])],
+        ),
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+        current_environment=capture("run_4821", StaticProvider(dataset="v4")),
+    )
+    revised = outcome.state
+    assert revised.evidence[0].status is StateStatus.STALE
+    assert revised.findings[0].status is StateStatus.STALE
+    assert revised.findings[1].status is StateStatus.STALE
+    assert revised.decisions[0].status is StateStatus.STALE
+    assert not outcome.safe
+
+
+def test_finding_citation_cascade_is_independent_of_list_order() -> None:
+    """A forward citation (a finding citing one listed after it) taints the
+    same set, so the cascade must not depend on list order (issue #739)."""
+    outcome = validate_state(
+        state(
+            external_dependencies=[ExternalDependency(resource="dataset", version="v3")],
+            evidence=[Evidence(evidence_id="paper_128", source="dataset")],
+            findings=[
+                # Listed before the raw finding it rests on.
+                Finding(finding_id="f_derived", claim="X holds", evidence=["f_raw"]),
+                Finding(finding_id="f_raw", claim="rows shifted", evidence=["paper_128"]),
+            ],
+        ),
+        checkpoint_environment=capture("run_4821", StaticProvider(dataset="v3")),
+        current_environment=capture("run_4821", StaticProvider(dataset="v4")),
+    )
+    revised = {f.finding_id: f.status for f in outcome.state.findings}
+    assert revised["f_raw"] is StateStatus.STALE
+    assert revised["f_derived"] is StateStatus.STALE
 
 
 def test_propagation_spares_state_that_did_not_depend_on_the_change() -> None:
@@ -250,6 +350,25 @@ def test_an_expired_approval_is_caught_by_its_timestamp() -> None:
     assert not outcome.safe
 
 
+def test_a_naive_expires_at_grades_instead_of_raising() -> None:
+    """Issue #704: a naive expires_at (persisted before the fold normalized
+    offsets, or constructed directly) must grade as EXPIRED, not raise
+    TypeError comparing naive against the tz-aware utcnow()."""
+    outcome = validate_state(
+        state(
+            approvals=[
+                Approval(
+                    approval_id="ap_1",
+                    subject="publish",
+                    status=ApprovalStatus.GRANTED,
+                    expires_at=datetime(2020, 1, 1),  # naive, and in the past
+                )
+            ]
+        )
+    )
+    assert status_for(outcome, Component.APPROVAL, "ap_1") is StateStatus.EXPIRED
+
+
 def test_a_live_approval_passes() -> None:
     outcome = validate_state(
         state(
@@ -322,6 +441,24 @@ def test_the_same_model_is_not_flagged() -> None:
 def test_no_expected_model_means_no_model_check() -> None:
     outcome = validate_state(state(model=ModelState(model="model-a")))
     assert not any(e.component is Component.MODEL for e in outcome.report.statuses)
+
+
+def test_expected_model_against_an_unrecorded_model_reports_the_gap() -> None:
+    """A safety check that silently does nothing is worse than none (issue #308).
+
+    No MCP tool records a model, so `state.model` is None for every MCP-created
+    run. Returning silently made the answer identical to a clean comparison, so
+    a caller passing expected_model believed it had ruled out drift when nothing
+    had been compared.
+    """
+    outcome = validate_state(state(), expected_model="claude-3-opus-20240229")
+    assert status_for(outcome, Component.MODEL) is StateStatus.UNKNOWN
+    detail = next(e.detail for e in outcome.report.statuses if e.component is Component.MODEL)
+    assert "no model recorded" in detail
+    assert "claude-3-opus-20240229" in detail
+    # The caller explicitly asked for a check that cannot be performed, so under
+    # the default strict_unknown this is not a clean resume.
+    assert not outcome.safe
 
 
 def test_no_expected_model_with_assumptions_is_unknown_not_valid() -> None:

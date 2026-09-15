@@ -17,6 +17,7 @@ from continuum.models import (
     Goal,
     ModelSpecificState,
     ModelState,
+    Origin,
     PendingWork,
     Progress,
     SemanticState,
@@ -103,6 +104,21 @@ def test_actions_start_planned_and_side_effect_is_certain_by_default() -> None:
     assert action.status is ActionStatus.PLANNED
     assert action.side_effect_uncertain is False
     assert action.external_id is None
+
+
+def test_action_origin_digest_must_be_sha256_hex() -> None:
+    """The origin_digest validator used to be accidentally nested inside
+    validate_caused_by (after its return), so it never registered on Action
+    and any string was accepted despite the documented 64-hex invariant.
+    """
+    good = "a" * 64
+    assert Action(run_id="run_1", action_type="t", origin_digest=good).origin_digest == good
+    assert Action(run_id="run_1", action_type="t").origin_digest is None
+
+    with pytest.raises(ValidationError, match="64 lowercase hex"):
+        Action(run_id="run_1", action_type="t", origin_digest="NOT-HEX-AT-ALL")
+    with pytest.raises(ValidationError, match="64 lowercase hex"):
+        Action(run_id="run_1", action_type="t", origin_digest="A" * 64)  # uppercase
 
 
 def test_approvals_start_pending() -> None:
@@ -205,3 +221,20 @@ def test_versions_increase_monotonically(steps: int) -> None:
         versions.append(state.version)
     assert versions == sorted(versions)
     assert versions[-1] == steps
+
+
+# --- provenance ------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    "origin,expected",
+    [
+        (Origin.DETERMINISTIC, False),
+        (Origin.HUMAN, False),
+        (Origin.LLM, True),
+        (Origin.EXTERNAL_AGENT, True),
+        (Origin.IMPORTED, True),
+    ],
+)
+def test_self_certified_truth_table(origin: Origin, expected: bool) -> None:
+    assert origin.self_certified is expected

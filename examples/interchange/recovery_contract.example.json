@@ -1,0 +1,20 @@
+{
+  "data": {
+    "checkpoint_version": 3,
+    "created_at": "2026-08-19T21:23:06.714844Z",
+    "integrity_hash": null,
+    "invalidated": [],
+    "next_allowed_action": null,
+    "recovery_status": "safe_to_resume",
+    "required_actions": [],
+    "run_id": "run_demo",
+    "verified": [
+      "goal",
+      "progress"
+    ]
+  },
+  "generated_at": "2026-08-19T21:23:06.714857+00:00",
+  "kind": "recovery_contract",
+  "schema": "continuum.interchange/v1",
+  "version": 1
+}

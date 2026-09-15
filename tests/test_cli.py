@@ -2,7 +2,7 @@
 
 ``continuum resume "$RUN" && ./start-agent.sh`` is the line these tests exist to
 protect. If an unsafe run ever exits 0, an agent gets launched onto stale state
-or an unreconciled side effect — so the exit code is treated as a safety
+or an unreconciled side effect, so the exit code is treated as a safety
 guarantee, not a formatting detail.
 """
 
@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -68,6 +70,53 @@ def interrupt_a_side_effect(db: str) -> None:
         ActionLedger(store, "run_1").claim("github.create_issue", {"title": "Anomaly"})
 
 
+# --- creating a run from the CLI (issue #204) -------------------------------- #
+
+
+def test_start_creates_a_run_the_whole_toolchain_can_use(tmp_path: Path) -> None:
+    """The CLI could not originate work before `start`: the resume hint pointed
+    at `continuum checkpoint <run_id>`, which fails on a run that does not
+    exist yet."""
+    path = str(tmp_path / "fresh.db")
+    code, out, err = run("--db", path, "start", "myrun", "--goal", "Ship the thing")
+    assert code == ExitCode.OK, err
+
+    with SQLiteStorage(path) as store:
+        assert store.get_run("myrun").goal == "Ship the thing"
+        events = store.read_events("myrun")
+    assert [e.type.value for e in events] == ["RUN_STARTED"]
+    assert events[0].payload["goal"] == "Ship the thing"
+
+    # The run is now visible everywhere a run must be.
+    code, out, _ = run("--db", path, "runs")
+    assert "myrun" in out
+    # A human-asserted goal with no self-reported progress is genuinely safe
+    # to resume: the verdict must be OK, not merely "found".
+    code, out, _ = run("--db", path, "resume", "myrun")
+    assert code == ExitCode.OK
+    assert "RESUME" in out
+
+
+def test_start_without_a_goal_is_a_usage_error(tmp_path: Path) -> None:
+    path = str(tmp_path / "fresh.db")
+    with pytest.raises(SystemExit):
+        run("--db", path, "start", "myrun")
+
+
+def test_starting_an_existing_run_fails_without_touching_history(db: str) -> None:
+    before_events: int
+    with SQLiteStorage(db) as store:
+        before_events = store.last_sequence("run_1")
+
+    code, _, err = run("--db", db, "start", "run_1", "--goal", "hijack")
+    assert code == ExitCode.ERROR
+    assert "already exists" in err
+
+    with SQLiteStorage(db) as store:
+        assert store.get_run("run_1").goal == "Analyze 100 documents"
+        assert store.last_sequence("run_1") == before_events
+
+
 # --- the exit-code contract ------------------------------------------------ #
 
 
@@ -117,28 +166,39 @@ def test_a_missing_run_is_distinguishable(db: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "command",
+    "command,extra",
     [
-        "inspect",
-        "history",
-        "events",
-        "verify",
-        "actions",
-        "replay",
-        "resume",
-        "validate",
-        "show-contract",
+        ("inspect", []),
+        ("history", []),
+        ("events", []),
+        ("verify", []),
+        ("actions", []),
+        ("replay", []),
+        ("resume", []),
+        ("validate", []),
+        ("show-contract", []),
+        # Mutating commands were added after issue #202: `checkpoint` used to
+        # fail with a ProjectionError (exit 1) instead of NOT_FOUND because it
+        # projected before checking the run existed.
+        ("checkpoint", []),
+        ("confirm", []),
+        ("attest", []),
+        ("attest-verify", ["--attest", "irrelevant-on-missing-run.json"]),
+        ("fork", ["--reason", "test"]),
     ],
 )
-def test_no_command_reports_success_for_a_run_that_does_not_exist(db: str, command: str) -> None:
+def test_no_command_reports_success_for_a_run_that_does_not_exist(
+    db: str, command: str, extra: list[str]
+) -> None:
     """A typo'd run name must never look like a clean bill of health.
 
     An empty run has a trivially valid (empty) event chain and no recorded
-    actions, so `verify` and `actions` would happily exit 0 — letting
+    actions, so `verify` and `actions` would happily exit 0, letting
     `continuum verify $TYPO && deploy` succeed against a name nobody has ever
-    written to.
+    written to. Mutating commands owe the same distinction: `checkpoint`
+    diagnosed a missing run as a projection error until issue #202.
     """
-    code, _, err = run("--db", db, command, "definitely-not-a-run")
+    code, _, err = run("--db", db, command, "definitely-not-a-run", *extra)
     assert code != ExitCode.OK, f"{command} reported success for a nonexistent run"
     assert code == ExitCode.NOT_FOUND, f"{command} misdiagnosed a missing run (exit {code})"
     assert "definitely-not-a-run" in err
@@ -392,6 +452,27 @@ def test_an_unopenable_database_reports_an_error_not_a_traceback(db: str) -> Non
     assert "Traceback" not in err
 
 
+def test_the_reported_path_is_not_backslash_escaped(tmp_path: Path) -> None:
+    """Regression for #94: the operator has to be able to copy the path back.
+
+    ``!r`` escapes each backslash, so a Windows path was reported with every
+    separator doubled -- not the path that was passed, and useless pasted into
+    a shell or a config file.
+
+    Pinned with a backslash in the *filename*, which is legal on POSIX, so the
+    ubuntu-only CI can catch a regression that otherwise only shows on Windows.
+    That blind spot is the reason this shipped: #81 was Windows-only for the
+    same reason.
+    """
+    missing = tmp_path / "no-such-dir" / "back\\slash.db"
+
+    code, _, err = run("--db", str(missing), "runs")
+
+    assert code == ExitCode.ERROR
+    assert str(missing) in err, "the path reported is not the path that was passed"
+    assert "\\\\" not in err, "repr()-style escaping is back"
+
+
 def test_an_empty_env_version_is_refused(db: str) -> None:
     """`--env dataset=` is nearly always an unexpanded shell variable.
 
@@ -403,10 +484,10 @@ def test_an_empty_env_version_is_refused(db: str) -> None:
     assert "empty version" in err
 
 
-def test_postgres_fails_clearly_rather_than_silently(db: str) -> None:
+def test_postgres_url_is_routed_and_fails_clearly(db: str) -> None:
     code, _, err = run("--db", "postgresql://localhost/x", "runs")
     assert code == ExitCode.ERROR
-    assert "not implemented" in err
+    assert "psycopg" in err or "could not connect" in err
 
 
 def test_benchmark_runs_and_reports_numbers() -> None:
@@ -494,21 +575,34 @@ def test_tolerating_unknown_is_opt_in(db: str) -> None:
 
 
 def test_a_model_switch_can_be_declared(db: str) -> None:
+    # No model was ever recorded for this run, so the requested comparison
+    # cannot be made. Reporting OK would mean "no drift", which is
+    # indistinguishable from a clean check: the fail-open pattern #49 closed for
+    # model-specific assumptions, and #308 closes for the model itself. The gap
+    # is reported instead, so a caller that explicitly asked for a drift check
+    # does not receive a false clean bill of health.
     code, out, _ = run("--db", db, "validate", "run_1", "--env", "dataset=v3", "--model", "model-b")
-    assert code == ExitCode.OK  # no model recorded, so nothing to invalidate
+    # REQUIRES_REPAIR, not REQUIRES_HUMAN: the remedy is to record which model
+    # produced the state, which is mechanical rather than a judgement call.
+    assert code == ExitCode.REQUIRES_REPAIR
     assert "Run: run_1" in out
+    assert "no model recorded" in out
 
 
 # --- invoked as a real process ---------------------------------------------- #
 
 
 def _cli(db: str, *argv: str) -> subprocess.CompletedProcess[str]:
+    # Inherit the parent environment rather than replacing it. Only PYTHONPATH
+    # matters here. It makes the subprocess import continuum from src/ instead
+    # of an installed copy. Passing a bare env= drops platform essentials: on
+    # Windows, losing SystemRoot leaves the interpreter unable to initialise
+    # Winsock, and every spawned process dies during startup on `import
+    # _overlapped` long before the CLI is reached.
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     return subprocess.run(
         [sys.executable, "-m", "continuum.cli", "--db", db, *argv],
-        env={
-            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-            "PATH": "/usr/bin:/bin",
-        },
+        env=env,
         capture_output=True,
         text=True,
     )
@@ -710,3 +804,408 @@ def test_attest_verify_reports_altered_after_new_event(db: str, tmp_path: Path) 
     code, out, _ = run("--db", db, "attest-verify", "run_1", "--attest", str(attest_file))
     assert code == ExitCode.CORRUPTED
     assert "ALTERED" in out
+
+
+def test_attest_verify_detects_an_in_place_payload_edit(db: str, tmp_path: Path) -> None:
+    """An attestation must not pass on content that was rewritten under it.
+
+    The verdict used to compare the signed ``chain_hash`` against the digest
+    *stored* in the head row. Editing an event's payload straight through the
+    database changes the payload and leaves every ``hash`` column untouched, so
+    the head still matched and the verdict read SIGNED, "chain matches", on a run
+    whose goal had been rewritten. `continuum verify` caught it in the same
+    breath, because it recomputes; attest-verify did not, because it did not.
+
+    This is the attack the signature exists to stop, so it gets its own test:
+    appending an event (covered above) moves the head and is easy to notice,
+    while an in-place edit is silent and is what an attacker with database access
+    would actually do.
+    """
+    from continuum.security.attestation import generate_keypair
+
+    priv_pem, _ = generate_keypair()
+    key_file = tmp_path / "signer.pem"
+    key_file.write_text(priv_pem)
+
+    attest_file = tmp_path / "run_1.attest.json"
+    code, _, _ = run(
+        "--db",
+        db,
+        "attest",
+        "run_1",
+        "--key",
+        str(key_file),
+        "--signer",
+        "ci-bot",
+        "--out",
+        str(attest_file),
+    )
+    assert code == ExitCode.OK
+
+    head_before = _head_hash(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE events SET payload = ? WHERE run_id = 'run_1' AND sequence = 1",
+            (json.dumps({"goal": "rewritten", "total": 100}),),
+        )
+    # The premise of the bug: the stored head digest is byte-identical, so any
+    # check that trusts it cannot see the edit.
+    assert _head_hash(db) == head_before
+
+    code, out, _ = run("--db", db, "attest-verify", "run_1", "--attest", str(attest_file))
+    assert code == ExitCode.CORRUPTED, f"a tampered chain must not verify: {out}"
+    assert "ALTERED" in out
+    assert "no longer verifies" in out
+
+
+def _head_hash(db: str) -> str:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT hash FROM events WHERE run_id = 'run_1' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+    return str(row[0])
+
+
+# --- provenance view (issue #148) ------------------------------------------- #
+
+
+def test_status_provenance_uses_canonical_labels(db: str) -> None:
+    code, out, _ = run("--db", db, "status", "run_1", "--provenance")
+    assert code == 0
+    # Canonical labels are rendered, not the raw source enums.
+    assert "observed" in out and "verified" in out
+    assert "DETERMINISTIC" not in out
+
+
+def test_status_plain_runs(db: str) -> None:
+    code, out, _ = run("--db", db, "status", "run_1")
+    assert code == 0
+    assert "run_1" in out and "goal" in out
+
+
+def test_status_provenance_json(db: str) -> None:
+    code, out, _ = run("--db", db, "--json", "status", "run_1", "--provenance")
+    assert code == 0
+    data = json.loads(out)
+    assert any(row["who"] == "observed" for row in data["provenance"])
+
+
+# --- scoped recovery CLI smoke (issue #110) --------------------------------- #
+
+
+def test_validate_is_read_only_and_produces_contract(db: str) -> None:
+    # Read-only scoped-recovery entry. Supplying the declared env yields a safe
+    # resume; omitting --env still runs without mutating state.
+    code, out, _ = run("--db", db, "validate", "run_1", "--env", "dataset=v3")
+    assert code == 0
+    assert "CONTINUUM RECOVERY" in out
+    assert "Recovery decision: RESUME" in out
+
+
+def test_validate_json_carries_mode(db: str) -> None:
+    code, out, _ = run("--db", db, "--json", "validate", "run_1", "--env", "dataset=v3")
+    assert code == 0
+    data = json.loads(out)
+    assert data["mode"] == "resume"
+    assert data["safe"] is True
+
+
+# --- closing a run from the keyboard ------------------------------------------ #
+
+
+def test_complete_closes_a_run_and_clears_it_from_active_resolution(
+    tmp_path: Path,
+) -> None:
+    """Found missing during live testing: finished runs kept surfacing as the
+    active run and hijacked every fresh session's resume."""
+    path = str(tmp_path / "c.db")
+    with SQLiteStorage(path) as store:
+        store.create_run(Run(run_id="old", goal="finished work"))
+    code, out, _ = run("--db", path, "--json", "complete", "old", "--summary", "shipped")
+    assert code == ExitCode.OK, out
+    payload = json.loads(out)
+    assert payload["status"] == "completed"
+
+    with SQLiteStorage(path) as store:
+        assert store.get_run("old").status.value == "completed"
+        events = [e.type.value for e in store.read_events("old")]
+        assert "REVIEW_CONFIRMED" in events and "RUN_COMPLETED" in events
+        # A completed run is terminal: it can never be offered for resume.
+        assert store.get_active_run() is None
+
+
+def test_complete_is_idempotent_for_double_clicks(tmp_path: Path) -> None:
+    path = str(tmp_path / "d.db")
+    with SQLiteStorage(path) as store:
+        store.create_run(Run(run_id="r", goal="g"))
+    code, _, err = run("--db", path, "complete", "r")
+    assert code == ExitCode.OK
+    with SQLiteStorage(path) as store:
+        events_after_first = list(store.read_events("r"))
+
+    code, out, err = run("--db", path, "complete", "r")
+    assert code == ExitCode.OK, err
+    assert "already completed" in out
+    code, out, err = run("--db", path, "--json", "complete", "r")
+    assert code == ExitCode.OK, err
+    assert json.loads(out)["already_completed"] is True
+    with SQLiteStorage(path) as store:
+        assert list(store.read_events("r")) == events_after_first
+
+
+def test_complete_unknown_run_is_not_found(tmp_path: Path) -> None:
+    path = str(tmp_path / "e.db")
+    with SQLiteStorage(path):
+        pass
+    code, _, err = run("--db", path, "complete", "ghost")
+    assert code == ExitCode.NOT_FOUND
+
+
+# --- verify reports coherence, not only integrity (issue #382) --------------- #
+
+
+def _poison(path: str) -> None:
+    """Append a TASK_UPDATED the fold rejects, through the normal write path.
+
+    Mirrors what #364 allowed before it was fixed: `completed` past the `total`
+    already on record. The event is hashed like any other, so the chain stays
+    intact and only the projection breaks, which is the whole point here.
+    """
+    with SQLiteStorage(path) as store:
+        store.append_event("run_1", EventType.TASK_UPDATED, {"completed": 999, "failed": 0})
+
+
+def test_verify_reports_a_run_whose_log_cannot_be_projected(db: str) -> None:
+    """`verify` certified a run no projecting command could read (issue #382).
+
+    An unprojectable log is perfectly intact, so the chain audit passes it and is
+    right to. Reporting only that verdict meant the one command an operator
+    reaches for during an incident was the one that could not see the incident.
+    """
+    _poison(db)
+    code, out, _ = run("--db", db, "verify", "run_1")
+
+    assert "no violations" in out, "the chain really is intact; do not hide that"
+    assert "PROJECTION FAILURE" in out
+    assert "sequence" in out and "TASK_UPDATED" in out
+    assert "exceeds total" in out, "name the constraint, not just the pydantic header"
+    assert code == ExitCode.CORRUPTED, "verify $RUN && resume must short-circuit"
+
+
+def test_verify_still_passes_a_healthy_run(db: str) -> None:
+    """The new check must not fail a run that folds; that would be worse."""
+    code, out, _ = run("--db", db, "verify", "run_1")
+    assert code == ExitCode.OK
+    assert "PROJECTION FAILURE" not in out
+
+
+def test_verify_json_names_the_offending_event(db: str) -> None:
+    """Scripts read the payload, not the prose."""
+    _poison(db)
+    code, out, _ = run("--db", db, "--json", "verify", "run_1")
+    payload = json.loads(out)
+
+    assert payload["ok"] is True, "chain integrity is unaffected"
+    assert payload["projectable"] is False
+    assert payload["projection_failed_at"]["type"] == "TASK_UPDATED"
+    assert payload["projection_failed_at"]["sequence"] > 0
+    assert code == ExitCode.CORRUPTED
+
+
+def test_verify_json_marks_a_healthy_run_projectable(db: str) -> None:
+    payload = json.loads(run("--db", db, "--json", "verify", "run_1")[1])
+    assert payload["projectable"] is True
+    assert "projection_failed_at" not in payload
+
+
+def test_a_tampered_chain_is_not_also_projected(db: str, tmp_path: Path) -> None:
+    """Do not describe events that cannot be trusted to say anything.
+
+    Same reasoning the action-index repair already uses: folding a tampered log
+    to report where it stops projecting would launder its contents into a
+    diagnosis the operator might act on.
+    """
+    _poison(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE events SET payload = ? WHERE sequence = 2", ('{"tampered": true}',))
+
+    code, out, _ = run("--db", db, "verify", "run_1")
+    assert code == ExitCode.CORRUPTED
+    assert "INTEGRITY FAILURE" in out
+    assert "PROJECTION FAILURE" not in out, "integrity comes first; do not fold a tampered log"
+
+
+def test_first_unprojectable_event_finds_the_earliest_break(db: str) -> None:
+    """Two bad events must report the first, or a repair fixes the wrong one."""
+    from continuum.state.semantic import first_unprojectable_event
+
+    _poison(db)
+    _poison(db)
+    with SQLiteStorage(db) as store:
+        events = list(store.read_events("run_1"))
+        broken = first_unprojectable_event("run_1", events)
+
+    assert broken is not None
+    sequence, event_type, reason = broken
+    bad = [e.sequence for e in events if e.type is EventType.TASK_UPDATED]
+    assert sequence == min(bad)
+    assert event_type == "TASK_UPDATED"
+    assert "\n" not in reason, "the reason is rendered on one line"
+
+
+def test_first_unprojectable_event_returns_none_for_a_sound_log(db: str) -> None:
+    from continuum.state.semantic import first_unprojectable_event
+
+    with SQLiteStorage(db) as store:
+        assert first_unprojectable_event("run_1", store.read_events("run_1")) is None
+
+
+def test_verify_projects_a_compacted_run_from_its_archive(db: str) -> None:
+    """After compaction the live log starts at the anchor (issue #239).
+
+    It no longer contains RUN_STARTED, so folding only the live tail reports
+    every compacted run as unprojectable. The archive holds the prefix verbatim
+    from sequence 1, so the two streams are folded together, the same merge
+    `ActionLedger._replay` does.
+    """
+    assert run("--db", db, "compact", "run_1", "--force")[0] == ExitCode.OK
+
+    code, out, err = run("--db", db, "verify", "run_1")
+    assert code == ExitCode.OK, f"a healthy compacted run must still verify: {out}{err}"
+    assert "PROJECTION FAILURE" not in out
+    assert json.loads(run("--db", db, "--json", "verify", "run_1")[1])["projectable"] is True
+
+
+# --- degrade instead of raise (issue #383) ----------------------------------- #
+
+
+def test_resume_on_an_unprojectable_run_answers_instead_of_crashing(db: str) -> None:
+    """resume is the command a crashed session reaches for first; on a poisoned
+    log it used to die with the same pydantic traceback as everything else,
+    while the action tools kept authorising side effects."""
+    _poison(db)
+    code, out, err = run("--db", db, "resume", "run_1", "--env", "dataset=v3")
+
+    assert code == ExitCode.REQUIRES_HUMAN, out
+    assert "stops folding at sequence" in out, "name where the log stops folding"
+    assert "exceeds total" in out, "name the constraint, not just the pydantic header"
+    assert "Traceback" not in out and "Traceback" not in err
+
+    payload = json.loads(run("--db", db, "--json", "resume", "run_1", "--env", "dataset=v3")[1])
+    assert payload["mode"] == "request_human"
+    assert payload["safe"] is False
+    assert payload["contract"]["recovery_status"] != "safe_to_resume"
+
+
+def test_show_contract_on_an_unprojectable_run_carries_the_break(db: str) -> None:
+    """The contract is the machine-readable artifact; it must not read clean.
+
+    The prose rationale named the break from day one, but required_actions was
+    empty and next_allowed rendered as "continue" over a requires_human
+    verdict (#385 review): a caller keying on the structure saw nothing to do.
+    """
+    _poison(db)
+    code, out, err = run("--db", db, "show-contract", "run_1")
+
+    assert code == ExitCode.REQUIRES_HUMAN, out
+    assert "repair_log:" in out, "required_actions must name real work"
+    assert "next_allowed:      repair_log:" in out
+    assert "continue" not in out
+    assert "(through sequence " in out, "verified entries are qualified, not unqualified"
+    assert "projection (invalid" in out
+
+
+def test_status_on_an_unprojectable_run_names_the_break_and_fails(db: str) -> None:
+    _poison(db)
+    code, out, err = run("--db", db, "status", "run_1")
+
+    # Not OK: the figures describe a prefix of the log, and exit 0 would wave
+    # a poisoned run through a pipeline.
+    assert code == ExitCode.CORRUPTED
+    assert "PROJECTION FAILURE" in out
+    assert "TASK_UPDATED" in out
+    assert "Traceback" not in out and "Traceback" not in err
+
+
+def test_inspect_on_an_unprojectable_run_reports_the_known_prefix(db: str) -> None:
+    _poison(db)
+    code, out, _ = run("--db", db, "inspect", "run_1")
+
+    assert code == ExitCode.CORRUPTED
+    assert "PROJECTION FAILURE" in out
+    assert "0 completed" in out, "prefix figures, not the poisoned ones"
+
+
+def test_replay_on_an_unprojectable_run_does_not_certify(db: str) -> None:
+    _poison(db)
+    code, out, err = run("--db", db, "replay", "run_1")
+
+    assert code == ExitCode.CORRUPTED
+    assert "PROJECTION FAILURE" in out
+    assert "Traceback" not in out and "Traceback" not in err
+
+
+def test_a_healthy_run_is_unaffected_in_both_modes(db: str) -> None:
+    """No poison: status stays a clean exit 0 and resume still answers RESUME."""
+    from continuum.state.semantic import project
+
+    with SQLiteStorage(db) as store:
+        raised = project("run_1", store.read_events("run_1"))
+        degraded = project("run_1", store.read_events("run_1"), on_unprojectable="degrade")
+
+    assert degraded == raised
+    assert degraded.status.value == "valid"
+
+    code, out, err = run("--db", db, "status", "run_1")
+    assert code == ExitCode.OK, f"{out}{err}"
+    assert "PROJECTION FAILURE" not in out
+
+    code, out, err = run("--db", db, "resume", "run_1", "--env", "dataset=v3")
+    assert code == ExitCode.OK, f"{out}{err}"
+    assert (
+        json.loads(run("--db", db, "--json", "resume", "run_1", "--env", "dataset=v3")[1])["mode"]
+        == "resume"
+    )
+
+
+def test_a_healthy_compacted_run_still_resumes_after_degrade_landed(db: str) -> None:
+    """Regression guard for constraint 5 (compaction).
+
+    After compaction the live log has no RUN_STARTED; restore works only
+    because the anchor checkpoint covers the prefix. The degrade wiring must
+    not change that, and folding the post-anchor tail must merge nothing less
+    than archive+live when it does run.
+    """
+    assert run("--db", db, "compact", "run_1", "--force")[0] == ExitCode.OK
+
+    code, out, err = run("--db", db, "status", "run_1")
+    assert code == ExitCode.OK, f"a healthy compacted run must read cleanly: {out}{err}"
+    assert "PROJECTION FAILURE" not in out
+
+    # The anchor checkpoint carries no environment snapshot, so the dataset
+    # cannot be re-verified and resume lands on request_human; that is
+    # pre-existing behaviour and must not turn into a projection failure.
+    code, out, err = run("--db", db, "resume", "run_1", "--env", "dataset=v3")
+    assert code in (ExitCode.OK, ExitCode.REQUIRES_HUMAN), f"{out}{err}"
+    assert "PROJECTION FAILURE" not in out
+    assert "Traceback" not in err
+
+
+def test_health_and_watch_honor_global_json_flag(db: str) -> None:
+    """Subparsers must not shadow the global --json flag (#677)."""
+    code, out, _ = run("--db", db, "--json", "health", "run_1")
+    assert code == ExitCode.OK
+    assert json.loads(out)["advisory"]["trust_score"] >= 0
+    code, out, _ = run("--db", db, "--json", "watch", "run_1", "--max-silence", "1h")
+    assert code == ExitCode.OK, out
+    assert json.loads(out)["breached"] is False
+
+
+def test_json_flag_works_after_the_subcommand(db: str) -> None:
+    """Trailing --json keeps working once shadowing is fixed (#677)."""
+    code, out, _ = run("--db", db, "health", "run_1", "--json")
+    assert code == ExitCode.OK
+    assert json.loads(out)["advisory"]["trust_score"] >= 0
+    code, out, _ = run("--db", db, "watch", "run_1", "--max-silence", "1h", "--json")
+    assert code == ExitCode.OK, out
+    assert json.loads(out)["breached"] is False

@@ -68,6 +68,35 @@ def test_duplicate_run_ids_are_refused(storage: SQLiteStorage, run: Run) -> None
         storage.create_run(Run(run_id="run_1", goal="other"))
 
 
+def test_create_run_started_writes_row_and_first_event_together(
+    storage: SQLiteStorage,
+) -> None:
+    """The run row and its RUN_STARTED event are one fact (CodeRabbit review,
+    PR #206): a crash between two separate writes would strand a run that can
+    be neither projected nor resumed, so the store commits both or neither."""
+    storage.create_run_started(Run(run_id="run_s", goal="Ship it"), source=Origin.HUMAN)
+
+    loaded = storage.get_run("run_s")
+    assert loaded.goal == "Ship it"
+    events = storage.read_events("run_s")
+    assert [e.type for e in events] == [EventType.RUN_STARTED]
+    assert events[0].sequence == 1
+    assert events[0].payload["goal"] == "Ship it"
+    assert events[0].source is Origin.HUMAN
+    # The event is a real chain head, verifiable like any other.
+    assert storage.verify_events("run_s").ok
+
+
+def test_create_run_started_refuses_a_duplicate_without_partial_writes(
+    storage: SQLiteStorage, run: Run
+) -> None:
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "Analyze 100 documents"})
+    with pytest.raises(ConcurrentWriteError, match="already exists"):
+        storage.create_run_started(Run(run_id="run_1", goal="hijack"))
+    # The existing run's history is untouched.
+    assert storage.last_sequence("run_1") == 1
+
+
 def test_updating_a_run_advances_its_timestamp(storage: SQLiteStorage, run: Run) -> None:
     updated = storage.update_run(run.model_copy(update={"status": RunStatus.COMPLETED}))
     assert updated.updated_at >= run.updated_at
@@ -221,6 +250,46 @@ def test_a_crashed_writer_leaves_a_readable_prefix(tmp_path: Path) -> None:
     with SQLiteStorage(db) as recovered:
         assert recovered.last_sequence("run_1") == 2
         assert project("run_1", recovered.read_events("run_1")).progress.completed == 1
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
+    """Closing twice must not raise (#320).
+
+    Shipped in #347 without a test, so the behaviour it fixed was left unpinned.
+    Double-close happens for real: an explicit ``close()`` inside a ``with``
+    block, or a caller closing before ``__del__`` runs.
+    """
+    store = SQLiteStorage(tmp_path / "agent.db")
+    store.create_run(Run(run_id="run_1", goal="g"))
+
+    store.close()
+    store.close()
+    store.close()
+
+
+def test_using_a_closed_store_says_it_was_closed(tmp_path: Path) -> None:
+    """Use-after-close must name the mistake, not a symptom of it.
+
+    Making ``close`` idempotent meant setting ``_connection`` to None, which left
+    every later call failing with ``AttributeError: 'NoneType' object has no
+    attribute 'execute'``. That points at CONTINUUM's internals instead of at the
+    caller's bug, so sqlite3's own wording is restored: reads and writes both go
+    through one accessor that raises ``ProgrammingError``.
+    """
+    db = tmp_path / "agent.db"
+    store = SQLiteStorage(db)
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.close()
+
+    # A read path and a write path, since they take different routes in.
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        store.get_run("run_1")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        store.create_run(Run(run_id="run_2", goal="g"))
+
+    # The file itself is untouched: a new handle works normally.
+    with SQLiteStorage(db) as reopened:
+        assert reopened.get_run("run_1").goal == "g"
 
 
 def test_two_connections_to_one_file_see_each_other(tmp_path: Path) -> None:
@@ -503,22 +572,68 @@ def test_a_newer_schema_is_refused(tmp_path: Path) -> None:
         SQLiteStorage(db)
 
 
-def test_an_older_schema_is_refused(tmp_path: Path) -> None:
-    from continuum.storage import SchemaVersionError
+def test_a_one_version_older_schema_is_migrated_forward(tmp_path: Path) -> None:
     from continuum.storage.sqlite import SCHEMA_VERSION
 
+    # A database left at v1 (one step behind) by an older build: it lacks the
+    # v2 ``versions`` table and the event provenance columns. The forward
+    # migration must bring it up to the current schema and open normally.
+    legacy = """
+        CREATE TABLE continuum_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE events (
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE,
+            type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL,
+            causer_event_id TEXT, hash TEXT NOT NULL,
+            PRIMARY KEY (run_id, sequence)
+        );
+        CREATE TABLE checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            version INTEGER NOT NULL, trigger TEXT NOT NULL,
+            created_at TEXT NOT NULL, integrity_hash TEXT NOT NULL, body TEXT NOT NULL
+        );
+        INSERT INTO continuum_meta(key, value) VALUES ('schema_version', '1');
+    """
     db = tmp_path / "agent.db"
-    SQLiteStorage(db).close()
-
     raw = sqlite3.connect(db)
-    raw.execute(
-        "UPDATE continuum_meta SET value = ? WHERE key = 'schema_version'",
-        (str(SCHEMA_VERSION - 1),),
-    )
+    raw.executescript(legacy)
     raw.commit()
     raw.close()
 
-    with pytest.raises(SchemaVersionError, match="older CONTINUUM"):
+    assert SCHEMA_VERSION >= 2  # pinned while v1 fixtures exist; bumped in #216
+    # No longer refused: the one-step migration path exists.
+    with SQLiteStorage(db) as store:
+        store.create_run(Run(run_id="run_1", goal="g"))
+        assert store.get_run("run_1").goal == "g"
+
+
+def test_an_unsupported_older_schema_is_refused(tmp_path: Path) -> None:
+    from continuum.storage import SchemaVersionError
+
+    # A database stamped older than any registered migration has no path
+    # forward and must still be refused rather than guessed at.
+    legacy = """
+        CREATE TABLE continuum_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO continuum_meta(key, value) VALUES ('schema_version', '0');
+    """
+    db = tmp_path / "agent.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(legacy)
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(SchemaVersionError, match="older than supported"):
         SQLiteStorage(db)
 
 
@@ -540,11 +655,48 @@ def test_storage_urls_are_accepted_in_several_forms(tmp_path: Path) -> None:
         assert memory.list_runs() == []
 
 
-def test_postgres_fails_clearly_rather_than_silently_using_sqlite() -> None:
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
+def test_postgres_url_is_routed_to_postgres_backend() -> None:
+    # A postgres URL is no longer refused with NotImplementedError; it is routed
+    # to PostgresStorage. Without the driver installed that fails clearly
+    # (RuntimeError mentioning psycopg) rather than silently falling back to
+    # SQLite, which would mask a misconfiguration.
+    with pytest.raises(RuntimeError, match="psycopg"):
         open_storage("postgresql://localhost/continuum")
 
 
 def test_an_unknown_scheme_is_rejected() -> None:
     with pytest.raises(ValueError, match="unsupported storage URL scheme"):
         open_storage("mysql://localhost/continuum")
+
+
+# --- parent directory creation (issue #358) ---------------------------------- #
+
+
+def test_open_storage_creates_parent_directories(tmp_path: Path) -> None:
+    path = tmp_path / "a" / "b" / "c.db"
+    storage = SQLiteStorage(f"sqlite://{path}")
+    storage.close()
+    assert path.exists()
+
+
+def test_open_storage_existing_directory_still_works(tmp_path: Path) -> None:
+    path = tmp_path / "existing" / "db.db"
+    path.parent.mkdir(parents=True)
+    storage = SQLiteStorage(f"sqlite://{path}")
+    storage.close()
+    assert path.exists()
+
+
+def test_open_storage_memory_still_works() -> None:
+    first = SQLiteStorage(":memory:")
+    first.close()
+    second = open_storage(":memory:")
+    second.close()
+    assert True
+
+
+def test_open_storage_creates_parent_for_plain_path(tmp_path: Path) -> None:
+    path = tmp_path / "x" / "y" / "plain.db"
+    storage = SQLiteStorage(f"sqlite://{path}")
+    storage.close()
+    assert path.exists()

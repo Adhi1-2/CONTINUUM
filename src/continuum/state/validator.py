@@ -5,7 +5,7 @@ trustworthy merely because it was persisted.** Before an agent resumes, every
 component is checked against the environment as it is *now*.
 
 Staleness propagates. If a dataset moves from v3 to v4, the dependency is not
-the only casualty — every finding whose evidence came from that dataset, and
+the only casualty: every finding whose evidence came from that dataset, and
 every decision resting on those findings, is now suspect. Marking only the
 dependency would leave the agent reasoning from conclusions it can no longer
 justify. Propagation walks:
@@ -17,28 +17,40 @@ Uncertainty degrades rather than resolves. An unverifiable resource yields
 resume. The system is allowed to say "I cannot tell"; it is not allowed to
 guess in its own favour.
 
-This module decides *status*. Choosing what to do about it — resume, repair,
-abort — is the recovery engine's job in Phase 7.
+This module decides *status*. Choosing what to do about it (resume, repair,
+abort) is the recovery engine's job in Phase 7.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC
+from typing import Any
 
 from continuum.environment.diff import EnvironmentDiff, ResourceChange, diff_environments
+from continuum.events import Event  # for caused_by graph
 from continuum.models import (
+    Action,
+    ActionStatus,
     ApprovalStatus,
     Component,
     ComponentValidationEntry,
     EnvironmentSnapshot,
     SemanticState,
+    StateCheckpoint,
     StateStatus,
     StateValidationResult,
     utcnow,
 )
 
-__all__ = ["StateValidator", "ValidationOutcome", "validate_state"]
+__all__ = [
+    "StateValidator",
+    "ValidationOutcome",
+    "validate_state",
+    "AdmissibilityResult",
+    "check_admissibility",
+]
 
 
 #: Statuses that mean the component cannot be relied on as-is.
@@ -47,7 +59,7 @@ __all__ = ["StateValidator", "ValidationOutcome", "validate_state"]
 #: reporting "safe to resume" while that is outstanding is precisely the false
 #: assurance this layer exists to prevent. The recovery engine already refused
 #: to resume in these cases via the repair plan, but the validator's own
-#: `safe_to_resume` disagreed with it — so anything reading the validation
+#: `safe_to_resume` disagreed with it, so anything reading the validation
 #: report directly got the wrong answer.
 _UNUSABLE = frozenset(
     {
@@ -59,6 +71,113 @@ _UNUSABLE = frozenset(
         StateStatus.REQUIRES_REVIEW,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissibilityResult:
+    """Result of checking whether a checkpoint is admissible for plain RESUME.
+
+    A checkpoint is inadmissible when a completed downstream action consumed
+    state produced after the checkpoint. The check is a deterministic graph
+    reachability over hash-chained positions, no heuristics.
+    """
+
+    admissible: bool
+    blocking: tuple[Action, ...]
+    reason: str
+    details: tuple[dict[str, Any], ...]
+
+
+def check_admissibility(
+    checkpoint: StateCheckpoint | None,
+    actions: Iterable[Action],
+) -> AdmissibilityResult:
+    """Check whether ``checkpoint`` is admissible given downstream ``actions``.
+
+    A checkpoint is inadmissible for plain RESUME when any COMPLETED action
+    consumed inputs that were produced after the checkpoint. Consumed inputs
+    include checkpoint_seq, event_positions, component_ids and prior action_ids.
+    Empty consumed_inputs is always admissible and old rows without the field
+    remain admissible.
+
+    ``checkpoint`` may be None when restoring without a checkpoint (pure event
+    replay); such restores are always admissible. ``actions`` is the full
+    ledger fold; only COMPLETED actions are examined, since other statuses
+    have not committed downstream work.
+    """
+    if checkpoint is None:
+        return AdmissibilityResult(admissible=True, blocking=(), reason="", details=())
+    blocking: list[Action] = []
+    details: list[dict[str, Any]] = []
+    actions_list = list(actions)
+    known_ids: set[str] = set()
+    for d in checkpoint.state.decisions:
+        known_ids.add(d.decision_id)
+    for f in checkpoint.state.findings:
+        known_ids.add(f.finding_id)
+    for e in checkpoint.state.evidence:
+        known_ids.add(e.evidence_id)
+    for p in checkpoint.state.plan:
+        known_ids.add(p.step_id)
+    for w in checkpoint.state.pending_work:
+        known_ids.add(w.task_id)
+    for dep in checkpoint.state.external_dependencies:
+        known_ids.add(dep.resource)
+    for pid in checkpoint.state.pins:
+        known_ids.add(pid)
+    for idx, action in enumerate(actions_list):
+        if action.status is not ActionStatus.COMPLETED:
+            continue
+        ci = action.consumed_inputs
+        if (
+            ci.checkpoint_seq == 0
+            and not ci.event_positions
+            and not ci.component_ids
+            and not ci.action_ids
+        ):
+            continue
+        reasons: list[str] = []
+        chain_pos = idx + 1
+        if ci.checkpoint_seq > checkpoint.version:
+            reasons.append(
+                f"checkpoint_seq {ci.checkpoint_seq} after checkpoint version {checkpoint.version}"
+            )
+        for pos in ci.event_positions:
+            if pos > checkpoint.state.source_sequence:
+                reasons.append(
+                    f"event position {pos} after checkpoint source_sequence {checkpoint.state.source_sequence}"
+                )
+                break
+        if ci.component_ids:
+            for cid in ci.component_ids:
+                if cid not in known_ids:
+                    reasons.append(f"component {cid!r} not in checkpoint (produced after)")
+                    break
+        if ci.action_ids:
+            reasons.append(f"consumed prior action(s) {', '.join(ci.action_ids)}")
+        if reasons:
+            blocking.append(action)
+            details.append(
+                {
+                    "action_id": action.action_id,
+                    "action_type": action.action_type,
+                    "chain_position": chain_pos,
+                    "consumed_inputs": ci.model_dump(),
+                    "reason": "; ".join(reasons),
+                }
+            )
+    if not blocking:
+        return AdmissibilityResult(admissible=True, blocking=(), reason="", details=())
+    reason = (
+        f"checkpoint v{checkpoint.version} inadmissible: {len(blocking)} blocking commitment(s): "
+        + "; ".join(
+            f"{d['action_id'][:12]} at position {d['chain_position']} ({d['reason']})"
+            for d in details[:3]
+        )
+    )
+    return AdmissibilityResult(
+        admissible=False, blocking=tuple(blocking), reason=reason, details=tuple(details)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,20 +194,23 @@ class ValidationOutcome:
 
     @property
     def safe(self) -> bool:
+        """True when all validated components permit resuming without repair."""
         return self.report.safe_to_resume
 
     @property
     def downgraded(self) -> tuple[ComponentValidationEntry, ...]:
+        """All component entries whose status was degraded away from valid."""
         return tuple(e for e in self.report.statuses if e.status is not StateStatus.VALID)
 
     def render(self) -> str:
+        """Render a human-readable summary of the validation report."""
         lines = [f"Run: {self.report.run_id}", f"Checkpoint: v{self.report.checkpoint_version}", ""]
         symbols = {StateStatus.VALID: "[ok]"}
         for entry in self.report.statuses:
             mark = symbols.get(entry.status, "[!!]")
             label = entry.component.value.replace("_", " ")
             identifier = f" {entry.component_id}" if entry.component_id else ""
-            detail = f" — {entry.detail}" if entry.detail else ""
+            detail = f" - {entry.detail}" if entry.detail else ""
             lines.append(f"{mark} {label}{identifier}: {entry.status}{detail}")
         lines.append("")
         lines.append(f"Safe to resume: {'yes' if self.safe else 'no'}")
@@ -105,13 +227,25 @@ class StateValidator:
     starts; a caller who genuinely tolerates uncertainty can opt out.
     """
 
-    def __init__(self, *, strict_unknown: bool = True, confirmed: bool = False) -> None:
+    def __init__(
+        self, *, strict_unknown: bool = True, confirmed: bool | Iterable[str] = False
+    ) -> None:
         self.strict_unknown = strict_unknown
         # Set when a human has explicitly confirmed the run's self-reported
         # goal/progress (via a REVIEW_CONFIRMED event). Confirmation clears the
         # REQUIRES_REVIEW that self-certified origins would otherwise force, so
         # an externally-driven run can be resumed after a human has eyeballed it.
-        self.confirmed = confirmed
+        # Scoped confirm (issue #394) narrows this to named components only;
+        # a boolean True still means both goal and progress, while an iterable
+        # names the confirmed subset.
+        if isinstance(confirmed, bool):
+            self.confirmed: set[str] = {"goal", "progress"} if confirmed else set()
+        else:
+            # Back-compat: a future caller may pass an iterable directly.
+            self.confirmed = set(confirmed)
+        # Keep the legacy boolean attribute for any external reader that
+        # checks truthiness, but the per-component checks below use the set.
+        self._legacy_confirmed = bool(self.confirmed)
 
     def validate(
         self,
@@ -121,20 +255,63 @@ class StateValidator:
         checkpoint_environment: EnvironmentSnapshot | None = None,
         checkpoint_version: int = 0,
         expected_model: str | None = None,
-        confirmed: bool = False,
+        confirmed: bool | Iterable[str] = False,
+        scope: Iterable[str] | None = None,
+        events: Iterable[Event] | None = None,
     ) -> ValidationOutcome:
-        self.confirmed = confirmed
+        """Validate semantic state against environment diff and causal history.
+
+        Compares ``checkpoint_environment`` and ``current_environment``,
+        propagating staleness through dependencies, evidence, findings, and
+        decisions. Checks plan topology, approvals, model alignment, and
+        optional causal events. Returns a :class:`ValidationOutcome` with
+        the revised state and detailed component statuses.
+        """
+        if isinstance(confirmed, bool):
+            self.confirmed = {"goal", "progress"} if confirmed else set()
+        else:
+            self.confirmed = set(confirmed)
+        self._legacy_confirmed = bool(self.confirmed)
         environment_diff = diff_environments(checkpoint_environment, current_environment)
         entries: list[ComponentValidationEntry] = []
 
         broken = self._broken_resources(environment_diff)
-        state = self._apply_dependency_status(state, environment_diff, entries)
-        state = self._propagate(state, broken, entries)
-        self._check_goal(state, entries)
-        self._check_progress(state, entries)
-        self._check_approvals(state, entries)
-        self._check_model(state, expected_model, entries)
-        self._check_evidence(state, entries)
+
+        # diff_environments returns an empty diff when *either* snapshot is
+        # absent, so the diff alone cannot distinguish "the caller supplied no
+        # observation" from "the caller supplied one that omits this resource".
+        # Only this frame knows which it was, so the distinction is passed down.
+        observed = current_environment is not None
+
+        if scope is None:
+            state = self._apply_dependency_status(
+                state, environment_diff, entries, observed=observed
+            )
+            state = self._propagate(state, broken, entries)
+            if events is not None:
+                state = self._propagate_caused_by(state, events, entries)
+            self._check_goal(state, entries)
+            self._check_progress(state, entries)
+            self._check_plan(state, entries)
+            self._check_approvals(state, entries)
+            self._check_model(state, expected_model, entries)
+            self._check_evidence(state, entries)
+            self._check_derived(state, entries)
+        else:
+            # Scoped re-validation: only the named dependency resources are
+            # re-checked and only their derivation subtree is allowed to go
+            # stale. Everything else keeps the status it already had, so a
+            # localized recovery does not re-taint components it is not
+            # responsible for.
+            scope_set = set(scope)
+            broken = {r: c for r, c in broken.items() if r in scope_set}
+            state = self._apply_dependency_status(
+                state, environment_diff, entries, scope=scope_set, observed=observed
+            )
+            state = self._propagate(state, broken, entries)
+            if events is not None:
+                state = self._propagate_caused_by(state, events, entries)
+            self._check_derived(state, entries)
 
         blocking = [
             e
@@ -173,12 +350,18 @@ class StateValidator:
         state: SemanticState,
         diff: EnvironmentDiff,
         entries: list[ComponentValidationEntry],
+        scope: set[str] | None = None,
+        observed: bool = True,
     ) -> SemanticState:
         if not state.external_dependencies:
             return state
 
         updated = []
         for dependency in state.external_dependencies:
+            if scope is not None and dependency.resource not in scope:
+                # Out of scope: preserve the status already recorded for it.
+                updated.append(dependency)
+                continue
             delta = diff.for_resource(dependency.resource)
             status = dependency.status
             detail = ""
@@ -188,7 +371,20 @@ class StateValidator:
                     status = StateStatus.UNKNOWN
                     detail = "not present in the current environment snapshot"
                 else:
-                    detail = "no environment snapshot to compare against"
+                    # A checkpoint snapshot may well exist; what is absent is the
+                    # caller's *current* observation, so name that rather than
+                    # blaming the stored side, which is the one thing definitely
+                    # present (issue #307). The status still degrades to UNKNOWN:
+                    # never validated is not the same as validated clean, and
+                    # strict_unknown is how a caller opts out of that.
+                    detail = (
+                        (
+                            "no current version supplied for comparison; pass "
+                            f'env={{"{dependency.resource}": "<version>"}}'
+                        )
+                        if not observed
+                        else "no environment snapshot to compare against"
+                    )
                     status = StateStatus.UNKNOWN if self.strict_unknown else dependency.status
             elif delta.change is ResourceChange.CHANGED:
                 status = StateStatus.CONFLICTED
@@ -249,19 +445,44 @@ class StateValidator:
             else:
                 evidence.append(item)
 
+        # A finding's support may be evidence or another finding
+        # (`dangling_evidence` blesses citing finding ids), so taint has to
+        # cascade along finding-to-finding edges too, and the pass repeats
+        # until no new finding is affected: a finding can cite one listed
+        # after it, which a single ordered pass would miss (issue #739).
         tainted_findings: set[str] = set()
+        finding_details: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            for finding in state.findings:
+                if finding.finding_id in tainted_findings:
+                    continue
+                if finding.status is not StateStatus.VALID:
+                    continue
+                affected_evidence = sorted(set(finding.evidence) & tainted_evidence)
+                affected_findings = sorted(set(finding.evidence) & tainted_findings)
+                if not (affected_evidence or affected_findings):
+                    continue
+                changed = True
+                tainted_findings.add(finding.finding_id)
+                parts = []
+                if affected_evidence:
+                    parts.append(f"changed evidence: {', '.join(affected_evidence)}")
+                if affected_findings:
+                    parts.append(f"stale finding: {', '.join(affected_findings)}")
+                finding_details[finding.finding_id] = "; ".join(parts)
+
         findings = []
         for finding in state.findings:
-            affected = sorted(set(finding.evidence) & tainted_evidence)
-            if affected and finding.status is StateStatus.VALID:
-                tainted_findings.add(finding.finding_id)
+            if finding.finding_id in tainted_findings:
                 findings.append(finding.model_copy(update={"status": StateStatus.STALE}))
                 entries.append(
                     ComponentValidationEntry(
                         component=Component.FINDING,
                         component_id=finding.finding_id,
                         status=StateStatus.STALE,
-                        detail=f"rests on changed evidence: {', '.join(affected)}",
+                        detail=f"rests on {finding_details[finding.finding_id]}",
                     )
                 )
             else:
@@ -297,11 +518,215 @@ class StateValidator:
             update={"evidence": evidence, "findings": findings, "decisions": decisions}
         )
 
+    def _propagate_caused_by(
+        self,
+        state: SemanticState,
+        events: Iterable[Event],
+        entries: list[ComponentValidationEntry],
+    ) -> SemanticState:
+        """Propagate staleness N hops via caused_by DAG (issue #553)."""
+        try:
+            from continuum.provenance.graph import build_provenance_graph
+        except ImportError:
+            return state
+        try:
+            graph = build_provenance_graph(events)
+        except Exception:
+            return state
+        if not graph.nodes:
+            return state
+        event_to_component: dict[str, tuple[str, str, object]] = {}
+        for ev in state.evidence:
+            eid = ev.provenance.source_event_id
+            if eid:
+                event_to_component[eid] = ("evidence", ev.evidence_id, ev)
+        for f in state.findings:
+            eid = f.provenance.source_event_id
+            if eid:
+                event_to_component[eid] = ("finding", f.finding_id, f)
+        for d in state.decisions:
+            eid = d.provenance.source_event_id
+            if eid:
+                event_to_component[eid] = ("decision", d.decision_id, d)
+        for plan in state.plan:
+            eid = plan.provenance.source_event_id
+            if eid:
+                event_to_component[eid] = ("plan", plan.step_id, plan)
+        tainted_events: set[str] = set()
+        for entry in entries:
+            if entry.status in (
+                StateStatus.STALE,
+                StateStatus.CONFLICTED,
+                StateStatus.INVALID,
+                StateStatus.UNKNOWN,
+            ):
+                for eid, (comp, cid, _) in event_to_component.items():
+                    if comp == entry.component.value and cid == entry.component_id:
+                        tainted_events.add(eid)
+                        break
+                if entry.component is Component.EVIDENCE and entry.component_id:
+                    for eid, (_comp, cid, _) in event_to_component.items():
+                        if cid == entry.component_id:
+                            tainted_events.add(eid)
+        for ev in state.evidence:
+            if ev.status is not StateStatus.VALID and ev.provenance.source_event_id:
+                tainted_events.add(ev.provenance.source_event_id)
+        for f in state.findings:
+            if f.status is not StateStatus.VALID and f.provenance.source_event_id:
+                tainted_events.add(f.provenance.source_event_id)
+        for d in state.decisions:
+            if d.status is not StateStatus.VALID and d.provenance.source_event_id:
+                tainted_events.add(d.provenance.source_event_id)
+        if not tainted_events:
+            return state
+        from collections import deque
+
+        dq = deque(tainted_events)
+        seen: set[str] = set(tainted_events)
+        downstream_events: set[str] = set()
+        while dq:
+            cur = dq.popleft()
+            for child in graph.edges.get(cur, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                downstream_events.add(child)
+                dq.append(child)
+        has_cycle = False
+        visited_dfs: set[str] = set()
+
+        def dfs(node: str, stack: set[str]) -> bool:
+            """Detect cycles in downstream causal event paths using DFS."""
+            if node in stack:
+                return True
+            if node in visited_dfs:
+                return False
+            visited_dfs.add(node)
+            stack.add(node)
+            for child in graph.edges.get(node, []):
+                if (child in downstream_events or child in tainted_events) and dfs(child, stack):
+                    return True
+            stack.remove(node)
+            return False
+
+        for start in tainted_events:
+            if dfs(start, set()):
+                has_cycle = True
+                break
+        evidence_by_id = {e.evidence_id: e for e in state.evidence}
+        findings_by_id = {f.finding_id: f for f in state.findings}
+        decisions_by_id = {d.decision_id: d for d in state.decisions}
+        plan_by_id = {p.step_id: p for p in state.plan}
+        tainted_downstream: list[tuple[str, str, str]] = []
+        for eid in downstream_events:
+            if eid not in event_to_component:
+                # Handle downstream ACTION_RECORDED not in state (ledger actions)
+                node = graph.nodes.get(eid)
+                if node and node.type.value == "ACTION_RECORDED":
+                    from continuum.events import EventType as _ET
+
+                    if node.type is _ET.ACTION_RECORDED:
+                        action_id = (
+                            node.payload.get("action_id")
+                            or node.payload.get("action", {}).get("action_id")
+                            or eid[:8]
+                        )
+                        # Avoid duplicate if already marked
+                        already_action = any(
+                            e.component is Component.ACTION
+                            and e.component_id == action_id
+                            and e.status is not StateStatus.VALID
+                            for e in entries
+                        )
+                        if not already_action:
+                            detail = "via caused_by downstream of tainted evidence (N-hop)"
+                            # Check for cycle already computed
+                            status_to_set_action = (
+                                StateStatus.CONFLICTED if has_cycle else StateStatus.STALE
+                            )
+                            entries.append(
+                                ComponentValidationEntry(
+                                    component=Component.ACTION,
+                                    component_id=action_id,
+                                    status=status_to_set_action,
+                                    detail=detail,
+                                )
+                            )
+                continue
+            comp, cid, obj = event_to_component[eid]
+            already = any(
+                e.component.value == comp
+                and e.component_id == cid
+                and e.status is not StateStatus.VALID
+                for e in entries
+            )
+            if already:
+                continue
+            current_status = obj.status if hasattr(obj, "status") else StateStatus.VALID
+            if current_status is not StateStatus.VALID:
+                continue
+            tainted_downstream.append((eid, comp, cid))
+        status_to_set = StateStatus.CONFLICTED if has_cycle else StateStatus.STALE
+        new_evidence = list(state.evidence)
+        new_findings = list(state.findings)
+        new_decisions = list(state.decisions)
+        new_plan = list(state.plan)
+        for eid, comp, cid in tainted_downstream:
+            parents = graph.reverse_edges.get(eid, [])
+            parent_str = parents[0][:8] if parents else "unknown"
+            detail = f"via caused_by from {parent_str} (N-hop staleness)"
+            if has_cycle:
+                detail = f"cycle detected via caused_by, downstream of {parent_str}"
+            # Map comp to Component
+            try:
+                comp_enum = Component(comp)
+            except ValueError:
+                comp_enum = Component.DECISION
+            entries.append(
+                ComponentValidationEntry(
+                    component=comp_enum,
+                    component_id=cid,
+                    status=status_to_set,
+                    detail=detail,
+                )
+            )
+            if comp == "evidence" and cid in evidence_by_id:
+                idx = next(i for i, e in enumerate(new_evidence) if e.evidence_id == cid)
+                new_evidence[idx] = evidence_by_id[cid].model_copy(update={"status": status_to_set})
+            elif comp == "finding" and cid in findings_by_id:
+                idx = next(i for i, f in enumerate(new_findings) if f.finding_id == cid)
+                new_findings[idx] = findings_by_id[cid].model_copy(update={"status": status_to_set})
+            elif comp == "decision" and cid in decisions_by_id:
+                idx = next(i for i, d in enumerate(new_decisions) if d.decision_id == cid)
+                update: dict[str, object] = {"status": status_to_set}
+                if status_to_set is StateStatus.STALE:
+                    from continuum.models import utcnow
+
+                    update["invalidated_reason"] = detail
+                    update["invalidated_at"] = utcnow()
+                new_decisions[idx] = decisions_by_id[cid].model_copy(update=update)
+            elif comp == "plan" and cid in plan_by_id:
+                idx = next(i for i, p in enumerate(new_plan) if p.step_id == cid)
+                import contextlib
+
+                with contextlib.suppress(Exception):
+                    new_plan[idx] = plan_by_id[cid].model_copy(update={"status": status_to_set})
+        if tainted_downstream:
+            return state.model_copy(
+                update={
+                    "evidence": new_evidence,
+                    "findings": new_findings,
+                    "decisions": new_decisions,
+                    "plan": new_plan,
+                }
+            )
+        return state
+
     # -- per-component checks --------------------------------------------- #
 
     def _check_goal(self, state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
         origin = state.goal.provenance.origin
-        if origin.self_certified and not self.confirmed:
+        if origin.self_certified and "goal" not in self.confirmed:
             entries.append(
                 ComponentValidationEntry(
                     component=Component.GOAL,
@@ -333,7 +758,7 @@ class StateValidator:
         # it, so it cannot count as verified state. A human confirmation
         # (REVIEW_CONFIRMED) clears this so the run can resume.
         origin = progress.provenance.origin
-        if origin.self_certified and not self.confirmed:
+        if origin.self_certified and "progress" not in self.confirmed:
             status = StateStatus.REQUIRES_REVIEW
             detail = (
                 f"{progress.completed} completed, self-reported by {origin.value} "
@@ -354,18 +779,148 @@ class StateValidator:
             )
         )
 
+    def _check_plan(self, state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
+        if not state.plan:
+            return
+        seen: set[str] = set()
+        by_id: dict[str, Any] = {}
+        for step in state.plan:
+            if not step.step_id or not step.step_id.strip():
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.PLAN,
+                        component_id=step.step_id,
+                        status=StateStatus.CONFLICTED,
+                        detail="plan unit id must be non-empty",
+                    )
+                )
+                continue
+            if step.step_id in seen:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.PLAN,
+                        component_id=step.step_id,
+                        status=StateStatus.CONFLICTED,
+                        detail=f"duplicate plan unit id {step.step_id!r}",
+                    )
+                )
+            seen.add(step.step_id)
+            by_id[step.step_id] = step
+        for step in state.plan:
+            for dep in step.depends_on:
+                if dep not in by_id:
+                    entries.append(
+                        ComponentValidationEntry(
+                            component=Component.PLAN,
+                            component_id=step.step_id,
+                            status=StateStatus.CONFLICTED,
+                            detail=f"depends_on {dep!r} not in plan",
+                        )
+                    )
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = []
+        cycle: list[str] | None = None
+
+        def dfs(node: str) -> bool:
+            """Detect dependency cycles within plan steps using DFS."""
+            nonlocal cycle
+            if node in visited:
+                return False
+            if node in visiting:
+                idx = stack.index(node) if node in stack else 0
+                cycle = stack[idx:] + [node]
+                return True
+            if node not in by_id:
+                return False
+            visiting.add(node)
+            stack.append(node)
+            for dep in by_id[node].depends_on:
+                if dfs(dep):
+                    return True
+            stack.pop()
+            visiting.remove(node)
+            visited.add(node)
+            return False
+
+        for sid in list(by_id):
+            if sid not in visited and dfs(sid):
+                break
+        if cycle:
+            detail = f"cycle detected: {' -> '.join(cycle)}"
+            for sid in cycle:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.PLAN,
+                        component_id=sid,
+                        status=StateStatus.CONFLICTED,
+                        detail=detail,
+                    )
+                )
+        for step in state.plan:
+            if step.provenance.origin.self_certified:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.PLAN,
+                        component_id=step.step_id,
+                        status=StateStatus.REQUIRES_REVIEW,
+                        detail=f"plan unit {step.step_id!r} asserted by {step.provenance.origin.value}",
+                    )
+                )
+        stale_ids: set[str] = set()
+        for e in entries:
+            if (
+                e.component is Component.PLAN
+                and e.status
+                in (
+                    StateStatus.STALE,
+                    StateStatus.CONFLICTED,
+                    StateStatus.REQUIRES_REVIEW,
+                    StateStatus.INVALID,
+                )
+                and e.component_id
+            ):
+                stale_ids.add(e.component_id)
+        changed = True
+        while changed:
+            changed = False
+            for step in state.plan:
+                if step.step_id in stale_ids:
+                    continue
+                for dep in step.depends_on:
+                    if dep in stale_ids:
+                        if step.step_id not in stale_ids:
+                            stale_ids.add(step.step_id)
+                            entries.append(
+                                ComponentValidationEntry(
+                                    component=Component.PLAN,
+                                    component_id=step.step_id,
+                                    status=StateStatus.STALE,
+                                    detail=f"depends on stale plan unit {dep!r}",
+                                )
+                            )
+                            changed = True
+                        break
+
     @staticmethod
     def _check_approvals(state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
         now = utcnow()
         for approval in state.approvals:
+            # A naive expires_at (persisted by versions before issue #704, or
+            # constructed directly) must grade, not raise: comparing it against
+            # the tz-aware `now` would TypeError and take down the whole
+            # validation pass. Read a missing offset as UTC, as the fold does.
+            expires_at = approval.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
             if approval.status is ApprovalStatus.REVOKED:
                 status, detail = StateStatus.INVALID, "approval was revoked"
             elif approval.status is ApprovalStatus.EXPIRED:
                 status, detail = StateStatus.EXPIRED, "approval expired"
-            elif approval.expires_at is not None and approval.expires_at <= now:
+            elif expires_at is not None and expires_at <= now:
                 status, detail = (
                     StateStatus.EXPIRED,
-                    f"expired at {approval.expires_at.isoformat()}",
+                    f"expired at {expires_at.isoformat()}",
                 )
             elif approval.status is ApprovalStatus.PENDING:
                 status, detail = StateStatus.REQUIRES_REVIEW, "approval never granted"
@@ -405,6 +960,26 @@ class StateValidator:
                             if assumptions
                             else ""
                         )
+                    ),
+                )
+            )
+            return
+
+        if expected_model is not None and recorded is None:
+            # The caller asked for a drift check the state cannot answer: no
+            # writer ever recorded which model produced this run. Returning
+            # silently here reads as "no drift" and is indistinguishable from a
+            # clean comparison, so a caller passing expected_model believes it
+            # got an assurance it never received (issue #308). Report the gap
+            # instead. Reached whenever no writer named the model: pass model_id
+            # to continuum_checkpoint to make the comparison answerable (#370).
+            entries.append(
+                ComponentValidationEntry(
+                    component=Component.MODEL,
+                    component_id=None,
+                    status=StateStatus.UNKNOWN,
+                    detail=(
+                        f"no model recorded for this run, cannot compare against {expected_model!r}"
                     ),
                 )
             )
@@ -456,6 +1031,39 @@ class StateValidator:
                 )
             )
 
+    def _check_derived(self, state: SemanticState, entries: list[ComponentValidationEntry]) -> None:
+        """Derived artifacts must never amplify weak sources (issue #392)."""
+        for finding in state.findings:
+            if finding.provenance.origin.self_certified and finding.status is StateStatus.VALID:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.FINDING,
+                        component_id=finding.finding_id,
+                        status=StateStatus.REQUIRES_REVIEW,
+                        detail=f"derived from {finding.provenance.origin.value} and not independently verified",
+                    )
+                )
+        for decision in state.decisions:
+            if decision.provenance.origin.self_certified and decision.status is StateStatus.VALID:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.DECISION,
+                        component_id=decision.decision_id,
+                        status=StateStatus.REQUIRES_REVIEW,
+                        detail=f"derived from {decision.provenance.origin.value} and not independently verified",
+                    )
+                )
+        for ev in state.evidence:
+            if ev.provenance.origin.self_certified and ev.status is StateStatus.VALID:
+                entries.append(
+                    ComponentValidationEntry(
+                        component=Component.EVIDENCE,
+                        component_id=ev.evidence_id,
+                        status=StateStatus.REQUIRES_REVIEW,
+                        detail=f"derived from {ev.provenance.origin.value} and not independently verified",
+                    )
+                )
+
 
 def validate_state(
     state: SemanticState,
@@ -465,9 +1073,19 @@ def validate_state(
     checkpoint_version: int = 0,
     expected_model: str | None = None,
     strict_unknown: bool = True,
-    confirmed: bool = False,
+    confirmed: bool | Iterable[str] = False,
+    scope: Iterable[str] | None = None,
+    events: Iterable[Event] | None = None,
 ) -> ValidationOutcome:
-    """Validate a state against the current environment."""
+    """Validate a state against the current environment.
+
+    When ``scope`` names specific dependency resources, only those resources are
+    re-checked and only their derivation subtree may go stale; the rest of the
+    state keeps its recorded status (localized recovery).
+
+    ``confirmed`` may be a boolean (True means both goal and progress) or an
+    iterable of component names for scoped confirm (issue #394).
+    """
     return StateValidator(strict_unknown=strict_unknown, confirmed=confirmed).validate(
         state,
         current_environment=current_environment,
@@ -475,4 +1093,6 @@ def validate_state(
         checkpoint_version=checkpoint_version,
         expected_model=expected_model,
         confirmed=confirmed,
+        scope=scope,
+        events=events,
     )

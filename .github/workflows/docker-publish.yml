@@ -1,0 +1,62 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Lowercase on purpose: GHCR rejects uppercase in image names.
+env:
+  IMAGE: ghcr.io/cyrax321/continuum
+
+jobs:
+  publish:
+    if: github.repository == 'Cyrax321/CONTINUUM'
+    name: Build and push to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm ${{ env.IMAGE }}:latest continuum --version
+          # The default CMD runs the crash-recovery demo; it is hermetic
+          # (the GitHub issue is a local log append) and finishes in about
+          # a minute. A nonzero exit or a missing verdict line fails the gate.
+          docker run --rm ${{ env.IMAGE }}:latest > /tmp/demo.log
+          grep -q "No work repeated. No side effect duplicated." /tmp/demo.log

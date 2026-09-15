@@ -4,7 +4,7 @@ Checkpointing every turn is the obvious design and the wrong one: it costs an
 fsync per step and fills history with versions that mean nothing. Checkpointing
 too rarely loses work. A policy decides.
 
-Policies answer one question — ``should_checkpoint(...) -> Decision`` — and are
+Policies answer one question (``should_checkpoint(...) -> Decision``) and are
 pure: same inputs, same answer, no clock reads hidden inside except the one
 passed in. That makes checkpoint timing testable instead of a source of
 flakiness.
@@ -59,6 +59,7 @@ class CheckpointTrigger:
     IMPORTANT_STATE_CHANGE = "important_state_change"
     CONTEXT_PRESSURE = "context_pressure"
     RUN_COMPLETED = "run_completed"
+    RECOVERY = "recovery"
 
 
 #: Events that mean the outside world changed. Losing these is expensive:
@@ -98,10 +99,12 @@ class CheckpointDecision:
 
     @classmethod
     def no(cls) -> CheckpointDecision:
+        """Return a negative decision indicating no checkpoint should be created."""
         return cls(should=False)
 
     @classmethod
     def yes(cls, trigger: str, reason: str = "") -> CheckpointDecision:
+        """Return an affirmative decision with trigger type and optional reason."""
         return cls(should=True, trigger=trigger, reason=reason)
 
 
@@ -124,7 +127,9 @@ class CheckpointPolicy(ABC):
     name: str = "policy"
 
     @abstractmethod
-    def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision: ...
+    def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Evaluate context and decide whether to trigger a checkpoint."""
+        ...
 
 
 class ManualPolicy(CheckpointPolicy):
@@ -133,6 +138,7 @@ class ManualPolicy(CheckpointPolicy):
     name = "manual"
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Trigger a checkpoint only when explicitly requested in the context."""
         if context.explicit:
             return CheckpointDecision.yes(CheckpointTrigger.MANUAL, "explicitly requested")
         return CheckpointDecision.no()
@@ -149,6 +155,7 @@ class IntervalPolicy(CheckpointPolicy):
         self.max_interval = timedelta(seconds=max_interval_seconds)
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Trigger a checkpoint if elapsed time exceeds the configured interval."""
         if context.last_checkpoint_at is None:
             return CheckpointDecision.yes(
                 CheckpointTrigger.INTERVAL, "no checkpoint exists for this run"
@@ -165,7 +172,7 @@ class IntervalPolicy(CheckpointPolicy):
 class EventPolicy(CheckpointPolicy):
     """Checkpoint when particular event types appear.
 
-    Defaults to side effects and milestones — the events whose loss actually
+    Defaults to side effects and milestones, the events whose loss actually
     costs something.
     """
 
@@ -185,6 +192,7 @@ class EventPolicy(CheckpointPolicy):
         self.watched = frozenset(watched)
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Trigger a checkpoint when new events match watched milestones or side effects."""
         for event in context.new_events:
             if event.type not in self.watched:
                 continue
@@ -202,8 +210,8 @@ class SemanticPolicy(CheckpointPolicy):
 
     Progress alone does not qualify unless it crosses a stride: counting from
     3,400 to 3,401 is not worth an fsync, but losing 500 documents of work is.
-    Structural changes — a new or invalidated decision, a new finding, a changed
-    dependency, an approval, a model switch — always qualify, because they
+    Structural changes (a new or invalidated decision, a new finding, a changed
+    dependency, an approval, a model switch) always qualify, because they
     change what the agent is allowed to do next.
     """
 
@@ -215,6 +223,7 @@ class SemanticPolicy(CheckpointPolicy):
         self.progress_stride = progress_stride
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Trigger a checkpoint on structural state changes or progress milestones."""
         current = context.state
         previous = context.previous_state
 
@@ -245,15 +254,18 @@ class SemanticPolicy(CheckpointPolicy):
         previous: SemanticState, current: SemanticState
     ) -> Sequence[tuple[str, bool]]:
         def invalidated(state: SemanticState) -> int:
+            """Count decisions and findings with terminal invalidation statuses."""
             terminal = {StateStatus.INVALID, StateStatus.STALE, StateStatus.CONFLICTED}
             return sum(1 for d in state.decisions if d.status in terminal) + sum(
                 1 for f in state.findings if f.status in terminal
             )
 
         def dependency_signature(state: SemanticState) -> tuple[tuple[str, str | None], ...]:
+            """Return a canonical sorted tuple of external dependencies and versions."""
             return tuple(sorted((d.resource, d.version) for d in state.external_dependencies))
 
         def approval_signature(state: SemanticState) -> tuple[tuple[str, str], ...]:
+            """Return a canonical sorted tuple of approval identifiers and statuses."""
             return tuple(sorted((a.approval_id, a.status.value) for a in state.approvals))
 
         return (
@@ -289,6 +301,7 @@ class HybridPolicy(CheckpointPolicy):
             raise ValueError("HybridPolicy requires at least one policy")
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Return the first affirmative decision from constituent policies, or negative."""
         for policy in self.policies:
             decision = policy.should_checkpoint(context)
             if decision.should:
@@ -315,6 +328,7 @@ class ContextPressurePolicy(CheckpointPolicy):
         self.threshold = threshold
 
     def should_checkpoint(self, context: PolicyContext) -> CheckpointDecision:
+        """Trigger a checkpoint when context token consumption crosses threshold."""
         if context.context_tokens is None:
             return CheckpointDecision.no()
         used = context.context_tokens / self.token_budget

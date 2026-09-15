@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -141,8 +142,53 @@ def test_a_compensated_action_may_be_performed_again(ledger: ActionLedger) -> No
 
 
 def test_completing_an_unknown_key_is_refused(ledger: ActionLedger) -> None:
-    with pytest.raises(LedgerError, match="no action recorded"):
+    """The refusal names both identifier spaces (issue #367).
+
+    Settle methods accept either an idempotency key or an ``action_id``, so a
+    failure means neither matched. The old wording said only "no action recorded
+    for key", which left a caller holding a valid identifier of the other kind
+    unable to tell a wrong-space mistake from a nonexistent action.
+    """
+    with pytest.raises(LedgerError, match="idempotency key or an action_id"):
         ledger.complete("nonexistent", external_id="1")
+
+
+def test_settle_methods_accept_an_action_id(ledger: ActionLedger) -> None:
+    """`action_id` is the identifier every read surface reports (issue #367).
+
+    The ledger keys on the idempotency key, but `Action.action_id`, the recovery
+    plan's `reconcile_action:<target>` steps, the contract's `required_actions`
+    and the rendered report all name the action id. Accepting only the key made
+    the project's own recovery guidance unexecutable as written.
+    """
+    outcome = ledger.claim("github.create_issue", ISSUE)
+    settled = ledger.complete(outcome.action.action_id, external_id="issue-7")
+
+    assert settled.status is ActionStatus.COMPLETED
+    assert settled.external_id == "issue-7"
+    # Settled under the ledger's own key, not under the identifier passed in, or
+    # the fold would grow a second entry for one action.
+    assert len(ledger.all()) == 1
+    assert ledger.get(str(outcome.key)) is not None
+
+
+def test_an_unknown_action_reports_the_key_needed_to_reconcile_it(
+    ledger: ActionLedger,
+) -> None:
+    """Telling a caller to reconcile without saying what is not actionable (#367).
+
+    The identity used to appear only as a 12-character truncated prefix inside
+    the exception message, so a recovering session, the one least able to
+    reconstruct it, had no way to follow the instruction it was given.
+    """
+    outcome = ledger.claim("github.create_issue", ISSUE)
+    with pytest.raises(UnknownSideEffect) as raised:
+        ledger.claim("github.create_issue", ISSUE)
+
+    assert raised.value.action_key == str(outcome.key)
+    assert raised.value.action_id == outcome.action.action_id
+    # Usable as passed, rather than merely reported.
+    assert ledger.reconcile(raised.value.action_key, occurred=False).status is ActionStatus.FAILED
 
 
 # --- the crash gap: the reason this module exists -------------------------- #
@@ -150,7 +196,7 @@ def test_completing_an_unknown_key_is_refused(ledger: ActionLedger) -> None:
 
 def test_an_interrupted_action_refuses_to_silently_retry(ledger: ActionLedger) -> None:
     """Crash between claim and complete: the effect may or may not have landed."""
-    ledger.claim("github.create_issue", ISSUE)  # never completed — process died
+    ledger.claim("github.create_issue", ISSUE)  # never completed, process died
 
     with pytest.raises(UnknownSideEffect, match="may or may not have occurred"):
         ledger.claim("github.create_issue", ISSUE)
@@ -180,6 +226,192 @@ def test_a_timeout_is_not_evidence_of_absence(ledger: ActionLedger) -> None:
 
     with pytest.raises(UnknownSideEffect):
         ledger.claim("payment.charge", {"amount": 100})
+
+
+def test_complete_cannot_launder_an_unknown_action(ledger: ActionLedger) -> None:
+    """`complete` must not clear a blocker that exists for lack of evidence (#366).
+
+    An action is UNKNOWN precisely because nobody could say whether the effect
+    happened. Completing it here asserted that it did, wrote no note, and left an
+    ACTION_RECORDED event indistinguishable from an ordinary first-time success,
+    so the audit trail lost the fact that the decision was made by assertion.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.fail(outcome.key, "gateway timeout after the charge was sent", certain=False)
+
+    with pytest.raises(LedgerError, match="nothing has verified"):
+        ledger.complete(outcome.key, external_id="txn-1")
+
+    still = ledger.get(str(outcome.key))
+    assert still is not None
+    assert still.status is ActionStatus.UNKNOWN
+    assert ledger.pending(), "the recovery blocker must survive the refused call"
+
+
+def test_reconcile_remains_the_route_for_a_settled_unknown(ledger: ActionLedger) -> None:
+    """The refusal must point somewhere that works (issue #366).
+
+    `reconcile` takes the same decision but demands the caller stand behind it and
+    records ACTION_RECONCILED with a note, so the correction stays visible.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.fail(outcome.key, "gateway timeout", certain=False)
+
+    settled = ledger.reconcile(
+        outcome.key,
+        occurred=True,
+        external_id="txn-1",
+        note="found the charge in the gateway ledger",
+    )
+    assert settled.status is ActionStatus.COMPLETED
+    assert settled.external_id == "txn-1"
+    assert not ledger.pending()
+    assert EventType.ACTION_RECONCILED in [e.type for e in ledger.storage.read_events("run_1")]
+
+
+@pytest.mark.parametrize(
+    ("settle", "expected_status"),
+    [
+        (lambda led, key: led.fail(key, "rejected before sending", certain=True), "failed"),
+        (lambda led, key: led.compensate(key, note="refunded"), "compensated"),
+        (lambda led, key: led.flag_for_review(key, "amount looks wrong"), "requires_review"),
+    ],
+)
+def test_complete_refuses_every_status_that_is_not_in_flight(
+    ledger: ActionLedger,
+    settle: Any,
+    expected_status: str,
+) -> None:
+    """Only a claim still in flight is a settlement; the rest are corrections (#366).
+
+    A FAILED action contradicted without evidence, a COMPENSATED one whose effect
+    was deliberately undone, and one a human flagged for review are all outcomes
+    already on record. Overwriting them belongs to `reconcile`, which records why.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    settle(ledger, outcome.key)
+
+    with pytest.raises(LedgerError, match=expected_status):
+        ledger.complete(outcome.key, external_id="txn-1")
+
+
+@pytest.mark.parametrize(
+    ("settle", "expected_status"),
+    [
+        (lambda led, key: led.complete(key, external_id="txn-1"), "completed"),
+        (lambda led, key: led.compensate(key, note="refunded"), "compensated"),
+        (lambda led, key: led.flag_for_review(key, "amount looks wrong"), "requires_review"),
+    ],
+)
+def test_fail_refuses_every_status_that_is_not_in_flight(
+    ledger: ActionLedger,
+    settle: Any,
+    expected_status: str,
+) -> None:
+    """The mirror of complete's guard (issue #366) for fail (issue #733).
+
+    A COMPLETED action flipped to FAILED by a late report reopened the key and
+    let the next claim re-fire a side effect that had already happened. The
+    other settled statuses are corrections of outcomes already on record, which
+    belong to `reconcile`.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    settle(ledger, outcome.key)
+
+    with pytest.raises(LedgerError, match=expected_status):
+        ledger.fail(outcome.key, "late failure report")
+
+
+def test_a_refused_fail_leaves_the_completed_outcome_settled(ledger: ActionLedger) -> None:
+    """The point of the guard: dedup must survive the refused late report.
+
+    The COMPLETED action keeps its receipt, stays out of pending(), and the
+    same claim remains a cache hit instead of re-opening as a fresh attempt.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.complete(outcome.key, external_id="txn-1")
+
+    with pytest.raises(LedgerError, match="erase a recorded outcome"):
+        ledger.fail(outcome.key, "late timeout report")
+
+    still = ledger.get(str(outcome.key))
+    assert still is not None
+    assert still.status is ActionStatus.COMPLETED
+    assert still.external_id == "txn-1"
+    assert not ledger.pending()
+
+    retry = ledger.claim("payment.charge", {"amount": 100})
+    assert retry.fresh is False, "a refused fail must not reopen the key"
+
+
+def test_failing_an_already_failed_action_is_still_allowed(ledger: ActionLedger) -> None:
+    """A caller repeating a failure report after a dropped response asserts
+    nothing new (same allowance complete makes for COMPLETED, issue #366)."""
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.fail(outcome.key, "500 from upstream")
+
+    again = ledger.fail(outcome.key, "500 from upstream, re-reported")
+    assert again.status is ActionStatus.FAILED
+
+
+def test_fail_refuses_an_unknown_action_and_reconcile_remains_the_route(
+    ledger: ActionLedger,
+) -> None:
+    """An uncertain outcome cannot be resolved by assertion; the evidence
+    goes through `reconcile`, exactly as for complete (issue #366)."""
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.fail(outcome.key, "gateway timeout", certain=False)
+
+    with pytest.raises(LedgerError, match="unknown"):
+        ledger.fail(outcome.key, "definitely did not happen")
+
+    settled = ledger.reconcile(outcome.key, occurred=False, note="gateway has no trace of it")
+    assert settled.status is ActionStatus.FAILED
+    assert not ledger.pending()
+
+
+def test_completing_an_already_completed_action_is_still_allowed(
+    ledger: ActionLedger,
+) -> None:
+    """A caller repeating itself after a dropped response asserts nothing new."""
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.complete(outcome.key, external_id="txn-1")
+
+    again = ledger.complete(outcome.key, external_id="txn-1")
+    assert again.status is ActionStatus.COMPLETED
+
+
+def test_repeating_a_completion_without_arguments_keeps_the_receipt(
+    ledger: ActionLedger,
+) -> None:
+    """Omission must not erase the evidence the effect happened (issue #366).
+
+    A caller retrying after a dropped response usually sends only the key, and
+    overwriting `external_id` and `result` with None would destroy the receipt on
+    the action the fold reports. Same invariant `reconcile` already documents.
+    """
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.complete(outcome.key, external_id="txn-1", result={"cents": 100})
+
+    again = ledger.complete(outcome.key)
+    assert again.external_id == "txn-1"
+    assert again.result == {"cents": 100}
+    assert again.result_hash is not None
+    # And the folded view, which is what every reader sees, agrees.
+    folded = ledger.get(str(outcome.key))
+    assert folded is not None and folded.external_id == "txn-1"
+
+
+def test_a_completion_may_still_replace_the_receipt_it_supplies(
+    ledger: ActionLedger,
+) -> None:
+    """Preserving on omission must not block a caller that does supply values."""
+    outcome = ledger.claim("payment.charge", {"amount": 100})
+    ledger.complete(outcome.key, external_id="txn-1", result={"cents": 100})
+
+    corrected = ledger.complete(outcome.key, external_id="txn-2", result={"cents": 250})
+    assert corrected.external_id == "txn-2"
+    assert corrected.result == {"cents": 250}
 
 
 def test_a_definite_failure_is_distinguished_from_a_timeout(
@@ -361,6 +593,54 @@ def test_a_globally_scoped_action_deduplicates_across_runs(
     assert not ledger.claim("send_welcome_email", {"to": "x@y.z"}, scoped_to_run=False).fresh
 
 
+def _seed_run(store: SQLiteStorage, run_id: str) -> None:
+    store.create_run(Run(run_id=run_id, goal="g"))
+    store.append_event(run_id, EventType.RUN_STARTED, {"goal": "g"})
+
+
+def test_an_unscoped_claim_deduplicates_against_another_run(
+    store: SQLiteStorage,
+) -> None:
+    """Issue 34: scoped_to_run=False must consult other runs, not just this one."""
+    _seed_run(store, "runA")
+    _seed_run(store, "runB")
+    first = ActionLedger(store, "runA")
+    second = ActionLedger(store, "runB")
+
+    outcome = first.claim("send.invoice", {"id": "INV-1"}, scoped_to_run=False)
+    assert outcome.fresh
+    first.complete(outcome.key, external_id="EXT-1")
+
+    replay = second.claim("send.invoice", {"id": "INV-1"}, scoped_to_run=False)
+    assert not replay.fresh
+    assert replay.external_id == "EXT-1"
+
+
+def test_an_unscoped_claim_refuses_while_another_run_is_uncertain(
+    store: SQLiteStorage,
+) -> None:
+    """An unresolved attempt elsewhere must block a parallel unclaimed slot."""
+    _seed_run(store, "runA")
+    _seed_run(store, "runB")
+    ActionLedger(store, "runA").claim("send.invoice", {"id": "INV-2"}, scoped_to_run=False)
+    with pytest.raises(UnknownSideEffect):
+        ActionLedger(store, "runB").claim("send.invoice", {"id": "INV-2"}, scoped_to_run=False)
+
+
+def test_a_failed_unscoped_action_in_another_run_does_not_block(
+    store: SQLiteStorage,
+) -> None:
+    """Certain failure means no effect stands in the way of this run's own slot."""
+    _seed_run(store, "runA")
+    _seed_run(store, "runB")
+    first = ActionLedger(store, "runA")
+    outcome = first.claim("send.invoice", {"id": "INV-3"}, scoped_to_run=False)
+    first.fail(outcome.key, "rejected before send", certain=True)
+
+    replay = ActionLedger(store, "runB").claim("send.invoice", {"id": "INV-3"}, scoped_to_run=False)
+    assert replay.fresh
+
+
 def test_a_resolver_that_declines_falls_back_to_refusing(
     ledger: ActionLedger,
 ) -> None:
@@ -398,7 +678,7 @@ def test_an_explicit_key_lets_a_repeat_be_a_genuine_second_action(
     """Argument hashing cannot express "this repeat is intentional".
 
     Two identical reminders are two sends, not one. Without an explicit key the
-    second is silently deduplicated away — failing closed, but still wrong.
+    second is silently deduplicated away, failing closed, but still wrong.
     """
     args = {"to": "x@y.z", "body": "Standup in 5"}
 
@@ -583,6 +863,65 @@ def test_identity_match_survives_an_absolute_versus_relative_path(
     assert again.external_id == "ext-5"
 
 
+def test_identity_match_does_not_collapse_same_name_files_in_different_directories(
+    ledger: ActionLedger,
+) -> None:
+    """Same basename, different directory, is different work (issue #365).
+
+    Comparing at the leaf is what lets a re-rendered path deduplicate, but it also
+    made every per-tenant file with a conventional name look like one resource.
+    The second tenant was never notified, and the ledger handed back the first
+    tenant's receipt as though it were the second's, which is precisely the silent
+    swallow the identity fallback exists to prevent.
+    """
+    first = ledger.claim("tenant.notify", {"path": "/tenants/acme/report.csv"})
+    ledger.complete(first.key, external_id="notify-acme-001")
+
+    second = ledger.claim("tenant.notify", {"path": "/tenants/globex/report.csv"})
+    assert second.fresh, "globex is a different file and must still be notified"
+    assert second.external_id is None, "acme's receipt must not be reused for globex"
+    assert second.key != first.key
+
+
+def test_identity_match_still_matches_when_only_one_side_names_a_path(
+    ledger: ActionLedger,
+) -> None:
+    """A side with no path makes no claim about location (issue #365).
+
+    Requiring locations to agree must not undo the field-rename case: an argument
+    set that drops the path entirely contradicts nothing, so it still matches on
+    its leaves.
+    """
+    first = ledger.claim("bench.send", {"file": "/data/invoices/INV-5.pdf"})
+    ledger.complete(first.key, external_id="ext-5")
+
+    again = ledger.claim("bench.send", {"invoice": "INV-5.pdf"})
+    assert not again.fresh
+    assert again.external_id == "ext-5"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "same"),
+    [
+        # Drift: one rendering is a trailing part of the other.
+        ("/data/invoices/INV-5.pdf", "invoices/INV-5.pdf", True),
+        ("/data/invoices/INV-5.pdf", "./invoices/INV-5.pdf", True),
+        ("/data/invoices/INV-5.pdf", "/data/invoices/INV-5.pdf", True),
+        # Different containers for the same filename are different files.
+        ("/tenants/acme/report.csv", "/tenants/globex/report.csv", False),
+        ("a/report.csv", "b/report.csv", False),
+        # Separator style is a rendering difference, not a resource difference.
+        ("data\\invoices\\INV-5.pdf", "invoices/INV-5.pdf", True),
+    ],
+)
+def test_same_location_compares_by_suffix_not_basename(left: str, right: str, same: bool) -> None:
+    """Suffix comparison is the shape path drift actually takes (issue #365)."""
+    from continuum.actions.idempotency import same_location
+
+    assert same_location(left, right) is same
+    assert same_location(right, left) is same, "the comparison must be symmetric"
+
+
 def test_identity_match_does_not_collapse_actions_sharing_one_incidental_value(
     ledger: ActionLedger,
 ) -> None:
@@ -717,3 +1056,54 @@ def test_file_extension_shape_still_deduplicates(ledger: ActionLedger) -> None:
 
     second = ledger.claim("export.report", {"dataset": "report.csv"})
     assert not second.fresh, "report.csv is a known-suffix rendering of report"
+
+
+# --- confirming an effect must not erase the proof of it --------------------- #
+
+
+def test_reconciling_as_occurred_keeps_an_existing_receipt(ledger: ActionLedger) -> None:
+    """Omitting external_id used to overwrite it with None.
+
+    Issue #29 established that occurred=False clears now-falsified evidence.
+    occurred=True is the opposite claim, so it must never be the reason a receipt
+    disappears. A caller that confirms an effect happened without capturing its
+    id should leave the recorded id standing, not destroy it.
+    """
+    claim = ledger.claim("charge", {"cents": 999}, key="invoice:2")
+    ledger.complete(claim.key, external_id="receipt-2", result={"cents": 999})
+
+    ledger.reconcile(claim.key, occurred=True, note="probe confirmed it exists")
+
+    settled = ledger.get(claim.key)
+    assert settled is not None
+    assert settled.status is ActionStatus.COMPLETED
+    assert settled.external_id == "receipt-2"
+    assert settled.result == {"cents": 999}
+
+
+def test_reconciling_as_occurred_still_accepts_new_evidence(ledger: ActionLedger) -> None:
+    """Preserving on omission must not stop a caller replacing the evidence."""
+    claim = ledger.claim("charge", {}, key="invoice:3")
+    ledger.complete(claim.key, external_id="stale", result={"v": 1})
+
+    ledger.reconcile(claim.key, occurred=True, external_id="corrected", result={"v": 2})
+
+    settled = ledger.get(claim.key)
+    assert settled is not None
+    assert settled.external_id == "corrected"
+    assert settled.result == {"v": 2}
+
+
+def test_reconciling_an_unknown_outcome_as_occurred_needs_no_prior_receipt(
+    ledger: ActionLedger,
+) -> None:
+    """The ordinary path: nothing was recorded, so there is nothing to keep."""
+    claim = ledger.claim("pay", {}, key="u:1")
+    ledger.fail(claim.key, "timeout after send", certain=False)
+
+    ledger.reconcile(claim.key, occurred=True, external_id="found-it")
+
+    settled = ledger.get(claim.key)
+    assert settled is not None
+    assert settled.status is ActionStatus.COMPLETED
+    assert settled.external_id == "found-it"

@@ -60,11 +60,15 @@ class AgentAdapter(ABC):
         *,
         volatile: Sequence[str] = (),
         scoped_to_run: bool = True,
+        dep_scope: str | None = None,
     ) -> Any:
         """Intercept and safely execute an external action via the ActionLedger.
 
         Prevents duplicate side effects by checking the ledger prior to invoking
         action_fn. Returns the cached result on duplicate attempts without re-executing.
+
+        ``dep_scope`` optionally tags the recorded ``Action`` with the dependency
+        it belongs to, for later localized-repair scoping.
         """
 
     @abstractmethod

@@ -12,18 +12,35 @@ The action-interception split
 -----------------------------
 
 ``continuum_intercept_action`` cannot execute the side effect itself: a Python
-callable does not cross the MCP boundary. So the protocol is two calls —
+callable does not cross the MCP boundary. So the protocol is two calls:
 
 1. ``continuum_intercept_action`` claims the action and answers *may I?*
 2. the caller performs the effect, then reports back with
    ``continuum_complete_action`` (or ``continuum_fail_action``)
 
 That split matters. Between the two calls the ledger holds a ``STARTED``
-record, so a crash in the gap is indistinguishable from a completed effect —
+record, so a crash in the gap is indistinguishable from a completed effect,
 which is exactly the state the ledger is designed to surface rather than
 paper over. A caller that never reports back leaves the action uncertain, and
 recovery will refuse to resume until it is reconciled. That is the intended
 behaviour, not a leak.
+
+The optional dependency
+-----------------------
+
+The ``mcp`` SDK is an optional extra, but ``pip install continuum-agent`` installs
+the ``continuum-mcp`` console script regardless. So the entry point exists in
+environments where its dependency does not, and importing the SDK at module
+scope makes that combination fail with a bare ``ModuleNotFoundError``.
+
+That failure is silent where it matters: the process dies before the
+``initialize`` handshake, so the client reports only that the server never
+became ready, and the traceback goes to a stderr log the operator is not
+looking at. The SDK is therefore imported inside ``build_server``, and the
+failure is translated by ``main`` into the one-line ``error:`` form the other
+cold-start failures already use. Keep it that way -- hoisting these imports
+back to module scope re-breaks the diagnosis, because no handler in ``main``
+can run if the module never finished importing.
 """
 
 from __future__ import annotations
@@ -35,22 +52,22 @@ import json
 import os
 import sqlite3
 import sys
-from collections.abc import Callable, Mapping
-from typing import Any
-
-from mcp.server import MCPServer
-from mcp.server.mcpserver.context import Context
-from mcp.types import ToolAnnotations
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from continuum.actions.ledger import ActionLedger
 from continuum.adapters.generic import GenericAgentAdapter
 from continuum.environment import StaticProvider, capture
-from continuum.events import EventType
+from continuum.events import Event, EventType
 from continuum.mcp.authz import (
+    CONFIRM_ENV_VAR,
     AuthorizationPolicy,
     AuthPolicy,
+    ConfirmPolicy,
     caller_name,
     load_auth,
+    load_confirm,
     load_policy,
     token_from,
 )
@@ -60,11 +77,17 @@ from continuum.models import (
     EnvResource,
     Origin,
     Run,
+    SemanticState,
     UnknownSideEffect,
 )
 from continuum.recovery.contract import render_contract
 from continuum.state.semantic import project
 from continuum.storage import RunNotFound, SQLiteStorage, Storage
+
+if TYPE_CHECKING:
+    # Type-only: the runtime import lives in build_server. See the module
+    # docstring's "The optional dependency" section.
+    from mcp.server import MCPServer
 
 __all__ = ["build_server", "ContinuumMCP", "MalformedRunLog", "DEFAULT_DB", "main"]
 
@@ -121,7 +144,7 @@ def _open_server_storage(database: str) -> SQLiteStorage:
 
     ``<db>-wal`` is not reconstructable. It holds transactions that were
     committed but not yet checkpointed into the main database, which for a
-    write-heavy run can be the entire history — deleting it turns durable work
+    write-heavy run can be the entire history; deleting it turns durable work
     into silent loss, and an emptied database still verifies as an intact chain.
     So it is moved aside rather than unlinked: the server comes up, and the
     committed data remains on disk for recovery instead of being destroyed. If
@@ -179,11 +202,205 @@ def _open_server_storage(database: str) -> SQLiteStorage:
     raise error
 
 
+@contextlib.contextmanager
+def _refusal_reaches_the_caller() -> Iterator[None]:
+    """Re-raise a deliberate refusal as ``ToolError`` so its reason survives.
+
+    Refusing a call is part of this server's contract, not a crash: an
+    unauthorized caller, a progress counter that violates its own arithmetic, a
+    run that does not exist, a log that never recorded RUN_STARTED. Each answer
+    is only useful if the caller is told which one it was.
+
+    The SDK draws that line by exception type. From mcp 2.1.0 a handler
+    exception it does not recognise becomes ``UnexpectedToolError`` whose message
+    is just ``"Error executing tool <name>"``, with the cause left on
+    ``__cause__``, while a ``ToolError`` keeps its text. Every refusal here is
+    raised as a domain exception (``PermissionError`` for authz, ``ValueError``
+    for validation, ``RunNotFound``, ``MalformedRunLog``), so under 2.1.0 the
+    caller was told nothing at all: not that it was a permissions problem, not
+    which counter was wrong, and not the CONTINUUM_MCP_MUTATING_CLIENTS setting
+    that fixes the first case. Converting here restores the guidance and states
+    the intent, that these outcomes are expected rather than faults.
+
+    Genuinely unexpected exceptions are deliberately not converted. Those should
+    keep surfacing as unexpected, because a bug in this server is not a message
+    to act on.
+
+    ``LedgerError`` belongs on the list even though it is a ``RuntimeError``
+    rather than one of the obvious refusal types. Every way the ledger raises it
+    is a deliberate answer: an identifier matching no action in either space, or
+    a settle call on an action whose status makes it a correction rather than a
+    settlement. Under mcp 2.0 its message happened to survive regardless, so the
+    omission was invisible locally; from 2.1.0 the caller was told only "Error
+    executing tool continuum_reconcile_action", which is the least useful possible
+    reply to being handed the wrong identifier (issue #367).
+    """
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from continuum.actions.ledger import LedgerError
+
+    try:
+        yield
+    except (PermissionError, ValueError, RunNotFound, MalformedRunLog, LedgerError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _project_candidate(
+    ctx: ContinuumMCP,
+    run_id: str,
+    event_type: EventType,
+    payload: Mapping[str, Any],
+) -> tuple[SemanticState, int]:
+    """Fold the log with ``payload`` appended, without committing it (issue #364).
+
+    The write path must reject exactly what the read path rejects, and the only
+    way to know what the read path will do is to run it. Validating a field in
+    isolation is not equivalent: a payload is legal or not *relative to the
+    state it lands on*, so a guard that inspects only the arguments is blind to
+    every invariant that spans events.
+
+    ``continuum_record_progress`` demonstrated the cost of getting this wrong.
+    It appended first and projected after, so a payload the fold refused was
+    already durable when the refusal arrived. Because the fold validates each
+    intermediate state, no later event could correct it, and every projecting
+    surface for that run stayed dead permanently: ``record_progress``,
+    ``checkpoint``, ``validate`` and ``resume`` over MCP, plus ``status``,
+    ``inspect``, ``replay``, ``show-contract`` and ``briefing`` over the CLI.
+    Meanwhile the action tools kept working, so the run could still authorise
+    real side effects while recovery was unable to say whether continuing was
+    safe. That inversion is what makes an unprojectable log worse than a
+    rejected call.
+
+    The candidate event is constructed in memory rather than written and rolled
+    back. There is no transaction spanning the append here, and a rollback that
+    fails would leave behind precisely the state this prevents.
+
+    Returns the projected state and the head sequence it was validated against.
+    The caller passes that sequence to ``append_event`` as ``expected_sequence``:
+    validation and append are two statements, so a second writer can advance the
+    run in between and two individually-legal payloads can compose into a log
+    neither of them would have been allowed to produce (for example ``total=50``
+    landing between the read and the write of a ``completed=75`` that omits
+    ``total``). One run has one owner by design, but the failure being guarded
+    here is unrecoverable, so it is worth not relying on that.
+    """
+    history = list(ctx.storage.read_events(run_id))
+    head = history[-1].sequence if history else 0
+    candidate = Event(
+        run_id=run_id,
+        sequence=head + 1,
+        type=event_type,
+        payload=dict(payload),
+        source=AGENT_SOURCE,
+    )
+    try:
+        return project(run_id, [*history, candidate]), head
+    except ValueError as exc:
+        # pydantic's ValidationError is a ValueError, so this covers both the
+        # model invariants and the projector's own checks. Re-raised with the
+        # payload named, because the bare pydantic message reports the folded
+        # figures without saying which call produced them.
+        raise ValueError(
+            f"{event_type.value} {dict(payload)} would leave run {run_id!r} unprojectable "
+            f"and was not recorded: {exc}"
+        ) from exc
+
+
+def _append_projectable(
+    ctx: ContinuumMCP,
+    run_id: str,
+    event_type: EventType,
+    payload: Mapping[str, Any],
+    *,
+    attempts: int = 3,
+) -> tuple[SemanticState, Event]:
+    """Commit ``payload`` only if the fold accepts it against the state it lands on.
+
+    Retries on ``ConcurrentWriteError`` rather than failing, because losing the
+    optimistic-concurrency race says nothing about whether the caller's update is
+    valid. Re-validation against the new head is the point: the update may still
+    be legal, and if the intervening write made it illegal that is exactly what
+    the next fold reports. Bounded, so a permanently busy run answers rather than
+    spinning.
+    """
+    from continuum.storage import ConcurrentWriteError
+
+    for remaining in range(attempts - 1, -1, -1):
+        state, expected = _project_candidate(ctx, run_id, event_type, payload)
+        try:
+            event = ctx.storage.append_event(
+                run_id,
+                event_type,
+                payload,
+                expected_sequence=expected,
+                source=AGENT_SOURCE,
+            )
+        except ConcurrentWriteError:
+            if remaining:
+                continue
+            raise ValueError(
+                f"run {run_id!r} is being written concurrently and this update lost the "
+                f"race {attempts} times; nothing was recorded. One run is meant to have "
+                f"one owner at a time, so check whether another agent holds this run."
+            ) from None
+        return state, event
+    raise AssertionError("unreachable: the loop either returns or raises")
+
+
+def _declare_model(
+    ctx: ContinuumMCP,
+    run_id: str,
+    model_id: str | None,
+    provider: str | None = None,
+) -> None:
+    """Record which model is driving this run, so drift becomes detectable (#370).
+
+    ``MODEL_CHANGED`` was defined, treated as checkpoint-worthy by the trigger
+    policy, and projected into ``SemanticState.model``, but nothing anywhere in
+    the codebase ever emitted it. So the validator's model component could only
+    ever answer "no model recorded for this run, cannot compare against ...", the
+    ``expected_model`` parameter on ``continuum_resume`` and ``continuum_validate``
+    could never do anything, and ``RepairKind.REVALIDATE_MODEL_STATE`` was
+    unreachable. A parameter that cannot be satisfied is worse than an absent one,
+    because its presence implies the check is covered.
+
+    That matters more than an ordinary dead branch: a different model resuming
+    another model's work is exactly the drift the surrounding architecture exists
+    to catch, and model-specific assumptions recorded by one model are not
+    automatically sound for another.
+
+    Attached to checkpointing rather than to progress because it is the same kind
+    of statement as ``env``: here is what the world looked like when this state was
+    saved. Recorded as ``EXTERNAL_AGENT``, since an agent naming its own model is
+    self-reporting, but the *comparison* against a later ``expected_model`` stays
+    independent of that claim, exactly as it does for declared dependencies.
+
+    Only appended when the value actually changes, so an agent checkpointing on a
+    schedule does not add an identical event each time. ``provider`` carries
+    forward when omitted, so naming the model alone cannot silently erase a
+    provider recorded earlier.
+    """
+    if not model_id:
+        return
+    current = project(run_id, ctx.storage.read_events(run_id)).model
+    recorded_model = current.model if current else None
+    recorded_provider = current.provider if current else None
+    settled_provider = provider if provider is not None else recorded_provider
+    if recorded_model == model_id and recorded_provider == settled_provider:
+        return
+    ctx.storage.append_event(
+        run_id,
+        EventType.MODEL_CHANGED,
+        {"model": model_id, "provider": settled_provider},
+        source=AGENT_SOURCE,
+    )
+
+
 def _environment(run_id: str, env: Mapping[str, str] | None) -> EnvironmentSnapshot | None:
     """Build a snapshot from a ``{name: version}`` mapping.
 
     Returns ``None`` when nothing was supplied. The validator treats that as
-    *unverified*, not *unchanged* — omitting the environment must never look
+    *unverified*, not *unchanged*: omitting the environment must never look
     like having checked it and found nothing wrong.
     """
     if not env:
@@ -200,7 +417,7 @@ def _declare_dependencies(ctx: ContinuumMCP, run_id: str, env: Mapping[str, str]
     Capturing a snapshot is not enough to make drift matter. The validator
     decides staleness per ``external_dependencies`` entry and returns early when
     a state has none, so a checkpoint carrying only a snapshot produces a
-    visible environment diff that invalidates nothing — the run reports
+    visible environment diff that invalidates nothing; the run reports
     ``safe_to_resume`` while the dataset underneath it has moved. Declaring each
     resource the agent pinned is what gives the diff something to invalidate,
     and what lets staleness propagate to the evidence resting on it.
@@ -209,7 +426,7 @@ def _declare_dependencies(ctx: ContinuumMCP, run_id: str, env: Mapping[str, str]
     the log is the durable record, so the declaration survives later projections
     and restores, is covered by the hash chain, and carries the same
     ``EXTERNAL_AGENT`` provenance as everything else this server writes. That
-    provenance does not weaken the check — unlike goal and progress, a
+    provenance does not weaken the check: unlike goal and progress, a
     dependency's status comes from comparing two snapshots rather than from
     trusting the claim, so the *comparison* stays independent of the agent that
     named the resource.
@@ -255,8 +472,8 @@ class ContinuumMCP:
 
         The run row and the ``RUN_STARTED`` event are separate facts: a row can
         exist without the event when the run was created directly through the
-        storage API. Projection needs the event — without it, folding the log
-        fails with "the log never recorded RUN_STARTED" — so it is backfilled
+        storage API. Projection needs the event; without it, folding the log
+        fails with "the log never recorded RUN_STARTED", so it is backfilled
         when the log is empty.
 
         ``RUN_STARTED`` must be the *first* event, and this checks for exactly
@@ -268,7 +485,7 @@ class ContinuumMCP:
         A non-empty log whose first event is not ``RUN_STARTED`` raises instead
         of backfilling. Appending it at that point would place the run's start
         *after* events that supposedly preceded it, and any state projected
-        from that log would be quietly wrong — a worse outcome than an error
+        from that log would be quietly wrong, a worse outcome than an error
         naming the problem.
         """
         try:
@@ -296,7 +513,7 @@ class ContinuumMCP:
         return run
 
     def ledger(self, run_id: str) -> ActionLedger:
-        return ActionLedger(self.storage, run_id)
+        return ActionLedger(self.storage, run_id, source=AGENT_SOURCE)
 
 
 def build_server(
@@ -305,6 +522,7 @@ def build_server(
     storage: Storage | None = None,
     policy: AuthorizationPolicy | None = None,
     auth: AuthPolicy | None = None,
+    confirm_auth: ConfirmPolicy | None = None,
 ) -> tuple[MCPServer, ContinuumMCP]:
     """Construct the MCP server and its backing context.
 
@@ -312,24 +530,69 @@ def build_server(
 
     ``policy`` decides which callers may use mutating tools. Omitted, it is
     resolved from the environment and then the project policy file, falling
-    back to denying every mutation — an unconfigured server is read-only.
+    back to denying every mutation: an unconfigured server is read-only.
 
     ``auth`` verifies a shared secret before any mutating tool runs. Omitted,
     it is resolved from ``CONTINUUM_MCP_TOKEN`` and is disabled when that is
     unset, leaving the default local, no-account behavior unchanged.
+
+    ``confirm_auth`` gates ``continuum_confirm`` specifically. Unlike the other
+    two, it fails closed when unconfigured (issue #201): an agent allowed to
+    record progress must not also be able to confirm that progress, which
+    would reinstate the self-certification exploit. Omitted, confirmation over
+    MCP refuses every caller; a human confirms with ``continuum confirm``, or
+    the operator sets ``CONTINUUM_MCP_CONFIRM_TOKEN`` to opt in.
+
+    Raises ``ModuleNotFoundError`` when the optional ``mcp`` extra is not
+    installed; ``main`` reports that as an actionable error rather than a
+    traceback.
     """
-    ctx = ContinuumMCP(database, storage=storage)
+    # Imported here rather than at module scope so a missing optional extra is
+    # reported by main() instead of killing the process during import, before
+    # any handler can run. Importing continuum.mcp.server therefore succeeds
+    # without the extra, which is what lets both entry points -- the
+    # continuum-mcp script and `python -m continuum.mcp` -- reach main() at all.
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.context import Context
+    from mcp.types import ToolAnnotations
+
+    # Configuration is resolved before storage is opened, because both loaders
+    # reject malformed input with ValueError (a bad policy file, a token entry
+    # without a colon). Opening first would strand that handle with no owner to
+    # close it, and would also leave an empty database behind for a server that
+    # never started. Nothing here depends on the store, so the order is free.
     policy = load_policy() if policy is None else policy
     auth = load_auth() if auth is None else auth
+    confirm_auth = load_confirm() if confirm_auth is None else confirm_auth
+    _reject_reused_confirmation_secret(auth, confirm_auth)
+    ctx = ContinuumMCP(database, storage=storage)
     server = MCPServer(
-        name="continuum",
+        name="continuum-mcp",
         title="CONTINUUM",
         instructions=(
             "Durable recovery for long-running work. Record progress as you go, "
             "checkpoint at meaningful milestones, and before resuming after any "
             "interruption call continuum_resume to find out whether it is safe to "
             "continue. Route every external side effect through "
-            "continuum_intercept_action so it is never performed twice."
+            "continuum_intercept_action so it is never performed twice.\n"
+            "\n"
+            "At the start of a session, call continuum_resume with no run_id. If it "
+            "returns a run, show its run_id, progress and goal, ask the user whether "
+            "to resume it or start something new, and wait for the answer. If it "
+            "returns no_active_run, just do what the user asked. The task is the "
+            "run's goal, which continuum_resume gives you, so never read or write a "
+            "side file to track it.\n"
+            "\n"
+            "mode=request_human on a run you created over MCP is expected and is not "
+            "a blocker. It means the goal and progress are self-reported and nothing "
+            "independent corroborates them. Recording progress, checkpointing and the "
+            "action tools all keep working. Do not call continuum_confirm to clear "
+            "it: that is refused over MCP by design, because an agent must not vouch "
+            "for its own claims. Only a human running 'continuum confirm <run_id>' "
+            "clears it. Until then, treat a recorded progress count as a claim to "
+            "sanity-check rather than a verified fact, and say so once instead of "
+            "stopping work. This matters most before skipping completed units: "
+            "confirm the work really happened rather than trusting the counter."
         ),
     )
 
@@ -345,7 +608,7 @@ def build_server(
         tool carries this.
 
         The check runs before the handler body, so a refused call writes
-        nothing — the denial precedes the side effect rather than following it.
+        nothing; the denial precedes the side effect rather than following it.
         """
 
         @functools.wraps(fn)
@@ -354,15 +617,54 @@ def build_server(
             # Authenticate before authorize: a caller proves the shared secret
             # first, then its declared name is checked against the allowlist.
             # Both must pass; either failure refuses the call before any write.
-            auth.verify(caller, token_from(ctx))
-            policy.require(caller, fn.__name__)
-            return fn(*args, **kwargs)
+            with _refusal_reaches_the_caller():
+                auth.verify(caller, token_from(ctx))
+                policy.require(caller, fn.__name__)
+                return fn(*args, **kwargs)
 
         # The SDK locates the context parameter via get_type_hints(), and
-        # functools.wraps copies the *wrapped* function's annotations — which
+        # functools.wraps copies the *wrapped* function's annotations, which
         # have no `ctx`. Re-advertise it in both the annotations and the
         # signature, or the guard is never handed a context and every caller
         # looks unidentified.
+        original = inspect.signature(fn)
+        wrapper.__annotations__ = {**fn.__annotations__, "ctx": Context}
+        wrapper.__signature__ = original.replace(  # type: ignore[attr-defined]
+            parameters=[
+                *original.parameters.values(),
+                inspect.Parameter(
+                    "ctx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
+                ),
+            ]
+        )
+        return wrapper
+
+    def confirm_gate(fn: Callable[..., str]) -> Callable[..., str]:
+        """Authorize and authenticate ``continuum_confirm`` on its own terms.
+
+        This replaces ``guard`` rather than stacking onto it (issue #201). The
+        handshake carries a single ``_meta.authToken``, so a stacked check
+        would demand two different secrets through one slot. Confirmation gets
+        its own credential instead: the caller must be on the mutation
+        allowlist *and* present the dedicated confirm secret. Without that
+        secret configured the tool refuses everyone, because an agent allowed
+        to record progress must not silently be able to confirm it too.
+        """
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, ctx: Context | None = None, **kwargs: Any) -> str:
+            caller = caller_name(ctx)
+            # Authenticate before authorizing (CodeRabbit review, PR #206):
+            # a caller that cannot present the confirmation secret must not
+            # be able to probe the allowlist, or receive its contents in the
+            # refusal, by sending requests without a token.
+            with _refusal_reaches_the_caller():
+                confirm_auth.verify(token_from(ctx))
+                policy.require(caller, fn.__name__)
+                return fn(*args, **kwargs)
+
+        # Same fix-up as ``guard``: re-advertise the context parameter or the
+        # SDK never hands us one and every caller looks tokenless.
         original = inspect.signature(fn)
         wrapper.__annotations__ = {**fn.__annotations__, "ctx": Context}
         wrapper.__signature__ = original.replace(  # type: ignore[attr-defined]
@@ -382,7 +684,7 @@ def build_server(
         description=(
             "Record how far through a task you are. Call this as you complete units "
             "of work so progress survives a crash. Creates the run on first call if "
-            "'goal' is given. Cheap — call it often."
+            "'goal' is given. Cheap: call it often."
         ),
         annotations=mutating,
     )
@@ -395,23 +697,32 @@ def build_server(
         failed: int = 0,
     ) -> str:
         """Record progress for a run."""
+        # Reject impossible counters before anything is written, including the
+        # run itself: a rejected call must not leave behind a runs row and a
+        # RUN_STARTED event (issue #203).
+        #
+        # These two checks are kept even though `_project_candidate` below would
+        # catch the same states, because they can answer without touching
+        # storage and they name the offending argument rather than the folded
+        # figures. They are not sufficient on their own: `total` is only known
+        # here when the caller passes it, and a call that omits it is still
+        # bounded by the `total` already on record (issue #364).
+        if completed < 0 or failed < 0:
+            raise ValueError("progress counters must be non-negative")
+        if total is not None and completed + failed > total:
+            raise ValueError(f"completed ({completed}) + failed ({failed}) exceeds total ({total})")
         ctx.ensure_run(run_id, goal)
         payload: dict[str, Any] = {"completed": completed, "failed": failed}
         if total is not None:
             payload["total"] = total
             payload["pending"] = max(total - completed - failed, 0)
-        # Reject impossible counters before anything is written. An over-total
-        # update passes `verify_events` but fails to project, so a run whose log
-        # is intact yet unprojectable would be poisoned permanently. The
-        # `Progress` model enforces this at projection time; checking here keeps
-        # the bad value out of the event log in the first place.
-        if completed < 0 or failed < 0:
-            raise ValueError("progress counters must be non-negative")
-        if total is not None and completed + failed > total:
-            raise ValueError(f"completed ({completed}) + failed ({failed}) exceeds total ({total})")
-        ctx.storage.append_event(run_id, EventType.TASK_UPDATED, payload, source=AGENT_SOURCE)
 
-        state = project(run_id, ctx.storage.read_events(run_id))
+        # Fold with this payload appended before committing it, and commit under
+        # optimistic concurrency so the validated state is the one it lands on.
+        # Appending first and projecting after leaves a rejected event
+        # permanently in the log, which no later event can correct (issue #364).
+        state, event = _append_projectable(ctx, run_id, EventType.TASK_UPDATED, payload)
+
         return _json(
             {
                 "run_id": run_id,
@@ -419,7 +730,10 @@ def build_server(
                 "pending": state.progress.pending,
                 "failed": state.progress.failed,
                 "total": state.progress.total,
-                "source_sequence": state.source_sequence,
+                # From the committed event rather than the candidate: the two
+                # agree because the append is guarded by expected_sequence, and
+                # reporting the real sequence keeps the answer honest regardless.
+                "source_sequence": event.sequence,
             }
         )
 
@@ -431,7 +745,10 @@ def build_server(
             "Save a durable checkpoint of the current task state. Worth doing at "
             "milestones, before risky or irreversible steps, and before a long gap. "
             "Recovery replays from the newest checkpoint, so checkpointing bounds "
-            "how much work a crash can cost."
+            "how much work a crash can cost.\n\n"
+            "Pass 'model_id' with your own model identifier. It is what later lets "
+            "continuum_resume answer whether the model resuming this work is the one "
+            "that produced it; without it that check can only report 'unknown'."
         ),
         annotations=mutating,
     )
@@ -440,10 +757,13 @@ def build_server(
         run_id: str,
         reason: str = "",
         env: dict[str, str] | None = None,
+        model_id: str | None = None,
+        provider: str | None = None,
     ) -> str:
         """Create a semantic checkpoint."""
         ctx.ensure_run(run_id)
         _declare_dependencies(ctx, run_id, env)
+        _declare_model(ctx, run_id, model_id, provider)
         state = project(run_id, ctx.storage.read_events(run_id))
         checkpoint = ctx.adapter.capture_state(
             run_id,
@@ -458,8 +778,156 @@ def build_server(
                 "version": checkpoint.version,
                 "trigger": checkpoint.trigger,
                 "integrity_hash": checkpoint.integrity_hash,
+                "model": state.model.model if state.model else None,
                 "completed": checkpoint.state.progress.completed,
                 "source_sequence": checkpoint.state.source_sequence,
+            }
+        )
+
+    # -- reasoning summaries ---------------------------------------------- #
+
+    @server.tool(
+        name="continuum_record_summary",
+        description=(
+            "Record a compact summary of WHERE your reasoning is, so a fresh "
+            "session after any interruption inherits your plan instead of "
+            "guessing. Call at natural checkpoints and before ending a turn. "
+            "Schema: {plan_stack: [current step first], decisions: [{what, why}], "
+            "open_questions: [...], working_set: [files/ids in play]}. Hard cap "
+            "4096 characters serialized - summarise, never dump transcripts."
+        ),
+        annotations=mutating,
+    )
+    @guard
+    def continuum_record_summary(
+        run_id: str,
+        plan_stack: list[str] | None = None,
+        decisions: list[dict[str, str]] | None = None,
+        open_questions: list[str] | None = None,
+        working_set: list[str] | None = None,
+        note: str = "",
+        pinning: dict[str, Any] | None = None,
+    ) -> str:
+        """Store one bounded reasoning summary (issue #235)."""
+        from continuum.pinning import normalize_pinning
+
+        pinning_clean = normalize_pinning(pinning)
+        summary = {
+            "plan_stack": plan_stack or [],
+            "decisions": decisions or [],
+            "open_questions": open_questions or [],
+            "working_set": working_set or [],
+            "note": note,
+        }
+        serialized = json.dumps(summary, ensure_ascii=False)
+        if len(serialized) > 4096:
+            from mcp.server.mcpserver.exceptions import ToolError
+
+            raise ToolError(
+                f"reasoning summary is {len(serialized)} chars; cap is 4096. "
+                "Summarise harder: fewer, shorter entries."
+            )
+        ctx.ensure_run(run_id)
+        payload: dict[str, Any] = {"summary": summary}
+        if pinning_clean:
+            payload["pinning"] = pinning_clean
+        from continuum.provenance_map import provenance_for_run
+
+        derived = provenance_for_run(ctx.storage, run_id)
+        from continuum.provenance_map import clamp_derived_origin
+
+        stamped = clamp_derived_origin(derived, Origin.EXTERNAL_AGENT, None)
+        payload["derived_origin"] = stamped.value
+        event = ctx.storage.append_event(
+            run_id,
+            EventType.REASONING_SUMMARY,
+            payload,
+            source=Origin.EXTERNAL_AGENT,
+        )
+        return _json(
+            {
+                "run_id": run_id,
+                "sequence": event.sequence,
+                "recorded": True,
+                "bytes": len(serialized),
+            }
+        )
+
+    @server.tool(
+        name="continuum_record_plan",
+        description=(
+            "Record a structured plan milestone update. Call as you define or complete units "
+            "so the run can resume with exact remaining work. One call per unit status change. "
+            "Payload is {plan_id, units: [{id, title, status, depends_on}]} where status is "
+            "pending, working, done, or blocked. Creates the run if needed. Mutating."
+        ),
+        annotations=mutating,
+    )
+    @guard
+    def continuum_record_plan(
+        run_id: str,
+        plan_id: str,
+        units: list[dict[str, Any]],
+    ) -> str:
+        """Record a plan upsert (issue #312)."""
+        if not isinstance(plan_id, str) or not plan_id.strip():
+            raise ValueError("plan_id must be a non-empty string")
+        if not isinstance(units, list) or not units:
+            raise ValueError("units must be a non-empty list")
+        seen: set[str] = set()
+        sorted_units: list[dict[str, Any]] = []
+        for raw in units:
+            if not isinstance(raw, dict):
+                raise ValueError("each unit must be an object")
+            unit_id = raw.get("id")
+            if not isinstance(unit_id, str) or not unit_id.strip():
+                raise ValueError("unit id must be non-empty")
+            if unit_id in seen:
+                raise ValueError(f"duplicate unit id {unit_id!r}")
+            seen.add(unit_id)
+            title = raw.get("title")
+            if not isinstance(title, str):
+                raise ValueError(f"unit {unit_id!r} title must be a string")
+            status = raw.get("status", "pending")
+            if status not in ("pending", "working", "done", "blocked"):
+                raise ValueError(
+                    f"unit {unit_id!r} status must be pending, working, done, or blocked"
+                )
+            depends = raw.get("depends_on", [])
+            if not isinstance(depends, list):
+                raise ValueError(f"unit {unit_id!r} depends_on must be a list")
+            for d in depends:
+                if not isinstance(d, str) or not d.strip():
+                    raise ValueError(
+                        f"unit {unit_id!r} depends_on entries must be non-empty strings"
+                    )
+            sorted_units.append(
+                {
+                    "id": unit_id,
+                    "title": title,
+                    "status": status,
+                    "depends_on": [str(d) for d in depends],
+                }
+            )
+        sorted_units.sort(key=lambda u: u["id"])
+        ctx.ensure_run(run_id)
+        payload = {"plan_id": plan_id, "units": sorted_units}
+        state, event = _append_projectable(ctx, run_id, EventType.PLAN_UPSERT, payload)
+        return _json(
+            {
+                "run_id": run_id,
+                "plan_id": plan_id,
+                "units": len(sorted_units),
+                "sequence": event.sequence,
+                "plan": [
+                    {
+                        "id": p.step_id,
+                        "title": p.description,
+                        "status": p.status.value,
+                        "depends_on": p.depends_on,
+                    }
+                    for p in state.plan
+                ],
             }
         )
 
@@ -470,7 +938,7 @@ def build_server(
         description=(
             "Check whether saved state is still trustworthy, without changing "
             "anything. Pass 'env' as {resource: version} to declare what the world "
-            "looks like now — a dependency that moved since the checkpoint "
+            "looks like now; a dependency that moved since the checkpoint "
             "invalidates the findings built on it. Read-only: safe to call anytime."
         ),
         annotations=read_only,
@@ -487,6 +955,20 @@ def build_server(
             expected_model=expected_model,
         )
         report = decision.validation.report
+        try:
+            from continuum.checkpoint.context import build_recovery_context
+            from continuum.state.semantic import constraint_pins_payload
+
+            ctx_rendered = build_recovery_context(decision.state).render()
+            constraint_pins = constraint_pins_payload(decision.state, ctx_rendered)
+        except Exception:
+            constraint_pins = {"pins": {}, "flagged": [], "grace_seconds": None}
+        try:
+            from continuum.recovery.health import advisory_for_storage
+
+            liveness = advisory_for_storage(ctx.storage, run_id)
+        except Exception:
+            liveness = {"breached": False, "silence_seconds": None}
         return _json(
             {
                 "run_id": run_id,
@@ -504,6 +986,8 @@ def build_server(
                     for e in report.statuses
                 ],
                 "environment_changes": [d.render() for d in decision.environment_diff.breaking],
+                "constraint_pins": constraint_pins,
+                "liveness": liveness,
             }
         )
 
@@ -551,6 +1035,44 @@ def build_server(
         # any external task file. The run's goal is the single source of truth
         # for "what was this task?" across interruptions.
         goal = ctx.storage.get_run(run_id).goal
+        tail_evidence = decision.tail_evidence
+        # Executable next steps (issue: actionable guidance). Derived from
+        # the plan plus whatever automation this project has registered, so
+        # the resuming agent never translates statuses into commands itself.
+        from continuum.gate import DEFAULT_GATE_CONFIG_PATH
+        from continuum.reconcilers import DEFAULT_RECONCILERS_PATH, load_reconcilers
+        from continuum.recovery.guidance import human_steps_for, self_report_guidance
+
+        try:
+            probed = list(load_reconcilers(Path(DEFAULT_RECONCILERS_PATH)))
+        except Exception:
+            probed = []
+        human_steps = human_steps_for(
+            decision,
+            run_id=run_id,
+            probed_types=probed,
+            gate_configured=Path(DEFAULT_GATE_CONFIG_PATH).exists(),
+        )
+        # `next_allowed_action` and the plan name actions by `action_id`, which
+        # the settle tools accept only since #367. Carry the ledger key too, so a
+        # caller never has to guess which identifier space it is holding.
+        uncertain_keys = {
+            action.action_id: key for key, action in ctx.ledger(run_id).folded().items()
+        }
+        try:
+            from continuum.checkpoint.context import build_recovery_context
+            from continuum.state.semantic import constraint_pins_payload
+
+            ctx_rendered = build_recovery_context(decision.state).render()
+            constraint_pins = constraint_pins_payload(decision.state, ctx_rendered)
+        except Exception:
+            constraint_pins = {"pins": {}, "flagged": [], "grace_seconds": None}
+        try:
+            from continuum.recovery.health import advisory_for_storage
+
+            liveness = advisory_for_storage(ctx.storage, run_id)
+        except Exception:
+            liveness = {"breached": False, "silence_seconds": None}
         return _json(
             {
                 "run_id": run_id,
@@ -558,6 +1080,7 @@ def build_server(
                 "mode": decision.mode.value,
                 "safe": decision.safe,
                 "next_allowed_action": decision.next_allowed_action,
+                "human_steps": human_steps,
                 "rationale": list(decision.rationale),
                 "repairs": [
                     {
@@ -572,6 +1095,7 @@ def build_server(
                 "uncertain_actions": [
                     {
                         "action_id": a.action_id,
+                        "action_key": uncertain_keys.get(a.action_id),
                         "action_type": a.action_type,
                         "status": a.status.value,
                     }
@@ -583,9 +1107,17 @@ def build_server(
                     "failed": decision.state.progress.failed,
                     "total": decision.state.progress.total,
                 },
+                "tail_evidence": tail_evidence,
+                "liveness": liveness,
+                "informed_retry": decision.informed_retry,
+                "attempt_lessons": [
+                    lesson.model_dump(mode="json") for lesson in decision.state.attempt_lessons
+                ],
                 "contract": decision.contract.model_dump(mode="json"),
                 "contract_text": render_contract(decision.contract),
                 "report": decision.render(),
+                **self_report_guidance(decision),
+                "constraint_pins": constraint_pins,
             }
         )
 
@@ -594,22 +1126,50 @@ def build_server(
         description=(
             "Confirm a run's self-reported goal and progress so it can resume. "
             "MCP/agent-reported runs are self_certified and would otherwise be "
-            "stuck at request_human forever. Call this (as the human operator) to "
-            "record a REVIEW_CONFIRMED event, then call continuum_resume again. "
-            "Mutates the run."
+            "stuck at request_human forever. REFUSED unless the server operator "
+            "set CONTINUUM_MCP_CONFIRM_TOKEN and you present that secret in the "
+            "handshake _meta.authToken: an agent must not confirm its own "
+            "self-reported state. The normal path is for a human to run "
+            "'continuum confirm <run_id>' on the host. "
+            'Pass scope=["goal"] or ["progress"] to confirm only that '
+            "component, leaving any other uncertainty intact (issue #394). "
+            "Omit scope for a full confirm of both. Mutates the run."
         ),
         annotations=mutating,
     )
-    @guard
+    @confirm_gate
     def continuum_confirm(
         run_id: str,
         expected_model: str | None = None,
+        scope: list[str] | str | None = None,
     ) -> str:
         """Record a human confirmation of self-reported state."""
+        # Scope handling (issue #394): normalize to a list of lowercased
+        # component names; None or empty means full confirm of both.
+        if scope is None:
+            components = ["goal", "progress"]
+        elif isinstance(scope, str):
+            components = [scope.strip().lower()] if scope.strip() else ["goal", "progress"]
+        elif isinstance(scope, (list, tuple, set)):
+            normalized: list[str] = []
+            for _c in scope:
+                if isinstance(_c, str) and _c.strip():
+                    normalized.append(_c.strip().lower())
+                elif _c is not None:
+                    normalized.append(str(_c).strip().lower())
+            components = normalized if normalized else ["goal", "progress"]
+        else:
+            components = ["goal", "progress"]
+        allowed = {"goal", "progress"}
+        for _c in components:
+            if _c not in allowed:
+                from mcp.server.mcpserver.exceptions import ToolError
+
+                raise ToolError(f"scope must be one of {sorted(allowed)}; got {components!r}")
         ctx.storage.append_event(
             run_id,
             EventType.REVIEW_CONFIRMED,
-            {"components": ["goal", "progress"]},
+            {"components": components},
             source=Origin.HUMAN,
         )
         decision = ctx.adapter.resume(
@@ -634,7 +1194,7 @@ def build_server(
             "Ask permission before performing an external side effect (creating an "
             "issue, sending a message, charging a card). Returns proceed=true if you "
             "should do it, or proceed=false with the previous result if it was "
-            "already done — do NOT repeat it in that case. If a previous attempt was "
+            "already done; do NOT repeat it in that case. If a previous attempt was "
             "interrupted, returns proceed=false with status='unknown': the effect may "
             "or may or may not have happened, so stop and ask a human. After performing the "
             "action, always call continuum_complete_action.\n\n"
@@ -654,14 +1214,129 @@ def build_server(
         arguments: dict[str, Any] | None = None,
         key: str | None = None,
         scoped_to_run: bool = True,
+        pinning: dict[str, Any] | None = None,
+        grant: dict[str, Any] | None = None,
     ) -> str:
         """Claim an action in the ledger and report whether to proceed."""
+        from continuum.actions.grants import GrantDenied, normalize_grant
+        from continuum.actions.idempotency import idempotency_key
+        from continuum.actions.ledger import LedgerError
+        from continuum.pinning import normalize_pinning
+
+        pinning_clean = normalize_pinning(pinning)
         ctx.ensure_run(run_id)
-        ledger = ctx.ledger(run_id)
+
+        # Run-level retry budget (issue #240): every claim slot counts as one
+        # attempt, so a model re-planning after failures hits the wall here
+        # instead of hammering the upstream.
+        from pathlib import Path as _Path
+
+        from continuum.budgets import (
+            DEFAULT_BUDGETS_PATH,
+            BudgetConfigError,
+            attempts_by_key,
+            evaluate_budget,
+        )
+
         try:
-            outcome = ledger.claim(
-                action_type, arguments=arguments, key=key, scoped_to_run=scoped_to_run
+            from continuum.budgets import load_budgets as _lb
+
+            budgets = _lb(_Path(DEFAULT_BUDGETS_PATH))
+        except BudgetConfigError as exc:
+            return _json(
+                {
+                    "run_id": run_id,
+                    "action_type": action_type,
+                    "proceed": False,
+                    "reason": f"retry budget registry invalid: {exc}",
+                }
             )
+
+        ledger = ctx.ledger(run_id)
+
+        # The budget may only gate a claim that would open a *new* attempt
+        # slot. Re-claiming an action that already reached a terminal-or-frozen
+        # state is not an attempt: a COMPLETED record returns the stored result
+        # (the whole point of idempotency), and an UNKNOWN one raises
+        # UnknownSideEffect asking for reconciliation. Gating either would make
+        # an exhausted budget suppress the dedup and reconciliation paths a
+        # recovering agent depends on, turning a safety limit into the cause of
+        # a duplicate side effect (issue #309).
+        existing = ledger.get(
+            idempotency_key(
+                action_type,
+                arguments,
+                scope=run_id if scoped_to_run else None,
+                key=key,
+            )
+        )
+        settled = existing is not None and existing.status in (
+            ActionStatus.COMPLETED,
+            ActionStatus.UNKNOWN,
+        )
+
+        if not settled:
+            # Archive-aware (issue #734): attempts live in the event log, and
+            # compaction moves failed attempts into the archive. Counting only
+            # the live tail reset an exhausted budget after every compaction.
+            events = ctx.storage.read_all_events(run_id)
+            # Counted per key, so the budget caps retries of *this* operation
+            # rather than the run's distinct work of this type (issue #368).
+            claim_key = str(
+                idempotency_key(
+                    action_type,
+                    arguments,
+                    scope=run_id if scoped_to_run else None,
+                    key=key,
+                )
+            )
+            attempts = attempts_by_key(events, action_type).get(claim_key, 0)
+            allowed, used, maximum = evaluate_budget(budgets, action_type, attempts)
+            if not allowed:
+                from mcp.server.mcpserver.exceptions import ToolError
+
+                # The old wording advised reconciling, which is no help when every
+                # prior attempt is already settled FAILED, and pointed at a
+                # registry file that usually does not exist yet (issue #368).
+                raise ToolError(
+                    f"retry budget exhausted for this {action_type!r} operation "
+                    f"(key {claim_key[:12]}...): {used} attempt(s) recorded, budget is "
+                    f"{maximum}. Retrying it again is the thing the budget exists to "
+                    f"stop, so either settle it a different way or raise the limit by "
+                    f"setting action_types.{action_type}.max_attempts in "
+                    f"{DEFAULT_BUDGETS_PATH} (creating that file if it does not exist)."
+                )
+
+        try:
+            grant_clean = normalize_grant(grant)
+            outcome = ledger.claim(
+                action_type,
+                arguments=arguments,
+                key=key,
+                scoped_to_run=scoped_to_run,
+                pinning=pinning_clean or None,
+                grant=grant_clean,
+            )
+        except GrantDenied as exc:
+            return _json(
+                {
+                    "run_id": run_id,
+                    "action_type": action_type,
+                    "proceed": False,
+                    "reason_code": "grant_denied",
+                    "grant_id": exc.grant_id,
+                    "reason": str(exc),
+                    "guidance": (
+                        "This single-use authority was already consumed (recorded "
+                        "in the ledger); it does not come back after a restore. "
+                        "Ask the operator for a fresh grant."
+                    ),
+                }
+            )
+        except LedgerError as exc:
+            from mcp.server.mcpserver.exceptions import ToolError
+
+            raise ToolError(str(exc)) from exc
         except UnknownSideEffect as exc:
             return _json(
                 {
@@ -669,12 +1344,18 @@ def build_server(
                     "action_type": action_type,
                     "proceed": False,
                     "status": ActionStatus.UNKNOWN.value,
+                    # Both identifiers, because reconciling needs one and every
+                    # other surface reports the other. Omitting them left the
+                    # only copy of the key inside the truncated prefix in
+                    # `reason`, which no caller could act on (issue #367).
+                    "action_key": exc.action_key,
+                    "action_id": exc.action_id,
                     "reason": str(exc),
                     "guidance": (
                         "A previous attempt was interrupted and its outcome is "
                         "unknown. Do not retry. Verify with the external system "
                         "whether it happened, then report via "
-                        "continuum_reconcile_action."
+                        "continuum_reconcile_action with the action_key above."
                     ),
                 }
             )
@@ -713,7 +1394,10 @@ def build_server(
             "Report that an intercepted action succeeded. Call this immediately "
             "after performing the side effect, using the action_key returned by "
             "continuum_intercept_action. Skipping it leaves the action uncertain "
-            "and blocks recovery."
+            "and blocks recovery. You may also pass consumed_inputs naming the "
+            "checkpoint and prior outputs this effect was computed from "
+            "(checkpoint_seq, event_positions, component_ids, action_ids); it is "
+            "recorded for restore-point admissibility and defaults to none."
         ),
         annotations=mutating,
     )
@@ -723,9 +1407,12 @@ def build_server(
         action_key: str,
         external_id: str | None = None,
         result: dict[str, Any] | None = None,
+        consumed_inputs: dict[str, Any] | None = None,
     ) -> str:
         """Mark a claimed action as completed."""
-        action = ctx.ledger(run_id).complete(action_key, external_id=external_id, result=result)
+        action = ctx.ledger(run_id).complete(
+            action_key, external_id=external_id, result=result, consumed_inputs=consumed_inputs
+        )
         return _json(
             {
                 "run_id": run_id,
@@ -741,7 +1428,7 @@ def build_server(
         description=(
             "Report that an intercepted action failed. Set certain=true only if you "
             "know nothing happened (e.g. the request was rejected before it was "
-            "sent). For timeouts or dropped connections leave certain=false — the "
+            "sent). For timeouts or dropped connections leave certain=false: the "
             "effect may still have landed, and treating it as failed could cause a "
             "duplicate."
         ),
@@ -771,7 +1458,10 @@ def build_server(
             "Settle an action whose outcome was unknown, after checking the external "
             "system. occurred=true records it as done (never repeated); "
             "occurred=false frees it to be retried. Only call this with real "
-            "evidence — guessing here causes either a duplicate or lost work."
+            "evidence; guessing here causes either a duplicate or lost work.\n\n"
+            "'action_key' accepts either the action_key from continuum_intercept_action "
+            "or the action_id that continuum_resume and continuum_list_actions report, "
+            "so the identifier named in next_allowed_action can be passed as-is."
         ),
         annotations=mutating,
     )
@@ -781,11 +1471,23 @@ def build_server(
         action_key: str,
         occurred: bool,
         external_id: str | None = None,
+        result: dict[str, Any] | None = None,
         note: str = "",
+        consumed_inputs: dict[str, Any] | None = None,
     ) -> str:
         """Resolve an uncertain action using external evidence."""
+        # `result` is accepted here because `complete` refuses an UNKNOWN action
+        # (issue #366) and this is the route it points at. Without it, structured
+        # evidence gathered by the probe had nowhere to go over MCP even though
+        # `ActionLedger.reconcile` has always stored it. `consumed_inputs` rides
+        # the same route for the same reason (issue #558).
         action = ctx.ledger(run_id).reconcile(
-            action_key, occurred=occurred, external_id=external_id, note=note
+            action_key,
+            occurred=occurred,
+            external_id=external_id,
+            result=result,
+            note=note,
+            consumed_inputs=consumed_inputs,
         )
         return _json(
             {
@@ -793,6 +1495,7 @@ def build_server(
                 "action_id": action.action_id,
                 "status": action.status.value,
                 "external_id": action.external_id,
+                "result": dict(action.result) if action.result else None,
                 "side_effect_uncertain": action.side_effect_uncertain,
             }
         )
@@ -814,7 +1517,11 @@ def build_server(
         # a genuinely unknown run without writing anything.
         ctx.storage.get_run(run_id)
         ledger = ctx.ledger(run_id)
-        actions = ledger.all()
+        folded = ledger.folded()
+        actions = list(folded.values())
+        # The settle tools key on the idempotency key, so a row that omits it
+        # cannot be acted on from this listing alone (issue #367).
+        key_by_action_id = {action.action_id: key for key, action in folded.items()}
         unresolved = {a.action_id for a in ledger.pending()}
         return _json(
             {
@@ -822,6 +1529,7 @@ def build_server(
                 "actions": [
                     {
                         "action_id": a.action_id,
+                        "action_key": key_by_action_id.get(a.action_id),
                         "action_type": a.action_type,
                         "status": a.status.value,
                         "external_id": a.external_id,
@@ -830,7 +1538,7 @@ def build_server(
                         # been *escalated* to UNKNOWN. An action still STARTED
                         # because the process died mid-flight has not been
                         # escalated yet, so the flag reads false while the
-                        # outcome is in fact unresolved — which is what a
+                        # outcome is in fact unresolved, which is what a
                         # recovering caller needs to see per row, not just in
                         # the aggregate count.
                         "outcome_unresolved": a.action_id in unresolved,
@@ -841,11 +1549,43 @@ def build_server(
             }
         )
 
+    if os.environ.get("CONTINUUM_MCP_SLIM") == "1":
+        keep = {"continuum_resume", "continuum_validate", "continuum_list_actions"}
+        for name in list(server._tool_manager._tools.keys()):
+            if name not in keep:
+                del server._tool_manager._tools[name]
+
     return server, ctx
 
 
 def _json(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
+
+
+def _reject_reused_confirmation_secret(auth: AuthPolicy, confirm_auth: ConfirmPolicy) -> None:
+    """Refuse a configuration where one secret unlocks both progress and confirmation.
+
+    The confirmation gate exists so that a caller trusted to record progress is
+    not automatically trusted to certify it (issue #201). If the operator sets
+    ``CONTINUUM_MCP_CONFIRM_TOKEN`` to the same value as the session secret, or
+    to any per-client token, every holder of a mutating credential becomes a
+    holder of the confirmation credential and the gate protects nothing. That
+    is a configuration mistake, not a decision, so it fails fast at startup.
+    """
+    if confirm_auth.disabled or auth.disabled:
+        return
+    expected = confirm_auth.expected
+    assert expected is not None  # disabled is checked above
+    overlaps = [name for name, secret in (auth.tokens or {}).items() if secret == expected]
+    if auth.expected == expected:
+        overlaps.append("<shared session secret>")
+    if overlaps:
+        raise ValueError(
+            f"{CONFIRM_ENV_VAR} must be distinct from every mutating credential; "
+            f"it matches: {', '.join(overlaps)}. Reusing one secret would let an "
+            f"agent that records progress also confirm it, which is what the "
+            f"confirmation gate exists to prevent."
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -869,7 +1609,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    server, ctx = build_server(args.db)
+    try:
+        server, ctx = build_server(args.db)
+    except ModuleNotFoundError as exc:
+        # The console script ships with the base package but the SDK it needs
+        # does not, so "installed but unimportable" is a normal state to land
+        # in rather than a broken build. Narrowed to the SDK itself: a missing
+        # transitive dependency of some other package is a different fault and
+        # must keep its traceback instead of being blamed on the extra.
+        if exc.name != "mcp" and not (exc.name or "").startswith("mcp."):
+            raise
+        print(
+            f"error: the MCP server needs the optional 'mcp' dependency, which is "
+            f"not importable ({exc}). Install it with: pip install continuum-agent[mcp]",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as exc:
+        # A malformed policy file or token list is an operator mistake, so it is
+        # reported the way the CLI reports the same class of failure (see
+        # cli/main.py): a traceback would bury the useful part. It matters more
+        # here than there, because a stdio server writes its traceback into the
+        # protocol pipe, where the client surfaces it only as "not ready" with
+        # no indication of what to fix.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        # resolve_database, not args.db, so the reported path is the one that
+        # was actually opened rather than None when --db was omitted.
+        #
+        # Quoted with literal delimiters rather than !r (issue #94), matching
+        # cli/main.py: repr() escapes each backslash, so a Windows path came
+        # back doubled and could not be copied into a shell or a config file.
+        print(
+            f"error: cannot open storage at '{resolve_database(args.db)}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         server.run(transport=args.transport)
     finally:

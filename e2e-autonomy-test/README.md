@@ -1,7 +1,7 @@
 # CONTINUUM autonomous end-to-end test (issue #6)
 
 This kit answers the one question the unit tests cannot: **will a real, unscripted
-LLM agent use CONTINUUM correctly on its own** — checkpoint as it goes, route side
+LLM agent use CONTINUUM correctly on its own**, checkpoint as it goes, route side
 effects through the ledger, call `resume` before acting after a crash, and refuse
 to repeat work that was already done?
 
@@ -146,7 +146,7 @@ times**, ideally with a reworded task, before trusting it. LLMs are stochastic.
 ## Why B/C/D matter: the shortcut problem
 
 Because the "sent" state is visible on disk, a clever agent can dodge duplicates by
-just `ls`-ing `/tmp/e2e-outbox/` and never touching CONTINUUM — and still pass
+just `ls`-ing `/tmp/e2e-outbox/` and never touching CONTINUUM, and still pass
 check A. Checks B/C/D reveal whether the *tooling* did the work or the agent worked
 around it. If the ledger is empty but the files are right, that is a **FAIL for the
 autonomy claim**, not a pass.
@@ -161,7 +161,7 @@ the file-write in PROMPT 1 with a POST the agent cannot list back:
    (or any endpoint only YOU can inspect).
 2. In PROMPT 1, define the side effect as: `curl -s -X POST
    http://127.0.0.1:8899/send/<INVOICE_ID>` and tell the agent it has **no way to
-   list what was already sent** — it must rely on its durable tooling to know.
+   list what was already sent**, it must rely on its durable tooling to know.
 3. After the crash + resume, grep `/tmp/e2e-sink.log` yourself: each `INV-00x` must
    appear exactly once. A duplicate POST proves the agent guessed instead of
    consulting the ledger.

@@ -21,6 +21,7 @@ from continuum.serve import (
     list_methods,
     serve_subprocess,
 )
+from continuum.serve.server import MUTATING
 
 
 def make_server() -> SidecarServer:
@@ -67,6 +68,114 @@ def test_checkpoint_and_resume_round_trip() -> None:
     # what this test exercises.
     assert decision["mode"] in {"resume", "repair_and_resume", "request_human"}
     assert decision["progress"]["completed"] == 1
+
+
+# --- resume mirrors the MCP surface (issue #91) ------------------------------
+
+
+def test_resume_returns_the_run_goal() -> None:
+    """A resumed client must learn what the task was, not just how far it got.
+
+    Without this the sidecar is the one boundary that still needs an external
+    task file to answer "what was I doing", which is the overhead the goal was
+    added to continuum_resume to remove.
+    """
+    srv = make_server()
+    srv.dispatch(
+        "record_progress",
+        {"run_id": "r1", "completed": 3, "total": 10, "goal": "migrate the billing module"},
+    )
+    srv.dispatch("checkpoint", {"run_id": "r1"})
+
+    decision = srv.dispatch("resume", {"run_id": "r1"})
+    assert decision["goal"] == "migrate the billing module"
+
+
+def test_resume_without_run_id_targets_the_active_run() -> None:
+    """An interrupted session has no id to send, so omitting it must work.
+
+    This is the whole point of the capability: a fresh process that lost its
+    memory of the run can still ask what to continue.
+    """
+    srv = make_server()
+    srv.dispatch(
+        "record_progress",
+        {"run_id": "r1", "completed": 3, "total": 10, "goal": "migrate the billing module"},
+    )
+    srv.dispatch("checkpoint", {"run_id": "r1"})
+
+    decision = srv.dispatch("resume", {})
+    assert decision["run_id"] == "r1"
+    assert decision["goal"] == "migrate the billing module"
+    assert decision["progress"]["completed"] == 3
+
+
+def test_resume_without_run_id_reports_no_active_run() -> None:
+    """Nothing to resume is a verdict, not a protocol error.
+
+    Reported as a mode so a client can branch on ``mode`` alone and get the
+    same answer from the sidecar as from continuum_resume.
+    """
+    srv = make_server()
+    decision = srv.dispatch("resume", {})
+    assert decision["mode"] == "no_active_run"
+    assert decision["safe"] is False
+    assert decision["run_id"] is None
+
+
+def test_resume_still_requires_review_for_a_self_reported_run() -> None:
+    """Returning the goal must not confirm it.
+
+    The goal is a self-report from a remote caller, so surfacing it is
+    read-only and the run stays behind the human-review gate.
+    """
+    srv = make_server()
+    srv.dispatch("record_progress", {"run_id": "r1", "completed": 1, "total": 10, "goal": "g"})
+    srv.dispatch("checkpoint", {"run_id": "r1"})
+
+    assert srv.dispatch("resume", {"run_id": "r1"})["mode"] == "request_human"
+
+
+async def test_resume_payload_covers_the_mcp_resume_surface() -> None:
+    """Every field continuum_resume returns must also come back from the sidecar.
+
+    Compared against the live MCP payload rather than a hardcoded key list,
+    because a field added there and forgotten here is exactly how ``goal`` went
+    missing. Skipped without the ``mcp`` extra, which ``continuum serve`` is
+    designed not to need.
+    """
+    pytest.importorskip("mcp")
+    from continuum.mcp.authz import AuthorizationPolicy
+    from continuum.mcp.server import build_server
+    from continuum.storage.sqlite import SQLiteStorage
+    from tests.mcp_helpers import fake_context
+
+    caller = "pytest-client"
+    server, ctx = build_server(
+        storage=SQLiteStorage(":memory:"), policy=AuthorizationPolicy([caller])
+    )
+    try:
+
+        async def call(name: str, **arguments: object) -> dict:
+            result = await server.call_tool(name, arguments, context=fake_context(caller))
+            return dict(json.loads(result.content[0].text))
+
+        await call("continuum_record_progress", run_id="r1", completed=3, total=10, goal="g")
+        await call("continuum_checkpoint", run_id="r1")
+        expected = await call("continuum_resume", run_id="r1")
+    finally:
+        ctx.close()
+
+    srv = make_server()
+    srv.dispatch("record_progress", {"run_id": "r1", "completed": 3, "total": 10, "goal": "g"})
+    srv.dispatch("checkpoint", {"run_id": "r1"})
+    actual = srv.dispatch("resume", {"run_id": "r1"})
+
+    missing = sorted(set(expected) - set(actual))
+    assert not missing, f"sidecar resume omits MCP fields: {missing}"
+
+    missing_progress = sorted(set(expected["progress"]) - set(actual["progress"]))
+    assert not missing_progress, f"sidecar progress omits MCP fields: {missing_progress}"
 
 
 def test_checkpointing_with_env_makes_drift_block_resume() -> None:
@@ -127,6 +236,40 @@ def test_intercept_then_complete_action() -> None:
     assert listed["actions"][0]["status"] == "completed"
 
 
+def test_complete_and_reconcile_forward_consumed_inputs() -> None:
+    """Sidecar complete/reconcile record caller-supplied consumed_inputs (#558)."""
+    from continuum.actions.ledger import fold_action_events
+
+    srv = make_server()
+    srv.dispatch("record_progress", {"run_id": "r1", "completed": 1, "goal": "g"})
+    claim = srv.dispatch("intercept_action", {"run_id": "r1", "action_type": "x.do", "key": "k1"})
+    ci = {
+        "checkpoint_seq": 2,
+        "event_positions": [1],
+        "component_ids": ["d1"],
+        "action_ids": ["a1"],
+    }
+    done = srv.dispatch(
+        "complete_action",
+        {"run_id": "r1", "action_key": claim["action_key"], "consumed_inputs": ci},
+    )
+    assert done["status"] == "completed"
+    folded = fold_action_events(srv.storage.read_events("r1"))
+    assert folded[claim["action_key"]].consumed_inputs.checkpoint_seq == 2
+    assert folded[claim["action_key"]].consumed_inputs.action_ids == ["a1"]
+    srv.dispatch(
+        "reconcile_action",
+        {
+            "run_id": "r1",
+            "action_key": claim["action_key"],
+            "occurred": True,
+            "consumed_inputs": {"checkpoint_seq": 3},
+        },
+    )
+    refolded = fold_action_events(srv.storage.read_events("r1"))
+    assert refolded[claim["action_key"]].consumed_inputs.checkpoint_seq == 3
+
+
 def test_unknown_method_is_not_found() -> None:
     srv = make_server()
     with pytest.raises(MethodNotFound):
@@ -154,14 +297,124 @@ def test_stdio_loop_reads_jsonl_and_answers() -> None:
     assert json.loads(lines[2])["error"]["type"] == "method_not_found"
 
 
+def test_stdio_resume_needs_no_params_at_all() -> None:
+    """The wire shape a restarted foreign client actually sends (issue #91).
+
+    Such a client knows the method and nothing else, so ``params`` may be absent
+    entirely rather than merely lacking ``run_id``. It must still come back with
+    the active run and its goal instead of a ``bad_params`` error.
+    """
+    srv = make_server()
+    requests = (
+        "\n".join(
+            [
+                json_line(
+                    0,
+                    "record_progress",
+                    {"run_id": "r1", "completed": 3, "total": 10, "goal": "migrate billing"},
+                ),
+                json_line(1, "checkpoint", {"run_id": "r1"}),
+                '{"id": 2, "method": "resume"}',
+            ]
+        )
+        + "\n"
+    )
+    out = io.StringIO()
+    srv.serve_stdio(io.StringIO(requests), out)
+
+    last = json.loads([line for line in out.getvalue().splitlines() if line.strip()][-1])
+    assert "error" not in last, last
+    assert last["result"]["run_id"] == "r1"
+    assert last["result"]["goal"] == "migrate billing"
+
+
+@pytest.mark.parametrize("body", ("[]", "null", "5", '"resume"', "true", '["resume"]'))
+def test_stdio_answers_a_non_object_request_and_keeps_serving(body: str) -> None:
+    """A request that parses but is not an object is a client error (issue #582).
+
+    ``rid = req.get("id")`` sat one line above the guard whose own comment reads
+    "report, never crash the loop", so a line like ``[]`` raised
+    ``AttributeError`` where nothing was catching and the process exited 1.
+    Because stdio is a long-lived session, one malformed line from any client
+    took the durability plane down and every later request on that connection
+    with it. It must be answered like a line that is not JSON at all --
+    ``bad_request``, with a null id, since a non-object request has nowhere to
+    put one -- and the request behind it must still be served.
+    """
+    srv = make_server()
+    good = json_line(1, "record_progress", {"run_id": "r1", "completed": 2, "goal": "g"})
+    out = io.StringIO()
+
+    assert srv.serve_stdio(io.StringIO(f"{body}\n{good}\n"), out) == 0
+
+    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 2, lines
+    assert lines[0] == {
+        "id": None,
+        "error": {"type": "bad_request", "message": "body must be a JSON object"},
+    }
+    assert lines[1]["id"] == 1
+    assert lines[1]["result"]["completed"] == 2
+
+
+def test_stdio_still_answers_a_line_that_is_not_json_at_all() -> None:
+    """The framing answer #582 reuses, pinned so the shared arm cannot change it.
+
+    A line that no parser can read keeps its own message (the decoder's), which
+    is what tells the two cases apart on the wire: same ``bad_request`` type and
+    null id, different text.
+    """
+    srv = make_server()
+    out = io.StringIO()
+
+    assert srv.serve_stdio(io.StringIO("not json at all\n"), out) == 0
+
+    answer = json.loads(out.getvalue().strip())
+    assert answer["id"] is None
+    assert answer["error"]["type"] == "bad_request"
+    assert answer["error"]["message"] != "body must be a JSON object"
+    assert "Expecting value" in answer["error"]["message"]
+
+
+def test_stdio_survives_a_run_of_unreadable_requests() -> None:
+    """The loop is a session, so the failure has to be survivable in series.
+
+    One answer per bad line, in order, and a working request at the end still
+    lands: the whole point of #582 is that the connection is not lost.
+    """
+    srv = make_server()
+    requests = (
+        "\n".join(
+            [
+                "[]",
+                "not json",
+                "null",
+                json_line(9, "record_progress", {"run_id": "r1", "completed": 1, "goal": "g"}),
+            ]
+        )
+        + "\n"
+    )
+    out = io.StringIO()
+
+    assert srv.serve_stdio(io.StringIO(requests), out) == 0
+
+    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert [line["id"] for line in lines] == [None, None, None, 9]
+    assert [line["error"]["type"] for line in lines[:3]] == ["bad_request"] * 3
+    assert lines[3]["result"]["completed"] == 1
+
+
 # --- authentication (fail-closed) ------------------------------------------
 
 
 def test_auth_refuses_without_token_when_required(monkeypatch) -> None:
-    monkeypatch.setenv("CONTINUUM_SERVE_TOKEN", "secret")
+    monkeypatch.setenv("CONTINUUM_SERVE_TOKEN", "actual-token-value")
     srv = make_server()
-    with pytest.raises(NotAuthorized):
+    with pytest.raises(NotAuthorized) as exc_info:
         srv.dispatch("record_progress", {"run_id": "r1", "completed": 1})
+    assert "CONTINUUM_SERVE_TOKEN" in str(exc_info.value)
+    assert "auth_token" in str(exc_info.value)
+    assert "actual-token-value" not in str(exc_info.value)
 
 
 def test_auth_allows_the_correct_token(monkeypatch) -> None:
@@ -178,6 +431,79 @@ def test_auth_disabled_by_default() -> None:
     auth = SidecarAuth()
     assert auth.disabled
     auth.verify(None)  # must not raise
+
+
+@pytest.mark.parametrize("method", list_methods())
+def test_every_method_requires_the_secret(monkeypatch, method: str) -> None:
+    """The sidecar's real policy, pinned exhaustively (issue #95).
+
+    The two token tests in this section both drive ``record_progress``, so
+    between them they only proved the policy for one mutating method -- which
+    left the suite consistent with a mutating-only policy that the sidecar does
+    not implement. Driving every entry in ``list_methods()`` closes that, and
+    keeps a method added later from landing unauthenticated by default.
+
+    ``dispatch`` verifies before it routes, so the missing ``run_id`` here
+    cannot be what raises: ``BadParams`` would mean auth had already been
+    skipped.
+    """
+    monkeypatch.setenv("CONTINUUM_SERVE_TOKEN", "secret")
+    srv = make_server()
+
+    with pytest.raises(NotAuthorized):
+        srv.dispatch(method, {"run_id": "r1"})
+
+
+def test_the_mutating_constant_does_not_govern_authentication(monkeypatch) -> None:
+    """Regression for #95: the exported constant is metadata, not the policy.
+
+    ``MUTATING`` omits the three read-only methods, and until this test the only
+    trace of a mutating-only rule was an unreferenced ``_auth_check`` helper.
+    Deleting the helper is not enough on its own -- someone reading the constant
+    can reintroduce the same gate in ``dispatch``, and every other test in this
+    file would still pass while ``resume``, ``validate`` and ``list_actions``
+    silently opened up to unauthenticated callers, in precisely the deployments
+    that bothered to set a secret. This is the test that goes red instead.
+    """
+    monkeypatch.setenv("CONTINUUM_SERVE_TOKEN", "secret")
+    srv = make_server()
+
+    read_only = [method for method in list_methods() if method not in MUTATING]
+    assert read_only == ["list_actions", "resume", "validate"], (
+        "the set of methods MUTATING leaves out has changed; "
+        "confirm the auth policy still covers them"
+    )
+
+    for method in read_only:
+        with pytest.raises(NotAuthorized):
+            srv.dispatch(method, {"run_id": "r1"})
+
+
+def test_a_read_only_method_succeeds_with_the_secret(monkeypatch) -> None:
+    """Closing reads must gate them, not break them.
+
+    Also shows what the gate is protecting: ``resume`` returns the goal string,
+    and ``list_actions`` the arguments and results of real side effects. That is
+    the argument for the sidecar being stricter than the MCP server -- anything
+    that can reach this pipe can ask for it.
+    """
+    monkeypatch.setenv("CONTINUUM_SERVE_TOKEN", "secret")
+    srv = make_server()
+    srv.dispatch(
+        "record_progress",
+        {
+            "run_id": "r1",
+            "completed": 1,
+            "total": 3,
+            "goal": "migrate billing",
+            "auth_token": "secret",
+        },
+    )
+
+    out = srv.dispatch("resume", {"run_id": "r1", "auth_token": "secret"})
+
+    assert out["goal"] == "migrate billing"
+    assert out["progress"]["completed"] == 1
 
 
 # --- real subprocess path (what an external client uses) --------------------
@@ -206,3 +532,31 @@ def json_line(rid: int, method: str, params: dict) -> str:
     import json
 
     return json.dumps({"id": rid, "method": method, "params": params})
+
+
+def test_malformed_consumed_inputs_is_bad_params_not_internal() -> None:
+    """Ledger validation failures surface as parameter errors (#645 review)."""
+    from continuum.serve.server import BadParams
+
+    srv = make_server()
+    srv.dispatch("record_progress", {"run_id": "r1", "completed": 1, "goal": "g"})
+    claim = srv.dispatch("intercept_action", {"run_id": "r1", "action_type": "x.do", "key": "k1"})
+    with pytest.raises(BadParams, match="greater than or equal"):
+        srv.dispatch(
+            "complete_action",
+            {
+                "run_id": "r1",
+                "action_key": claim["action_key"],
+                "consumed_inputs": {"checkpoint_seq": -1},
+            },
+        )
+    with pytest.raises(BadParams, match="consumed_inputs"):
+        srv.dispatch(
+            "reconcile_action",
+            {
+                "run_id": "r1",
+                "action_key": claim["action_key"],
+                "occurred": True,
+                "consumed_inputs": [1, 2],
+            },
+        )

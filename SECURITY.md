@@ -52,7 +52,7 @@ Out of scope:
 ## Why this policy exists
 
 A real example, already in this repository's history. PR #3 proposed an
-authorization gate whose guard returned early — permitting the call — when the
+authorization gate whose guard returned early, permitting the call, when the
 request context was missing. The failure was reachable, the PR added no test of
 its own gate, so CI passed, and its `Fixes #1` footer would have closed the
 tracking issue on merge.

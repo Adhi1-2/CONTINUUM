@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "continuum-agent"
-version = "0.1.0"
+version = "0.1.2"
 description = "Verifiable semantic recovery layer for long-running AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,7 +35,7 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.23",
     "hypothesis>=6.0",
-    "ruff==0.16.2",
+    "ruff==0.16.5",
     "mypy>=1.13",
     "mcp>=2.0",
     # The adapter packages are optional runtime dependencies (see [project.optional-dependencies])
@@ -51,6 +51,8 @@ dev = [
 # The MCP server is optional: the core library and CLI never import it, so
 # installing CONTINUUM does not pull in a server stack you may not want.
 mcp = ["mcp>=2.0"]
+# The OpenTelemetry bridge is optional: the core library never imports it.
+otel = ["opentelemetry-api>=1.20"]
 # The LangGraph adapter is optional: it wraps langgraph's StateGraph and tool
 # decorators with CONTINUUM's durability layer.
 langgraph = ["langgraph>=0.2"]
@@ -65,6 +67,9 @@ langchain = ["langchain>=0.3"]
 # Optional Ed25519 attestation of the event chain (continuum attest), kept out
 # of the core so the recovery path needs no crypto dependency.
 attest = ["cryptography>=45.0"]
+# The PostgreSQL storage backend (B2.3) for multi-process / multi-host durability.
+# The core stays SQLite-only so a plain install needs no database driver.
+postgres = ["psycopg>=3.2"]
 
 [project.scripts]
 continuum = "continuum.cli.main:main"
@@ -99,6 +104,67 @@ warn_unused_configs = true
 plugins = ["pydantic.mypy"]
 files = ["src/continuum"]
 
+# Every optional dependency is imported lazily, behind a `try` or under
+# `TYPE_CHECKING`, so each module that reaches for one still has to type-check on
+# an install that does not have it. A plain `pip install -e .` clone has only
+# pydantic, and the families below are what stand between that clone and 26
+# errors from `mypy src/continuum` that say nothing about the code (#315). An
+# optional import added without a family here brings the errors back.
+
+# psycopg is an optional runtime dependency (the [postgres] extra). It is
+# imported lazily, so the module must type-check without it installed.
+[[tool.mypy.overrides]]
+module = ["psycopg", "psycopg.*"]
+ignore_missing_imports = true
+
+# playwright and kubernetes are optional dependencies of the browser and
+# kubernetes environment adapters. They are imported lazily, so the modules
+# must type-check without them installed.
+[[tool.mypy.overrides]]
+module = ["playwright", "playwright.*", "kubernetes"]
+ignore_missing_imports = true
+
+# opentelemetry backs the [otel] span bridge and crewai the thin hook adapter.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*", "crewai", "crewai.*", "crewai.hooks"]
+ignore_missing_imports = true
+
+# cryptography signs the event chain for `continuum attest` (the [attest]
+# extra). The recovery path must import with no crypto installed, so the import
+# sits inside the signing call.
+[[tool.mypy.overrides]]
+module = ["cryptography.*"]
+ignore_missing_imports = true
+
+# The MCP server stack (the [mcp] extra). The core library and CLI never import
+# it, so a dependency-free install must still type-check the server module.
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
+
+# The framework adapters: langgraph, openai-agents (imported as `agents`) and
+# langchain-core. Each has its own extra and its own availability guard, so none
+# of the three is present in a core install.
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "agents", "agents.*", "langchain_core"]
+ignore_missing_imports = true
+
+# Silencing the missing import is half the job: the names it supplied are now
+# `Any`, and two strict checks refuse `Any` where these three modules need it.
+# `langgraph_store` subclasses LangGraph's `BaseCheckpointSaver` and the openai
+# adapter subclasses `RunHooks`, which `disallow_subclassing_any` rejects; every
+# MCP tool is registered through the server's own decorator, which
+# `disallow_untyped_decorators` rejects. Both are checked in CI, where the
+# packages are installed and the real signatures apply. Scoped to the three
+# modules that hold an optional seam so strict stays whole everywhere else.
+[[tool.mypy.overrides]]
+module = ["continuum.adapters.langgraph_store", "continuum.adapters.openai"]
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = ["continuum.mcp.server"]
+disallow_untyped_decorators = false
+
 [tool.pydantic.mypy]
 init_forbid_extra = true
 init_typed = true
@@ -107,7 +173,10 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+addopts = "-q --strict-markers"
+markers = [
+    "slow: integration test that takes more than about 2 seconds. Deselect it during development with `pytest -m 'not slow'`; CI runs the suite unfiltered.",
+]
 # The MCP server's tools are async; without this, pytest silently skips them
 # as "not natively supported" rather than failing, which would let the whole
 # suite pass while testing nothing.

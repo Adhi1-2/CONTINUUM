@@ -17,6 +17,7 @@ from typing import IO, Any, TextIO, cast
 
 from continuum.serve.server import (
     BadParams,
+    BadRequest,
     MalformedRunLog,
     MethodNotFound,
     NotAuthorized,
@@ -39,6 +40,7 @@ __all__ = [
     "MethodNotFound",
     "NotAuthorized",
     "BadParams",
+    "BadRequest",
     "MalformedRunLog",
 ]
 
@@ -56,6 +58,11 @@ class SidecarClient:
         self._next_id = 0
 
     def request(self, method: str, **params: Any) -> dict[str, Any]:
+        """Send one JSON-RPC call and return its result.
+
+        Raises:
+            SidecarClientError: If the connection closes or the sidecar returns an error.
+        """
         rid = self._next_id
         self._next_id += 1
         self._out.write(json.dumps({"id": rid, "method": method, "params": params}) + "\n")
@@ -76,6 +83,7 @@ class SidecarClient:
             return cast("dict[str, Any]", msg["result"])
 
     def close(self) -> None:
+        """Close the output stream, suppressing close errors."""
         with contextlib.suppress(Exception):
             self._out.close()
 
@@ -91,6 +99,7 @@ class SubprocessClient:
         return getattr(self._client, name)
 
     def terminate(self) -> None:
+        """Stop the sidecar, killing it if it does not exit within five seconds."""
         self._process.terminate()
         try:
             self._process.wait(timeout=5)
@@ -124,19 +133,37 @@ def run_serve(
     transport: str = "stdio",
     instream: TextIO | None = None,
     outstream: TextIO | None = None,
+    port: int = 8765,
 ) -> int:
     """Run the sidecar loop. Defaults to stdin/stdout for a real server."""
     server = SidecarServer(database=db)
+    if transport == "http":
+        from continuum.serve.server import SidecarHTTP
+
+        http = SidecarHTTP(server, port=port)
+        print(f"CONTINUUM sidecar listening on http://{'127.0.0.1'}:{http.port}", flush=True)
+        try:
+            http.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            http.shutdown()
+            server.close()
+        return 0
     try:
         return server.serve_stdio(instream, outstream)
     finally:
         server.close()
 
 
-def cmd_serve(args: Any, storage: Any, out: TextIO, err: TextIO) -> int:  # noqa: ANN401
+def cmd_serve(args: Any, storage: Any, out: TextIO, err: TextIO) -> int:
     """CLI entry point for ``continuum serve``."""
     from continuum.storage import Storage
 
     if storage is not None and isinstance(storage, Storage):
         storage.close()
-    return run_serve(db=getattr(args, "db", None), transport=getattr(args, "transport", "stdio"))
+    return run_serve(
+        db=getattr(args, "db", None),
+        transport=getattr(args, "transport", "stdio"),
+        port=int(getattr(args, "port", 8765)),
+    )

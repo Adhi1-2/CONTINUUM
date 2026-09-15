@@ -1,8 +1,8 @@
 """Which MCP callers may change a run.
 
 The problem this solves is coexistence, not intrusion. Several agents can be
-configured against the same database at once — Kilo, Gemini CLI and Claude Code
-have all pointed at this project's ``continuum.db`` simultaneously — and until
+configured against the same database at once (Kilo, Gemini CLI and Claude Code
+have all pointed at this project's ``continuum.db`` simultaneously), and until
 now any of them could overwrite another's progress, checkpoint over its state,
 or claim its actions. This layer keeps honestly-named agents out of each other's
 runs.
@@ -51,16 +51,19 @@ from typing import Any
 
 __all__ = [
     "AuthorizationPolicy",
+    "AuthPolicy",
+    "ConfirmPolicy",
     "NotAuthorized",
     "UnknownCaller",
-    "AuthPolicy",
     "NotAuthenticated",
     "POLICY_ENV_VAR",
     "POLICY_ENV_VAR_ALIAS",
     "POLICY_FILENAME",
     "AUTH_ENV_VAR",
+    "CONFIRM_ENV_VAR",
     "load_policy",
     "load_auth",
+    "load_confirm",
     "caller_name",
     "token_from",
     "CLIENT_TOKENS_ENV_VAR",
@@ -70,7 +73,7 @@ POLICY_ENV_VAR = "CONTINUUM_MCP_ALLOW"
 
 #: Alias for ``POLICY_ENV_VAR``, preserved from the closed PR #3. The longer
 #: name states what is being allowed rather than leaving it to be inferred, so
-#: it wins when both are set — a reader who followed that PR's history will
+#: it wins when both are set: a reader who followed that PR's history will
 #: reach for it first, and silently preferring the vaguer name would surprise
 #: them. Same precedence position: an alias, not an extra config source.
 POLICY_ENV_VAR_ALIAS = "CONTINUUM_MCP_MUTATING_CLIENTS"
@@ -128,6 +131,8 @@ class AuthPolicy:
 
     @property
     def disabled(self) -> bool:
+        """Whether authentication is disabled because no secret is configured."""
+
         # Only an absent secret disables authentication. An explicit empty
         # secret is a misconfiguration and must refuse, not open the door.
         return self.expected is None and not self.tokens
@@ -149,8 +154,39 @@ class AuthPolicy:
             expected = self.expected
         # An empty expected secret cannot be presented, so it must refuse.
         if not expected or not token or token != expected:
-            raise NotAuthenticated("the caller did not present the expected shared secret")
+            if self.tokens is not None:
+                if self.source == CLIENT_TOKENS_ENV_VAR:
+                    guidance = (
+                        "expected the secret registered for this caller "
+                        f"(set {CLIENT_TOKENS_ENV_VAR} on the server and pass the "
+                        "matching value in _meta.authToken during initialize)"
+                    )
+                else:
+                    guidance = (
+                        "expected the secret registered for this caller "
+                        "(configure the per-client token mapping in the embedding "
+                        "application and pass the matching value in _meta.authToken "
+                        "during initialize)"
+                    )
+            elif self.source == "argument":
+                guidance = (
+                    "expected the secret configured by the embedding application "
+                    "(pass it in _meta.authToken during initialize)"
+                )
+            else:
+                guidance = (
+                    f"expected shared secret (set {AUTH_ENV_VAR} on the server "
+                    "and pass _meta.authToken during initialize)"
+                )
+            raise NotAuthenticated(guidance)
 
+
+#: Confirmation of self-reported state over MCP is gated behind its own secret
+#: (issue #201). Without this, any caller allowlisted to record progress could
+#: also call ``continuum_confirm`` to clear the REQUIRES_REVIEW on its own
+#: self-report, which reinstates exactly the exploit the self-certification fix
+#: (``9738b9e``) closed.
+CONFIRM_ENV_VAR = "CONTINUUM_MCP_CONFIRM_TOKEN"
 
 AUTH_ENV_VAR = "CONTINUUM_MCP_TOKEN"
 
@@ -207,6 +243,68 @@ def load_auth(
     return AuthPolicy(source="default (disabled)")
 
 
+class ConfirmPolicy:
+    """Gates ``continuum_confirm`` behind a dedicated secret (issue #201).
+
+    Unlike :class:`AuthPolicy` this is fail-closed *by default*: with no secret
+    configured the tool refuses every caller, because an open confirmation path
+    is not a default anyone could want. An agent that may record progress must
+    not also be able to confirm that progress, so confirmation over MCP is off
+    until the operator explicitly turns it on by setting
+    ``CONTINUUM_MCP_CONFIRM_TOKEN``; a human confirms instead with
+    ``continuum confirm <run_id>`` on the host.
+
+    When configured, the caller must present that secret in the handshake's
+    ``_meta.authToken``. A missing, empty, or mismatched secret always refuses.
+    """
+
+    __slots__ = ("expected", "source")
+
+    def __init__(self, expected: str | None = None, *, source: str = "default (refusing)") -> None:
+        self.expected = expected
+        self.source = source
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        mode = "configured" if self.expected else "refusing"
+        return f"ConfirmPolicy(mode={mode}, source={self.source!r})"
+
+    @property
+    def disabled(self) -> bool:
+        """True when no secret is configured, in which case every call refuses."""
+        return not self.expected
+
+    def verify(self, token: str | None) -> None:
+        """Raise ``NotAuthenticated`` unless ``token`` proves the confirm secret."""
+        if not self.expected:
+            raise NotAuthenticated(
+                f"continuum_confirm is refused because no {CONFIRM_ENV_VAR} is configured; "
+                f"an agent must not confirm its own self-reported state. Have a human run "
+                f"'continuum confirm <run_id>' instead, or set {CONFIRM_ENV_VAR} if "
+                f"confirmation over MCP is genuinely wanted."
+            )
+        if not token or token != self.expected:
+            raise NotAuthenticated(
+                f"the caller did not present the confirmation secret required by {CONFIRM_ENV_VAR}"
+            )
+
+
+def load_confirm(
+    expected: str | None = None, *, env: Mapping[str, str] | None = None
+) -> ConfirmPolicy:
+    """Resolve the confirmation policy: explicit argument, then env var, then refuse.
+
+    There is deliberately no state in which an unset secret allows calls: an
+    unset secret means ``continuum_confirm`` refuses every caller.
+    """
+    if expected is not None:
+        return ConfirmPolicy(expected, source="argument")
+    environ = os.environ if env is None else env
+    value = environ.get(CONFIRM_ENV_VAR)
+    if value:
+        return ConfirmPolicy(value, source=CONFIRM_ENV_VAR)
+    return ConfirmPolicy(source=f"default (refuse; set {CONFIRM_ENV_VAR} to enable)")
+
+
 def token_from(context: Any) -> str | None:
     """Read the shared secret a client presented in the initialize handshake.
 
@@ -231,7 +329,7 @@ class AuthorizationPolicy:
     """Decides whether a named caller may invoke a mutating tool.
 
     Deny by default. An unlisted caller is not a caller we have decided to
-    trust — it is one nobody has made a decision about, and treating an absent
+    trust. It is one nobody has made a decision about, and treating an absent
     decision as approval is how the whole point of the layer gets lost. This
     mirrors the validator's stance elsewhere in CONTINUUM: uncertainty degrades
     rather than resolving in its own favour.
@@ -249,6 +347,8 @@ class AuthorizationPolicy:
 
     @property
     def denies_everything(self) -> bool:
+        """Whether the empty allow-list refuses every mutating caller."""
+
         return not self.allowed
 
     def permits(self, caller: str | None) -> bool:
@@ -350,8 +450,8 @@ def caller_name(context: Any) -> str | None:
     """Extract the client's declared name from an MCP request context.
 
     Read from the initialize handshake, which the transport injects server-side.
-    A caller cannot override it by passing ``clientInfo`` in tool arguments —
-    verified by test. It is still only what the client *claims* to be.
+    A caller cannot override it by passing ``clientInfo`` in tool arguments
+    (verified by test). It is still only what the client *claims* to be.
     """
     if context is None:
         return None

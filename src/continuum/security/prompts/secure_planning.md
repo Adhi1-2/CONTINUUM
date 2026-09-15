@@ -12,12 +12,12 @@ When generating a plan, decompose it into branches. For each branch, output:
 - branch_id
 - action_intent: the concrete effect this branch has if executed
 - risk_tier:
-    "high"   — irreversible, moves money, deletes data, sends communication,
+    "high"  , irreversible, moves money, deletes data, sends communication,
                changes account state
-    "medium" — reversible but consequential (navigating to a page that
+    "medium", reversible but consequential (navigating to a page that
                changes context)
-    "low"    — purely observational (scroll, read, screenshot)
-- depends_on_observation: true/false — does taking this branch depend on a
+    "low"   , purely observational (scroll, read, screenshot)
+- depends_on_observation: true/false, does taking this branch depend on a
   claim the perception model makes about the environment (button label,
   displayed form state, page content)?
 

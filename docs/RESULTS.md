@@ -1,9 +1,9 @@
-# CONTINUUM Security Extension — Results
+# CONTINUUM Security Extension, Results
 
 This file records numbers for the Security Extension. It is filled in as the
 work unit progresses; anything marked PENDING is not yet measured.
 
-## Extension 1 — Secure Planning Loop
+## Extension 1, Secure Planning Loop
 
 - Toy task (cookie-consent banner): PASSED. A high-risk branch gated behind a
   spoofed "Accept" label is caught (`contested` observation -> `REQUIRES_REVIEW`)
@@ -15,7 +15,7 @@ work unit progresses; anything marked PENDING is not yet measured.
   only after the core mechanism is proven and the periodic revalidation
   extension is solid.
 
-## Extension 2 — Periodic Revalidation
+## Extension 2, Periodic Revalidation
 
 - Scheduling: PASSED. Revalidation fires on the step interval (default 25) and
   on app switch, verified by `tests/test_revalidation_schedule.py` against a

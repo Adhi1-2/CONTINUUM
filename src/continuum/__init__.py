@@ -1,4 +1,4 @@
-"""CONTINUUM — verifiable semantic recovery layer for long-running AI agents.
+"""CONTINUUM: verifiable semantic recovery layer for long-running AI agents.
 
 Agents that can lose their context without losing their work.
 
@@ -6,6 +6,10 @@ Phase 1 exposes the durable data model and the append-only event log. The
 runtime (``Continuum``), storage engines, validation, action ledger and CLI
 arrive in later phases; nothing here imports an LLM provider.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from continuum.actions import (
     ActionLedger,
@@ -20,6 +24,15 @@ from continuum.actions import (
     idempotency_key,
     reconcile_pending,
     unresolved_actions,
+)
+from continuum.adapters import (
+    AdapterRegistry,
+    AgentAdapter,
+    GenericAgentAdapter,
+    get_adapter,
+    list_adapters,
+    recover,
+    register_adapter,
 )
 from continuum.checkpoint import (
     CheckpointDecision,
@@ -95,9 +108,25 @@ from continuum.models import (
     UnknownSideEffect,
     utcnow,
 )
+from continuum.provenance_map import (
+    CanonicalProvenance,
+    ProvenanceView,
+    canonical_origin,
+    canonical_state_status,
+    canonical_trust,
+    summarize,
+)
 from continuum.recovery import (
+    DependencyGraph,
+    ImpactedSet,
+    LedgerEntryKind,
+    LedgerError,
+    LedgerLockError,
+    ReconcileReport,
     RecoveryDecision,
     RecoveryEngine,
+    RecoveryLedger,
+    RecoveryLedgerEntry,
     RepairKind,
     RepairPlan,
     RepairStep,
@@ -135,7 +164,39 @@ from continuum.storage import (
     open_storage,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
+
+# Framework-adapter names resolve lazily (PEP 562, issue #214): importing the
+# package must not pay for openai/langgraph/langchain, because every entry
+# point imports this package, including processes that never touch an
+# adapter. Type-checkers see the real definitions here; runtime resolves them
+# through __getattr__ below.
+if TYPE_CHECKING:
+    from continuum.adapters.langchain import LangChainAgentAdapter
+    from continuum.adapters.langgraph import LangGraphAgentAdapter
+    from continuum.adapters.openai import OpenAIAgentAdapter
+
+_LAZY_TOP_LEVEL: dict[str, str] = {
+    "LangChainAgentAdapter": "langchain",
+    "LangGraphAgentAdapter": "langgraph",
+    "OpenAIAgentAdapter": "openai",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _LAZY_TOP_LEVEL.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(f"continuum.adapters.{module_name}"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_TOP_LEVEL))
+
 
 __all__ = [
     "__version__",
@@ -252,8 +313,16 @@ __all__ = [
     "reconcile_pending",
     "unresolved_actions",
     # recovery engine
+    "DependencyGraph",
+    "ImpactedSet",
+    "LedgerEntryKind",
+    "LedgerError",
+    "LedgerLockError",
     "RecoveryDecision",
     "RecoveryEngine",
+    "RecoveryLedger",
+    "RecoveryLedgerEntry",
+    "ReconcileReport",
     "RepairKind",
     "RepairPlan",
     "RepairStep",
@@ -261,4 +330,22 @@ __all__ = [
     "plan_repairs",
     "render_contract",
     "verify_contract",
+    # agent framework adapters
+    "AdapterRegistry",
+    "AgentAdapter",
+    "GenericAgentAdapter",
+    "LangChainAgentAdapter",
+    "LangGraphAgentAdapter",
+    "OpenAIAgentAdapter",
+    "get_adapter",
+    "list_adapters",
+    "recover",
+    "register_adapter",
+    # provenance (canonical mapping)
+    "CanonicalProvenance",
+    "ProvenanceView",
+    "canonical_origin",
+    "canonical_state_status",
+    "canonical_trust",
+    "summarize",
 ]

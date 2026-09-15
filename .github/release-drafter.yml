@@ -1,0 +1,63 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+
+autolabeler:
+  - label: "enhancement"
+    title:
+      - '/^feat(\(.+\))?(!)?:/'
+      - '/^perf(\(.+\))?(!)?:/'
+  - label: "bug"
+    title:
+      - '/^fix(\(.+\))?:/'
+  - label: "documentation"
+    title:
+      - '/^docs(\(.+\))?:/'
+  - label: "ci"
+    title:
+      - '/^ci(\(.+\))?:/'
+      - '/^build(\(.+\))?:/'
+  - label: "tests"
+    title:
+      - '/^test(\(.+\))?:/'
+  - label: "adapter"
+    files:
+      - "src/continuum/adapters/**"
+  - label: "mcp"
+    files:
+      - "src/continuum/mcp*/**"
+  - label: "cli"
+    files:
+      - "src/continuum/**/*cli*"
+  - label: "benchmark"
+    files:
+      - "benchmarks/**"
+
+categories:
+  - title: "🚀 Features"
+    labels: ["enhancement"]
+  - title: "🐛 Bug Fixes"
+    labels: ["bug"]
+  - title: "🔌 Adapters"
+    labels: ["adapter"]
+  - title: "📚 Documentation"
+    labels: ["documentation"]
+  - title: "⚙️ Infrastructure"
+    labels: ["ci", "dependencies"]
+  - title: "🧪 Tests & Benchmarks"
+    labels: ["tests", "benchmark"]
+
+version-resolver:
+  major:
+    labels: ["breaking", "major"]
+  minor:
+    labels: ["enhancement", "feature"]
+  patch:
+    labels: ["bug", "documentation", "ci", "tests", "dependencies", "adapter"]
+
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+exclude:
+  labels: ["duplicate", "invalid", "wontfix"]

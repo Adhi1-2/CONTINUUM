@@ -31,11 +31,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
+from heapq import merge
 from types import TracebackType
-from typing import Any
+from typing import Any, ClassVar
 
 from continuum.events import Event, EventType, IntegrityReport
-from continuum.models import Origin, Run, SemanticState, StateCheckpoint
+from continuum.models import Action, Origin, Run, SemanticState, StateCheckpoint
 
 __all__ = [
     "Storage",
@@ -57,8 +58,8 @@ class RunNotFound(StorageError, KeyError):
 
     Subclasses ``KeyError`` so ``except KeyError`` still catches it, but
     overrides ``__str__``: ``KeyError.__str__`` applies ``repr()`` to its
-    message, which would surface to CLI users as ``"no such run: 'ghost'"``
-    — quoted twice.
+    message, which would surface to CLI users as ``"no such run: 'ghost'"``,
+    quoted twice.
     """
 
     def __init__(self, run_id: str) -> None:
@@ -101,10 +102,94 @@ class SchemaVersionError(StorageError):
 class Storage(ABC):
     """Durable backing store for runs, events, versions and checkpoints."""
 
+    #: True when the engine maintains the derived action index (issue #216)
+    #: and implements :meth:`foreign_action`. Callers fall back to event-scan
+    #: lookups when False, so the flag must reflect real capability.
+    supports_action_index: ClassVar[bool] = False
+
+    #: True when the engine maintains ``events_archive`` and implements
+    #: :meth:`compact_run` (issue #239). Callers gate on this flag rather than
+    #: catching NotImplementedError, mirroring :attr:`supports_action_index`.
+    supports_compaction: ClassVar[bool] = False
+
+    def compact_run(self, run_id: str, *, through_sequence: int | None = None) -> dict[str, int]:
+        """Archive the pre-anchor prefix of a run's log (issue #239).
+
+        Only meaningful on engines with ``events_archive``; callers check
+        :attr:`supports_compaction` first, which is the capability contract.
+        """
+        raise NotImplementedError
+
+    def read_archived_events(self, run_id: str) -> Sequence[Event]:
+        """Read events moved into ``events_archive``, oldest first.
+
+        Engines without an archive return an empty sequence, so a caller that
+        wants "the whole recorded history" can concatenate this with
+        :meth:`read_events` unconditionally. This is what keeps exactly-once
+        action claims (and any other fold over history) intact across
+        compaction: an archived fact is still a recorded fact.
+        """
+        del run_id
+        return []
+
+    def read_all_events(self, run_id: str) -> Sequence[Event]:
+        """Full history including archived prefix, sorted by sequence.
+
+        After compaction the live log holds only the anchor and tail; any
+        provenance calculation that reads only live events would miss an
+        archived ``EXTERNAL_AGENT`` fact and launder it to ``DETERMINISTIC``.
+        Callers that compute ``derived_origin`` over a run's history must use
+        this helper so min is honest. Authority enforcement, memory enumeration,
+        forensic joins, and cross-run action scans likewise require full history:
+        compaction moves facts but does not revoke their consequences. Checkpoint
+        projection may intentionally read only the live tail instead.
+        Callers folding the same history more than once should reuse the returned
+        sequence within that operation instead of rescanning the archive.
+        Sorted to keep hash chain order stable.
+        """
+        archived = list(self.read_archived_events(run_id))
+        live = list(self.read_events(run_id))
+        if not archived:
+            return live
+        if not live:
+            return archived
+        # Both streams arrive sequence-ordered, so merge linearly instead of
+        # re-sorting: full-history folds on long compacted runs pay O(n).
+        # merge is stable, matching sorted() for equal sequences.
+        return tuple(merge(archived, live, key=lambda e: e.sequence))
+
+    def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
+        """Newest action recorded under ``key`` outside ``exclude_run``.
+
+        Only meaningful when ``supports_action_index`` is True; engines
+        without an index leave the default, and callers scan event logs
+        instead. Returns None both for "not found" and "no index", which is
+        why callers must check the flag first.
+        """
+        del key, exclude_run
+        return None
+
+    def action_index_drift(self) -> int:
+        """Count index rows disagreeing with the log. Index engines only.
+
+        Callers must check :attr:`supports_action_index` first; engines
+        without an index deliberately have no meaningful answer.
+        """
+        raise NotImplementedError
+
+    def rebuild_action_index(self) -> int:
+        """Recompute the index from the log; returns corrected rows.
+
+        Same capability contract as :meth:`action_index_drift`.
+        """
+        raise NotImplementedError
+
     # -- lifecycle -------------------------------------------------------- #
 
     @abstractmethod
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Release the backing store. Idempotent; safe to call twice."""
+        ...
 
     def __enter__(self) -> Storage:
         return self
@@ -119,17 +204,58 @@ class Storage(ABC):
 
     # -- runs ------------------------------------------------------------- #
 
-    @abstractmethod
-    def create_run(self, run: Run) -> Run: ...
+    @staticmethod
+    def require_usable_run_id(run: Run) -> None:
+        """Refuse a blank run id where work enters storage.
+
+        Enforced on the write path rather than on :class:`Run` itself, because a
+        model-level constraint also runs on deserialization: one bad legacy row
+        would then make ``list_runs`` and ``get_active_run`` raise, leaving an
+        operator unable to even see the row in order to clean it up. Guarding the
+        entry point stops new bad data without bricking existing databases.
+
+        A blank id is not cosmetic. It is indistinguishable from "no run" at every
+        boundary that takes one, it wins ``get_active_run`` and so silently
+        becomes the run a fresh session is told to resume, and it renders guidance
+        like ``continuum confirm `` with nothing after it.
+        """
+        if not run.run_id.strip():
+            raise ValueError(
+                "run_id must not be blank: a blank id is indistinguishable from "
+                "'no run', and it wins get_active_run so a fresh session would be "
+                "told to resume it instead of real work"
+            )
 
     @abstractmethod
-    def get_run(self, run_id: str) -> Run: ...
+    def create_run(self, run: Run) -> Run:
+        """Persist a new run row. Raises when the id already exists."""
+        ...
 
     @abstractmethod
-    def update_run(self, run: Run) -> Run: ...
+    def create_run_started(self, run: Run, *, source: Origin = Origin.DETERMINISTIC) -> Run:
+        """Create a run and its ``RUN_STARTED`` event as one atomic write.
+
+        The run row and its first event are two inserts but one fact: without
+        the event the run cannot be projected, and without the row the event
+        violates its foreign key. Writing them separately admits a half-created
+        run that can be neither resumed nor deleted whenever the process dies
+        between the two statements. Engines must commit both or neither.
+        """
 
     @abstractmethod
-    def list_runs(self, *, limit: int | None = None) -> Sequence[Run]: ...
+    def get_run(self, run_id: str) -> Run:
+        """Return the run row. Raises RunNotFound for a run that was never created."""
+        ...
+
+    @abstractmethod
+    def update_run(self, run: Run) -> Run:
+        """Persist run changes and refresh its timestamp. Raises RunNotFound for a missing row."""
+        ...
+
+    @abstractmethod
+    def list_runs(self, *, limit: int | None = None) -> Sequence[Run]:
+        """Most recently created runs first, at most ``limit`` when given."""
+        ...
 
     @abstractmethod
     def get_active_run(self) -> Run | None:
@@ -169,42 +295,71 @@ class Storage(ABC):
         *,
         after_sequence: int = 0,
         upto: int | None = None,
-    ) -> Sequence[Event]: ...
+    ) -> Sequence[Event]:
+        """Live (unarchived) events in sequence order, windowed by ``after_sequence``/``upto``."""
+        ...
 
     @abstractmethod
-    def last_sequence(self, run_id: str) -> int: ...
+    def last_sequence(self, run_id: str) -> int:
+        """Highest live sequence number; 0 when the run has no events yet."""
+        ...
 
     @abstractmethod
-    def verify_events(self, run_id: str) -> IntegrityReport: ...
+    def verify_events(self, run_id: str) -> IntegrityReport:
+        """Recompute the hash chain and report whether it is intact."""
+        ...
 
     # -- state versions --------------------------------------------------- #
 
     @abstractmethod
-    def put_version(self, state: SemanticState, *, reason: str = "") -> int:
+    def put_version(self, state: SemanticState, *, reason: str = "", force: bool = False) -> int:
         """Persist a state version. Returns the assigned version number."""
 
     @abstractmethod
-    def get_version(self, run_id: str, version: int) -> SemanticState: ...
+    def get_version(self, run_id: str, version: int) -> SemanticState:
+        """Return one persisted state version. Raises for an unknown version."""
+        ...
 
     @abstractmethod
-    def latest_version(self, run_id: str) -> SemanticState | None: ...
+    def latest_version(self, run_id: str) -> SemanticState | None:
+        """Newest persisted state, or None when nothing was stored yet."""
+        ...
 
     @abstractmethod
-    def list_versions(self, run_id: str) -> Sequence[int]: ...
+    def list_versions(self, run_id: str) -> Sequence[int]:
+        """Persisted state version numbers in ascending order."""
+        ...
 
     # -- checkpoints ------------------------------------------------------ #
 
     @abstractmethod
-    def put_checkpoint(self, checkpoint: StateCheckpoint) -> StateCheckpoint: ...
+    def put_checkpoint(self, checkpoint: StateCheckpoint) -> StateCheckpoint:
+        """Persist a checkpoint and return it."""
+        ...
 
     @abstractmethod
-    def get_checkpoint(self, checkpoint_id: str) -> StateCheckpoint: ...
+    def get_checkpoint(self, checkpoint_id: str) -> StateCheckpoint:
+        """Return one checkpoint. Raises for an unknown id."""
+        ...
 
     @abstractmethod
-    def latest_checkpoint(self, run_id: str) -> StateCheckpoint | None: ...
+    def latest_checkpoint(self, run_id: str) -> StateCheckpoint | None:
+        """Newest checkpoint for the run, or None when there is none."""
+        ...
 
     @abstractmethod
-    def list_checkpoints(self, run_id: str) -> Sequence[StateCheckpoint]: ...
+    def list_checkpoints(self, run_id: str) -> Sequence[StateCheckpoint]:
+        """Every checkpoint for the run in creation order."""
+        ...
+
+    @abstractmethod
+    def delete_checkpoint(self, checkpoint_id: str) -> None:
+        """Remove a checkpoint by id.
+
+        Callers (for example CheckpointManager.prune) are responsible for not
+        deleting a checkpoint that a recovery decision still depends on; the
+        store itself only refuses referential impossibilities.
+        """
 
     # -- convenience ------------------------------------------------------ #
 

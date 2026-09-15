@@ -6,7 +6,7 @@ asking "is this safe to resume?" should never require permission.
 
 This is authorization by declared identity, not authentication. ``clientInfo``
 is asserted by the client at handshake and never verified, so these tests prove
-that honestly-named agents are kept apart — not that a hostile one is stopped.
+that honestly-named agents are kept apart, not that a hostile one is stopped.
 """
 
 from __future__ import annotations
@@ -21,16 +21,19 @@ import pytest
 from continuum.mcp.authz import (
     AUTH_ENV_VAR,
     CLIENT_TOKENS_ENV_VAR,
+    CONFIRM_ENV_VAR,
     POLICY_ENV_VAR,
     POLICY_ENV_VAR_ALIAS,
     POLICY_FILENAME,
     AuthorizationPolicy,
     AuthPolicy,
+    ConfirmPolicy,
     NotAuthenticated,
     NotAuthorized,
     UnknownCaller,
     caller_name,
     load_auth,
+    load_confirm,
     load_policy,
     token_from,
 )
@@ -40,6 +43,13 @@ from tests.mcp_helpers import fake_context
 
 ALLOWED = "trusted-agent"
 STRANGER = "some-other-agent"
+
+
+@pytest.fixture(autouse=True)
+def _no_confirm_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stray CONTINUUM_MCP_CONFIRM_TOKEN must not flip any test here."""
+    monkeypatch.delenv(CONFIRM_ENV_VAR, raising=False)
+
 
 #: Each mutating tool with arguments valid for its own schema. Sending
 #: malformed arguments would trip pydantic validation *before* the guard runs,
@@ -56,6 +66,15 @@ MUTATING_CALLS: dict[str, dict[str, Any]] = {
         "occurred": True,
     },
     "continuum_confirm": {"run_id": "run_1"},
+    "continuum_record_summary": {
+        "run_id": "run_1",
+        "plan_stack": ["step"],
+    },
+    "continuum_record_plan": {
+        "run_id": "run_1",
+        "plan_id": "plan-1",
+        "units": [{"id": "u1", "title": "t", "status": "pending"}],
+    },
 }
 MUTATING = list(MUTATING_CALLS)
 READ_ONLY = ["continuum_validate", "continuum_resume", "continuum_list_actions"]
@@ -236,7 +255,10 @@ def test_caller_name_is_none_when_absent() -> None:
 async def test_a_stranger_cannot_use_any_mutating_tool(server: Any, tool: str) -> None:
     from mcp.server.mcpserver.exceptions import ToolError
 
-    with pytest.raises(ToolError, match="not permitted"):
+    # continuum_confirm authenticates before authorizing (CodeRabbit review,
+    # PR #206), so a tokenless caller hits its confirmation refusal rather
+    # than the allowlist one. Either way the mutation is refused.
+    with pytest.raises(ToolError, match="not permitted|CONTINUUM_MCP_CONFIRM_TOKEN"):
         await server.call_tool(tool, MUTATING_CALLS[tool], context=fake_context(STRANGER))
 
 
@@ -289,7 +311,7 @@ async def test_read_only_tools_stay_open_to_anyone(
     """Asking "is this safe to resume?" must never require permission.
 
     A stranger denied read access could not even discover why its writes are
-    failing, and the information disclosed — a run's goal and progress — is
+    failing, and the information disclosed (a run's goal and progress) is
     already readable by anyone holding the database file.
     """
     await seed(server)
@@ -350,13 +372,16 @@ def test_a_disabled_auth_policy_is_a_no_op() -> None:
 
 
 def test_a_configured_secret_is_required() -> None:
-    auth = AuthPolicy("secret")
+    auth = AuthPolicy("actual-token-value")
     assert not auth.disabled
     # Correct secret passes.
-    auth.verify(ALLOWED, "secret")
+    auth.verify(ALLOWED, "actual-token-value")
     # Missing, empty, or wrong secret refuses.
-    with pytest.raises(NotAuthenticated, match="shared secret"):
+    with pytest.raises(NotAuthenticated, match="shared secret") as exc_info:
         auth.verify(ALLOWED, None)
+    assert "CONTINUUM_MCP_TOKEN" in str(exc_info.value)
+    assert "_meta.authToken" in str(exc_info.value)
+    assert "actual-token-value" not in str(exc_info.value)
     with pytest.raises(NotAuthenticated, match="shared secret"):
         auth.verify(ALLOWED, "")
     with pytest.raises(NotAuthenticated, match="shared secret"):
@@ -382,8 +407,19 @@ def test_per_client_tokens_map_a_secret_to_a_name() -> None:
     with pytest.raises(NotAuthenticated, match="not registered"):
         auth.verify(STRANGER, "a-secret")
     # A registered caller with the wrong token is refused.
-    with pytest.raises(NotAuthenticated, match="shared secret"):
+    with pytest.raises(NotAuthenticated, match="registered for this caller") as exc_info:
         auth.verify(ALLOWED, "nope")
+    assert "CONTINUUM_MCP_TOKEN" not in str(exc_info.value)
+    assert "_meta.authToken" in str(exc_info.value)
+
+
+def test_argument_auth_names_the_matching_client_field() -> None:
+    auth = AuthPolicy("a-secret", source="argument")
+
+    with pytest.raises(NotAuthenticated, match="embedding application") as exc_info:
+        auth.verify(ALLOWED, "nope")
+    assert "CONTINUUM_MCP_TOKEN" not in str(exc_info.value)
+    assert "_meta.authToken" in str(exc_info.value)
 
 
 def test_load_auth_reads_the_env_var() -> None:
@@ -393,6 +429,16 @@ def test_load_auth_reads_the_env_var() -> None:
     auth.verify(ALLOWED, "s3cr3t")
     with pytest.raises(NotAuthenticated):
         auth.verify(ALLOWED, "nope")
+
+
+def test_per_client_env_auth_names_the_matching_configuration() -> None:
+    auth = load_auth(env={CLIENT_TOKENS_ENV_VAR: f"{ALLOWED}:a-secret"})
+
+    with pytest.raises(NotAuthenticated, match=CLIENT_TOKENS_ENV_VAR) as exc_info:
+        auth.verify(ALLOWED, "nope")
+    assert "CONTINUUM_MCP_TOKEN" not in str(exc_info.value)
+    assert "_meta.authToken" in str(exc_info.value)
+    assert "a-secret" not in str(exc_info.value)
 
 
 def test_load_auth_is_disabled_without_a_secret() -> None:
@@ -541,7 +587,7 @@ async def test_load_auth_wires_per_client_tokens_into_the_server(
     )
     assert json.loads(result.content[0].text)["completed"] == 3
     # Replaying another client's token against this name is refused.
-    with pytest.raises(ToolError, match="shared secret|not registered"):
+    with pytest.raises(ToolError, match="registered for this caller|not registered"):
         await srv.call_tool(
             "continuum_record_progress",
             {"run_id": "run_1", "completed": 1, "goal": "g"},
@@ -572,7 +618,7 @@ async def test_per_client_secret_is_bound_to_its_name(per_client_server: Any) ->
     )
     assert json.loads(result.content[0].text)["completed"] == 3
     # A different client's token replayed under this name is refused.
-    with pytest.raises(ToolError, match="shared secret|not registered"):
+    with pytest.raises(ToolError, match="registered for this caller|not registered"):
         await per_client_server.call_tool(
             "continuum_record_progress",
             {"run_id": "run_1", "completed": 1, "goal": "g"},
@@ -617,3 +663,237 @@ async def test_the_gate_matches_the_declared_annotations(server: Any) -> None:
     for tool in await server.list_tools():
         read_only = bool(tool.annotations and tool.annotations.read_only_hint)
         assert read_only == (tool.name in READ_ONLY), tool.name
+
+
+# --- confirmation is a separate grant (issue #201) ---------------------------
+#
+# The allowlist that permits recording progress must not silently permit
+# confirming it. continuum_confirm sits behind its own secret, refused by
+# default, so the self-certification exploit (record_progress -> checkpoint ->
+# confirm -> resume with safe=True) is unreachable for an agent that only has
+# the ordinary mutating grant.
+
+
+def test_a_default_confirm_policy_refuses_everything() -> None:
+    """Fail closed: no configured secret means every confirmation refuses."""
+    policy = load_confirm(env={})
+    assert policy.disabled
+    with pytest.raises(NotAuthenticated, match=CONFIRM_ENV_VAR):
+        policy.verify(None)
+    with pytest.raises(NotAuthenticated, match=CONFIRM_ENV_VAR):
+        policy.verify("anything")
+
+
+def test_load_confirm_reads_the_env_var() -> None:
+    policy = load_confirm(env={CONFIRM_ENV_VAR: "human-only"})
+    assert not policy.disabled
+    assert policy.source == CONFIRM_ENV_VAR
+    policy.verify("human-only")
+    with pytest.raises(NotAuthenticated, match="confirmation secret"):
+        policy.verify(None)
+    with pytest.raises(NotAuthenticated, match="confirmation secret"):
+        policy.verify("wrong")
+
+
+def test_an_explicit_confirm_argument_wins_over_the_env() -> None:
+    policy = load_confirm("arg-secret", env={CONFIRM_ENV_VAR: "env-secret"})
+    policy.verify("arg-secret")
+    with pytest.raises(NotAuthenticated):
+        policy.verify("env-secret")
+
+
+def test_an_empty_confirm_secret_refuses_rather_than_opening_the_door() -> None:
+    """The PR #3 lesson applies here too: a misconfiguration refuses."""
+    policy = ConfirmPolicy("")
+    assert policy.disabled
+    with pytest.raises(NotAuthenticated, match=CONFIRM_ENV_VAR):
+        policy.verify("")
+    with pytest.raises(NotAuthenticated, match=CONFIRM_ENV_VAR):
+        policy.verify(None)
+
+
+@pytest.mark.asyncio
+async def test_an_allowlisted_agent_cannot_confirm_without_the_secret(
+    server: Any, store: SQLiteStorage
+) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    await seed(server)
+    before = store.last_sequence("run_1")
+
+    with pytest.raises(ToolError, match=CONFIRM_ENV_VAR):
+        await server.call_tool(
+            "continuum_confirm", {"run_id": "run_1"}, context=fake_context(ALLOWED)
+        )
+
+    # The refusal precedes the write: no REVIEW_CONFIRMED event exists.
+    assert store.last_sequence("run_1") == before
+
+
+@pytest.mark.asyncio
+async def test_confirmation_over_mcp_needs_the_dedicated_secret(
+    store: SQLiteStorage,
+) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    srv, _ = build_server(
+        storage=store,
+        policy=AuthorizationPolicy([ALLOWED]),
+        auth=AuthPolicy("session-secret"),
+        confirm_auth=ConfirmPolicy("confirm-secret"),
+    )
+
+    # The session secret alone is not enough; the confirm secret is distinct.
+    with pytest.raises(ToolError, match="confirmation secret"):
+        await srv.call_tool(
+            "continuum_confirm",
+            {"run_id": "run_1"},
+            context=fake_context(ALLOWED, auth_token="session-secret"),
+        )
+    with pytest.raises(ToolError):
+        await srv.call_tool(
+            "continuum_confirm",
+            {"run_id": "run_1"},
+            context=fake_context(ALLOWED, auth_token=None),
+        )
+
+    # Other mutating tools still demand the session secret...
+    result = await srv.call_tool(
+        "continuum_record_progress",
+        {"run_id": "run_1", "completed": 1, "goal": "g"},
+        context=fake_context(ALLOWED, auth_token="session-secret"),
+    )
+    assert json.loads(result.content[0].text)["completed"] == 1
+
+    # ...and presenting the dedicated confirm secret confirms the run.
+    result = await srv.call_tool(
+        "continuum_confirm",
+        {"run_id": "run_1"},
+        context=fake_context(ALLOWED, auth_token="confirm-secret"),
+    )
+    payload = json.loads(result.content[0].text)
+    assert "mode" in payload
+
+
+# --- one secret must not unlock both progress and confirmation (PR #206) -----
+
+
+def test_a_confirm_secret_matching_the_session_secret_is_refused_at_startup(
+    store: SQLiteStorage,
+) -> None:
+    """Reusing the session secret as the confirm secret makes the gate a no-op.
+
+    Every holder of a mutating credential would also hold the confirmation
+    credential, so build_server refuses the configuration instead of running
+    with a boundary that protects nothing.
+    """
+    with pytest.raises(ValueError, match=CONFIRM_ENV_VAR):
+        build_server(
+            storage=store,
+            policy=AuthorizationPolicy([ALLOWED]),
+            auth=AuthPolicy("same-secret"),
+            confirm_auth=ConfirmPolicy("same-secret"),
+        )
+
+
+def test_a_confirm_secret_matching_a_per_client_token_is_refused_at_startup(
+    store: SQLiteStorage,
+) -> None:
+    with pytest.raises(ValueError, match="trusted-agent"):
+        build_server(
+            storage=store,
+            policy=AuthorizationPolicy([ALLOWED]),
+            auth=AuthPolicy(tokens={ALLOWED: "tok-a"}),
+            confirm_auth=ConfirmPolicy("tok-a"),
+        )
+
+
+def test_a_distinct_confirm_secret_starts_normally(store: SQLiteStorage) -> None:
+    srv, _ = build_server(
+        storage=store,
+        policy=AuthorizationPolicy([ALLOWED]),
+        auth=AuthPolicy("session-secret"),
+        confirm_auth=ConfirmPolicy("confirm-secret"),
+    )
+    assert srv is not None
+
+
+def test_an_unconfigured_confirm_secret_never_conflicts(store: SQLiteStorage) -> None:
+    """The refusing default has no secret to collide with."""
+    srv, _ = build_server(
+        storage=store,
+        policy=AuthorizationPolicy([ALLOWED]),
+        auth=AuthPolicy("session-secret"),
+    )
+    assert srv is not None
+
+
+# --- a refusal has to say why -------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_raised_as_tool_error_carrying_its_reason(
+    store: SQLiteStorage,
+) -> None:
+    """The reason must survive the SDK's error wrapping, not just exist.
+
+    Refusing is part of this server's contract, so the caller has to be told
+    which refusal it hit. The SDK decides that by exception type: from mcp 2.1.0
+    an exception it does not recognise becomes UnexpectedToolError whose message
+    is only "Error executing tool <name>", with the cause demoted to __cause__.
+    Authz raises PermissionError subclasses, so on 2.1.0 a refused caller learned
+    nothing: not that it was a permissions problem, and not the env var that
+    grants access. This asserts the message itself, because asserting only the
+    type would have passed throughout that regression.
+    """
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    server, _ = build_server(storage=store, policy=AuthorizationPolicy([ALLOWED]))
+
+    with pytest.raises(ToolError) as caught:
+        await server.call_tool(
+            "continuum_record_progress",
+            {"run_id": "r", "completed": 1, "total": 2, "goal": "g"},
+            context=fake_context("a-stranger"),
+        )
+    message = str(caught.value)
+    assert "not permitted" in message, message
+    assert CLIENT_TOKENS_ENV_VAR in message or "CONTINUUM_MCP_MUTATING_CLIENTS" in message, message
+
+
+@pytest.mark.asyncio
+async def test_a_validation_refusal_also_carries_its_reason(store: SQLiteStorage) -> None:
+    """Same contract for the caller's own mistakes, not only for authz.
+
+    A progress counter that breaks its own arithmetic is a refusal the caller can
+    act on, so the numbers have to reach it. These are ValueError, which the SDK
+    also treats as unexpected.
+    """
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    server, _ = build_server(storage=store, policy=AuthorizationPolicy([ALLOWED]))
+
+    with pytest.raises(ToolError, match="exceeds total"):
+        await server.call_tool(
+            "continuum_record_progress",
+            {"run_id": "r", "completed": 999, "total": 10, "goal": "g"},
+            context=fake_context(ALLOWED),
+        )
+
+
+@pytest.mark.asyncio
+async def test_confirm_handler_refusal_carries_its_reason(store: SQLiteStorage) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    server, _ = build_server(
+        storage=store,
+        policy=AuthorizationPolicy([ALLOWED]),
+        confirm_auth=ConfirmPolicy("confirm-secret"),
+    )
+
+    with pytest.raises(ToolError, match="no such run: 'missing'"):
+        await server.call_tool(
+            "continuum_confirm",
+            {"run_id": "missing"},
+            context=fake_context(ALLOWED, auth_token="confirm-secret"),
+        )

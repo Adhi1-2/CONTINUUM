@@ -1,4 +1,4 @@
-# CONTINUUM Security Extension — Problem Statement
+# CONTINUUM Security Extension, Problem Statement
 
 This document is the first deliverable of the Security Extension work unit
 (spec Section 5, step 1). It states, per extension, the source paper, the
@@ -11,7 +11,7 @@ claim to have "solved" a paper's open problem.
 
 ---
 
-## Extension 1 — Secure Planning Loop
+## Extension 1, Secure Planning Loop
 
 - **Paper:** Foerster et al., *CaMeLs Can Use Computers Too*, arXiv:2601.09923
   (March 2026).
@@ -24,11 +24,11 @@ claim to have "solved" a paper's open problem.
   pixel patch is not defeated by what we add. We do not claim otherwise.
 - **Our fix (additive):** we extend CONTINUUM's existing, proven
   `REQUIRES_REVIEW → request_human` path with two new primitives:
-  - `ObservationProvenance` — every perception claim is recorded with a
+  - `ObservationProvenance`, every perception claim is recorded with a
     trust tier (`verified` / `unverified` / `contested`), the verifier that
     produced it, a content hash of the screenshot/DOM slice, and the raw claim
     text (never mutated, for audit).
-  - `PlanBranch` — the planner emits branches tagged with a `risk_tier`
+  - `PlanBranch`, the planner emits branches tagged with a `risk_tier`
     (`low` / `medium` / `high`) and whether the branch depends on a perception
     claim.
   - A trust gate (`resolve_branch`) combines the two: a high-risk branch
@@ -42,7 +42,7 @@ claim to have "solved" a paper's open problem.
 
 ---
 
-## Extension 2 — Periodic Revalidation
+## Extension 2, Periodic Revalidation
 
 - **Paper:** Yuan et al., *OSWorld 2.0*, arXiv:2606.29537 (June 2026).
 - **Problem named as unsolved:** *Long-horizon state drift.* Agent effort

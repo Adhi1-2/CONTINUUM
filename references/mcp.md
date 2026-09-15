@@ -9,7 +9,7 @@ expendable:
 
 1. `<db>-shm` is a shared-memory index and genuinely is reconstructable, so it is
    removed and the open retried. When a stale `-shm` was the blocker this is
-   lossless — SQLite replays the `-wal` and every committed transaction survives.
+   lossless, SQLite replays the `-wal` and every committed transaction survives.
 2. `<db>-wal` is *not* reconstructable: it holds transactions committed but not
    yet checkpointed into the main database. On a write-heavy run that can be the
    whole history. It is therefore moved aside rather than unlinked, and restored
@@ -28,7 +28,7 @@ help, and the re-raise when there is nothing to clear. Recorded in CHANGELOG.md
 under Fixed.
 
 **The server is verified usable through Claude Code.** Registered as an MCP
-server, it reports `✔ Connected`, exposes all ten tools with the correct
+server, it reports `✔ Connected`, exposes all twelve tools with the correct
 read-only/mutating split, and the full `continuum_record_progress` to
 `continuum_checkpoint` to `continuum_intercept_action` to
 `continuum_complete_action` to `continuum_resume` cycle returns correct,
@@ -36,8 +36,8 @@ durable JSON. Authorization denies by default. That claim is proven end to end
 over the real stdio protocol, and the unit suite covers every tool.
 
 **The surface has been audited adversarially.** Beyond confirming the documented
-behaviour, the audit tested the dangerous inverse of each claim — not only that
-duplicate side effects are suppressed, but that genuinely new work is not — and
+behaviour, the audit tested the dangerous inverse of each claim, not only that
+duplicate side effects are suppressed, but that genuinely new work is not, and
 verified every result against the SQLite store instead of trusting tool output.
 It found that `env` supplied to `continuum_checkpoint` was recorded as a snapshot
 only, so environment drift was rendered in `environment_changes` while the verdict

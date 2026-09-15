@@ -1,0 +1,22 @@
+{
+  "name": "CONTINUUM",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "postCreateCommand": "python -m pip install --user uv && python -m uv sync --extra dev && python -m uv run continuum init",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker"
+      ]
+    }
+  },
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "continuum dashboard",
+      "onAutoForward": "notify"
+    }
+  },
+  "remoteUser": "vscode"
+}

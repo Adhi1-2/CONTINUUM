@@ -1,0 +1,87 @@
+name: PR Status Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request_review:
+    types: [submitted]
+
+# Phase 1 of the status-label sync. Runs triggered by a review on a
+# fork-originated PR receive a read-only GITHUB_TOKEN regardless of the
+# permissions declared here, so no writes are attempted in this workflow.
+# The intended change is recorded as an artifact and applied by the
+# "PR Status Labels Apply" workflow, which runs in the base repository
+# context via workflow_run and holds real write access.
+permissions: {}
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record intended label change
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require("fs");
+
+            const isReview = context.eventName === "pull_request_review";
+            // Both event payloads carry the PR at payload.pull_request
+            const pr = context.payload.pull_request;
+
+            let intent;
+
+            if (isReview) {
+              const state = context.payload.review.state;
+              if (state === "approved") {
+                intent = {
+                  pr_number: pr.number,
+                  add_label: "ready to merge",
+                  remove_labels: ["awaiting review", "changes requested"],
+                  thank: true,
+                };
+              } else if (state === "changes_requested") {
+                intent = {
+                  pr_number: pr.number,
+                  add_label: "changes requested",
+                  remove_labels: ["awaiting review", "ready to merge"],
+                  thank: false,
+                };
+              } else {
+                // COMMENT reviews do not change approval status.
+                // No artifact is written; the apply workflow skips.
+                core.info("Comment review: nothing to do.");
+                return;
+              }
+            } else {
+              const action = context.payload.action;
+              if (action === "synchronize") {
+                // New commits pushed: approval no longer reflects HEAD
+                intent = {
+                  pr_number: pr.number,
+                  add_label: null,
+                  remove_labels: ["ready to merge"],
+                  thank: false,
+                  // Post a visible notice, but only if the apply step
+                  // actually finds and removes a stale ready-to-merge.
+                  notify_on_reset: true,
+                };
+              } else {
+                // opened or reopened
+                intent = {
+                  pr_number: pr.number,
+                  add_label: "awaiting review",
+                  remove_labels: ["ready to merge", "changes requested"],
+                  thank: false,
+                };
+              }
+            }
+
+            core.info(`Recorded intent: ${JSON.stringify(intent)}`);
+            fs.writeFileSync("intent.json", JSON.stringify(intent));
+
+      - name: Upload intent artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-status-intent
+          path: intent.json
+          retention-days: 1

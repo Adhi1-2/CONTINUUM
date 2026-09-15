@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -36,10 +37,19 @@ class GenericAgentAdapter(AgentAdapter):
     or interact directly with storage handles, event log streams, or ledger objects.
     """
 
-    def __init__(self, storage: Storage, *, engine: RecoveryEngine | None = None) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        *,
+        engine: RecoveryEngine | None = None,
+        auto_file: str | None = None,
+        auto_total: int | None = None,
+    ) -> None:
         self.storage = storage
         self.manager = CheckpointManager(storage)
         self.engine = engine or RecoveryEngine(storage)
+        self.auto_file = auto_file
+        self.auto_total = auto_total
 
     def start_run(
         self,
@@ -64,6 +74,7 @@ class GenericAgentAdapter(AgentAdapter):
         environment: EnvironmentSnapshot | None = None,
         reason: str = "",
     ) -> StateCheckpoint:
+        """Capture semantic state and optionally pin its environment."""
         # A snapshot alone cannot invalidate a checkpoint: the validator decides
         # staleness per declared dependency and returns early when a state has
         # none, so a checkpoint carrying only a snapshot would report
@@ -72,6 +83,15 @@ class GenericAgentAdapter(AgentAdapter):
         # to invalidate. Mirrors the MCP server and serve sidecar (issue #25).
         if environment is not None:
             self._declare_dependencies(run_id, environment)
+        # Auto mode: the file is ground truth for progress. The derived events
+        # are appended before the checkpoint so the checkpoint captures them,
+        # and record_file_progress is a no-op when the count is unchanged.
+        if self.auto_file is not None and self.auto_total is not None:
+            from continuum.hooks import record_file_progress
+
+            record_file_progress(self.manager, run_id, self.auto_file, self.auto_total)
+            # Reproject so the checkpoint captures the derived progress
+            state = project(run_id, self.storage.read_events(run_id))
         return self.manager.checkpoint(
             run_id,
             state=state,
@@ -120,6 +140,7 @@ class GenericAgentAdapter(AgentAdapter):
         *,
         replay: bool = True,
     ) -> SemanticState:
+        """Restore the latest checkpointed semantic state for a run."""
         restored = self.manager.restore(run_id, replay=replay)
         return restored.state
 
@@ -134,6 +155,7 @@ class GenericAgentAdapter(AgentAdapter):
         scoped_to_run: bool = True,
         on_unknown: Callable[[Any], ActionOutcome | None] | None = None,
         key: str | None = None,
+        dep_scope: str | None = None,
     ) -> Any:
         """Intercept and safely execute an external side effect.
 
@@ -153,7 +175,7 @@ class GenericAgentAdapter(AgentAdapter):
         call does not prove the side effect failed to occur: a timeout or a
         dropped connection means the request may already have landed. Recording
         it as a definite failure would remove it from ``ledger.pending()``, hide
-        it from reconciliation, and let a later retry duplicate the effect —
+        it from reconciliation, and let a later retry duplicate the effect,
         exactly the hazard the ledger exists to prevent.
 
         There is no exception type in this layer that reliably proves nothing
@@ -171,6 +193,7 @@ class GenericAgentAdapter(AgentAdapter):
             scoped_to_run=scoped_to_run,
             on_unknown=on_unknown,
             key=key,
+            dep_scope=dep_scope,
         )
 
         if not outcome.fresh:
@@ -200,7 +223,29 @@ class GenericAgentAdapter(AgentAdapter):
         needs_envelope = not isinstance(val, dict) or RESULT_ENVELOPE_KEY in val
         result_dict = {RESULT_ENVELOPE_KEY: val} if needs_envelope else val
         ledger.complete(outcome.key, result=result_dict)
+        self._auto_progress(run_id)
         return val
+
+    def _auto_progress(self, run_id: str) -> None:
+        """Fire the opt-in auto hooks after a turn without blocking the caller.
+
+        Mirrors the file into the log when the derived count changed (cheap:
+        one small read plus an event-log comparison), then lets the policy
+        decide whether a checkpoint write is due. The write itself goes to the
+        shared background executor, so the agent's turn is never blocked on
+        SQLite I/O. This is what makes durability automatic for every harness
+        using the adapter: no model tool call and no prompt mention of
+        CONTINUUM required (issue 191).
+        """
+        if self.auto_file is None or self.auto_total is None:
+            return
+        from continuum.hooks import make_async_file_derived_progress_hook
+
+        hook = make_async_file_derived_progress_hook(
+            self.manager, run_id, self.auto_file, self.auto_total
+        )
+        with contextlib.suppress(Exception):  # durability must never break the turn
+            hook()
 
     def resume(
         self,
@@ -210,6 +255,7 @@ class GenericAgentAdapter(AgentAdapter):
         expected_model: str | None = None,
         replay: bool = True,
     ) -> RecoveryDecision:
+        """Assess whether a run may safely resume under current conditions."""
         return self.engine.assess(
             run_id,
             current_environment=current_environment,

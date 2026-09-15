@@ -16,14 +16,14 @@ The protocol
 
 A crash can land anywhere:
 
-* **before 1** — nothing happened. Retry is safe.
-* **between 1 and 2** — intent recorded, effect may or may not have occurred.
+* **before 1**: nothing happened. Retry is safe.
+* **between 1 and 2**: intent recorded, effect may or may not have occurred.
   On recovery the action is ``STARTED`` with no result: **the effect is of
   unknown status.** The ledger refuses to guess.
-* **between 2 and 3** — the effect definitely happened but was never recorded.
+* **between 2 and 3**: the effect definitely happened but was never recorded.
   Indistinguishable from the previous case *from the ledger alone*, which is
   precisely why it must not be resolved by assumption.
-* **after 3** — fully recorded. A repeat call returns the stored result.
+* **after 3**: fully recorded. A repeat call returns the stored result.
 
 Why not just retry?
 -------------------
@@ -32,7 +32,7 @@ Retrying an unrecorded action is only safe if the operation is naturally
 idempotent. Creating a GitHub issue, charging a card and sending an email are
 not. Retrying duplicates them; skipping may drop them. Neither default is
 correct, so the ledger raises ``UnknownSideEffect`` and requires the caller to
-supply a reconciler — usually a cheap read against the external system that can
+supply a reconciler, usually a cheap read against the external system that can
 answer "did this actually happen?".
 
 This is honest at-least-once with mandatory reconciliation, not exactly-once.
@@ -42,27 +42,74 @@ The distinction is documented rather than marketed away.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from typing import Any
+from datetime import timedelta
+from functools import wraps
+from heapq import merge
+from pathlib import Path
+from typing import Any, Concatenate, ParamSpec, TypeVar
 
+from continuum.actions.grants import GrantDenied, normalize_grant, scan_grants
 from continuum.actions.idempotency import (
     IdempotencyKey,
     arguments_hash,
     idempotency_key,
     identity_tokens,
     leaf_tokens,
+    location_tokens,
+    locations_agree,
+    resolve_authorization_id,
 )
-from continuum.events import EventType
-from continuum.models import Action, ActionStatus, UnknownSideEffect, utcnow
+from continuum.budgets import (
+    DEFAULT_BUDGETS_PATH,
+    BudgetConfigError,
+    ensure_authorization_entry,
+    increment,
+    load_budgets,
+    save_budgets,
+    would_refuse,
+)
+from continuum.concurrency.lease import LeaseCoordinator
+from continuum.events import Event, EventType
+from continuum.models import Action, ActionStatus, ConsumedInputs, Origin, UnknownSideEffect, utcnow
 from continuum.security.hashing import stable_hash
 from continuum.storage.base import Storage
+
+_ACTION_EVENT_TYPES = (
+    EventType.ACTION_RECORDED,
+    EventType.ACTION_RECONCILED,
+    EventType.ACTION_COMPENSATED,
+)
+
+
+def fold_action_events(events: Any) -> dict[str, Action]:
+    """Fold action events into ``{key: Action}``, last write per key wins.
+
+    Shared by :meth:`ActionLedger._replay` and the cross-run scan behind
+    unscoped claims so both read the log with identical semantics.
+    """
+    actions: dict[str, Action] = {}
+    for event in events:
+        if event.type not in _ACTION_EVENT_TYPES:
+            continue
+        payload = dict(event.payload)
+        key = str(payload.get("key", ""))
+        if not key:
+            continue
+        actions[key] = Action.model_validate(payload["action"])
+    return actions
+
 
 __all__ = [
     "ActionLedger",
     "ActionOutcome",
     "LedgerError",
     "DuplicateAction",
+    "ClaimLockError",
+    "fold_action_events",
+    "forensic_join_across_runs",
 ]
 
 
@@ -177,6 +224,26 @@ def _superset_derives_from_subset(subset: frozenset[str], superset: frozenset[st
     return True
 
 
+def _normalize_consumed_inputs(
+    consumed: ConsumedInputs | Mapping[str, Any] | None,
+) -> ConsumedInputs | None:
+    """Validate and normalize caller-supplied consumed_inputs.
+
+    Accepts a ``ConsumedInputs`` instance, a plain mapping with
+    ``checkpoint_seq``, ``event_positions``, ``action_ids``, or None.
+    Returns a validated ``ConsumedInputs`` or None when nothing was
+    supplied. Invalid shapes raise ``ValueError`` so the caller learns
+    at the boundary rather than storing an un-auditable commitment.
+    """
+    if consumed is None:
+        return None
+    if isinstance(consumed, ConsumedInputs):
+        return consumed
+    if isinstance(consumed, Mapping):
+        return ConsumedInputs.model_validate(dict(consumed))
+    raise ValueError("consumed_inputs must be a mapping or ConsumedInputs")
+
+
 class LedgerError(RuntimeError):
     """The ledger was used in a way that cannot be made safe."""
 
@@ -185,12 +252,51 @@ class DuplicateAction(LedgerError):
     """A second attempt was made while the first is still in flight."""
 
 
+class ClaimLockError(LedgerError):
+    """The run's lease is held elsewhere, so this ledger must not write.
+
+    Raised instead of proceeding, because the alternative -- claiming anyway --
+    is the duplicate side effect this ledger exists to prevent. A caller seeing
+    this should back off and retry, not force the write: another agent owns the
+    run right now, and whatever it is claiming may be the very action this
+    caller wanted.
+    """
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _single_writer(
+    method: Callable[Concatenate[ActionLedger, _P], _R],
+) -> Callable[Concatenate[ActionLedger, _P], _R]:
+    """Run a mutating ledger method while holding the run's lease.
+
+    Every method that folds the log and then appends to it is a
+    read-modify-write, so every one of them races. Marking them declaratively
+    keeps that list honest: a new mutator without this decorator is visibly
+    missing something, whereas a forgotten ``with self._locked()`` deep inside a
+    hundred-line body is not.
+
+    A ledger built without a lease is unaffected, which is what keeps the
+    single-process path exactly as it was.
+    """
+
+    @wraps(method)
+    def wrapper(self: ActionLedger, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        """Acquire the ledger lease lock before invoking the mutating method."""
+        with self._locked():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 @dataclass(frozen=True, slots=True)
 class ActionOutcome:
     """What a claim returned.
 
     ``fresh`` distinguishes "go ahead and perform this" from "already done,
-    here is the previous result" — the single most important bit for callers.
+    here is the previous result"; the single most important bit for callers.
     """
 
     key: IdempotencyKey
@@ -199,14 +305,17 @@ class ActionOutcome:
 
     @property
     def already_completed(self) -> bool:
+        """True when the claim hit an existing already-completed action."""
         return not self.fresh and self.action.status is ActionStatus.COMPLETED
 
     @property
     def result(self) -> Mapping[str, Any] | None:
+        """The recorded result dictionary from the underlying action, if any."""
         return self.action.result
 
     @property
     def external_id(self) -> str | None:
+        """The external system identifier associated with the action, if known."""
         return self.action.external_id
 
 
@@ -215,33 +324,291 @@ class ActionLedger:
 
     Actions are stored as events, so the ledger inherits the event log's
     ordering, durability and tamper-evidence rather than inventing its own.
+
+    Single-writer per run. Deduplication is a claim-then-check against the
+    folded log, not an atomic compare-and-set, so two processes claiming the
+    same key at the same instant both read "no prior slot" and both open one.
+    The ``docs/multi_agent_isolation.md`` ownership model applies: one run, one
+    owner at a time.
+
+    Pass ``lease`` to have the ledger enforce that itself. Every mutating
+    method then acquires the run's lease for ``holder_id`` before it folds the
+    log, and releases it after the append, so concurrent claimants on one key
+    collapse to a single winner; the losers raise :class:`ClaimLockError`
+    rather than opening a parallel slot. ``holder_id`` is required alongside a
+    lease and must be a stable agent identity, not a shared constant: a default
+    would make every process look like the same holder and quietly disable the
+    protection it was passed to provide.
+
+    The lease is reentrant for its own holder, so the documented pattern of a
+    caller acquiring the run lease and *then* using the ledger still works --
+    the ledger recognises the lease as already its own, and leaves releasing it
+    to whoever acquired it.
+
+    Without ``lease`` the behaviour is exactly as before: unsynchronised, and
+    only as strong as the caller's own serialization. That remains the default
+    because the single-process path has nothing to serialise against.
+
+    Two limits are worth stating rather than implying. The lease is scoped to
+    one ``run_id``, so an unscoped claim (``scoped_to_run=False``) racing the
+    same key from *another* run is not covered by this run's lease; both
+    claimants would need to agree on a lease to be safe. And the claim is still
+    not atomic in storage, so a caller that mixes leased and unleased ledgers on
+    one run gets the weaker guarantee.
     """
 
-    def __init__(self, storage: Storage, run_id: str) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        run_id: str,
+        *,
+        lease: LeaseCoordinator | None = None,
+        holder_id: str | None = None,
+        ttl: timedelta | None = None,
+        source: Origin = Origin.DETERMINISTIC,
+    ) -> None:
+        """Bind this ledger to a run.
+
+        ``source`` stamps the action records this ledger writes
+        (issue #612): the writer, not the derivation. Callers whose
+        claims are asserted by an autonomous agent about its own work
+        pass ``Origin.EXTERNAL_AGENT`` so the validator holds the run
+        for review. Denial records stay ``DETERMINISTIC``: they are the
+        ledger's own verdicts, not caller assertions.
+        """
+        if lease is not None and not holder_id:
+            raise ValueError(
+                "holder_id is required when a lease is supplied: a shared default "
+                "would make two processes appear to be the same lease holder and "
+                "silently defeat the serialization. Pass a stable agent identity."
+            )
         self.storage = storage
         self.run_id = run_id
+        self._source = source
+        self._lease = lease
+        self._holder_id = holder_id or ""
+        self._ttl = ttl
+
+    # -- single-writer ---------------------------------------------------- #
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold the run's lease for the duration of one mutating call.
+
+        Reentrant for the lease's own holder. A caller that already acquired the
+        run lease (the pattern ``docs/multi_agent_isolation.md`` describes, and
+        the one ``continuum serve`` follows) passes straight through, and the
+        lease is left for that caller to release. Without this, the ledger would
+        fail every claim made by an agent that had correctly taken ownership of
+        the run first, which is precisely the well-behaved caller.
+        """
+        if self._lease is None:
+            yield
+            return
+        if self._lease.is_held(self.run_id, self._holder_id):
+            # Already ours. Do not release on the way out: the outer holder owns
+            # the lease's lifetime and may still need it.
+            yield
+            return
+        if not self._lease.acquire(self.run_id, self._holder_id, self._ttl):
+            raise ClaimLockError(
+                f"run {self.run_id!r} is leased to {self._lease.holder(self.run_id)!r}; "
+                f"{self._holder_id!r} must not write to the action ledger while another "
+                f"agent owns the run. Retry once the lease is free."
+            )
+        try:
+            yield
+        finally:
+            self._lease.release(self.run_id, self._holder_id)
+
+    # -- budget drawdown (issue #413) ------------------------------------- #
+
+    def _budget_path(self) -> Path:
+        """Registry path, overridable for tests via env."""
+        return Path(os.environ.get("CONTINUUM_BUDGETS_PATH", DEFAULT_BUDGETS_PATH))
+
+    def _budget_authorization_id(
+        self,
+        action_type: str,
+        key: str | None,
+        arguments: Mapping[str, Any] | None,
+        volatile: Sequence[str],
+    ) -> str | None:
+        """Stable authorization bucket for this operation, or None when unbound.
+
+        For budgets the bucket must survive fresh-key rotation (issue #390):
+        two attempts with different idempotency keys but the same resource
+        tokens (e.g. same invoice id) are the same authorization and must
+        draw down the same counter.  Passing the explicit key would give
+        each fresh key its own bucket and defeat the cap-amplification fix
+        (#413), so the helper ignores an explicit key and derives from
+        resource tokens alone. Ledger anchoring is not used here so a
+        prior failed attempt does not make a retry look unbound.
+        """
+        try:
+            return resolve_authorization_id(
+                action_type, None, arguments, volatile=volatile, ledger=None
+            )
+        except Exception:
+            return None
+
+    def _budget_consume_claim(
+        self,
+        action_type: str,
+        authorization_id: str,
+    ) -> None:
+        """Consume one authorization-bound budget slot for a fresh attempt.
+
+        Fail closed: an unreadable or malformed registry refuses the claim
+        rather than letting it proceed with no accounting. All writes go
+        through the pure helpers from ``budgets.py``.
+
+        When the registry file does not exist, budgets are treated as
+        unconfigured and no drawdown happens. This keeps runs and tests
+        without authorization data byte-identical to today while still
+        enforcing caps once an operator creates the file.
+        """
+        path = self._budget_path()
+        if not path.exists():
+            return
+        try:
+            raw = load_budgets(path)
+        except BudgetConfigError as exc:
+            raise LedgerError(f"budget registry invalid: {exc}") from exc
+        entry = ensure_authorization_entry(raw, action_type, authorization_id)
+        refused, reason = would_refuse(raw, action_type, authorization_id)
+        if refused:
+            remaining = 0
+            try:
+                from continuum.budgets import get_remaining as _get_rem
+
+                remaining = _get_rem(raw, action_type, authorization_id) or 0
+            except Exception:
+                remaining = 0
+            counter = int(entry.get("counter", 0))
+            max_attempts = int(entry.get("max_attempts", 0))
+            raise LedgerError(
+                f"budget exhausted for {action_type!r} / {authorization_id!r} "
+                f"({counter} of {max_attempts} used, {remaining} remaining; "
+                f"{reason})"
+            )
+        increment(raw, action_type, authorization_id)
+        save_budgets(path, raw)
+
+    def _budget_consume_settlement(
+        self,
+        action_type: str,
+        authorization_id: str,
+    ) -> None:
+        """Consume one slot for a confirmation/settlement event.
+
+        Settlements share the same per-authorization counter as claims, so a
+        completed confirmation visibly draws down the budget and a rapid
+        complete/re-claim cannot amplify the cap. Failures to read or write
+        the registry are swallowed here: a settlement must land even if the
+        budget file is momentarily unreadable, otherwise the ledger would
+        refuse to record that an effect happened.
+        """
+        path = self._budget_path()
+        if not path.exists():
+            return
+        try:
+            raw = load_budgets(path)
+        except Exception:
+            return
+        try:
+            ensure_authorization_entry(raw, action_type, authorization_id)
+        except Exception:
+            return
+        try:
+            increment(raw, action_type, authorization_id)
+        except Exception:
+            return
+        try:
+            save_budgets(path, raw)
+        except Exception:
+            return
 
     # -- reading ---------------------------------------------------------- #
 
     def _replay(self) -> dict[str, Action]:
-        """Rebuild the ledger by folding action events. Cheap and verifiable."""
-        actions: dict[str, Action] = {}
-        for event in self.storage.read_events(self.run_id):
-            if event.type not in (
-                EventType.ACTION_RECORDED,
-                EventType.ACTION_RECONCILED,
-                EventType.ACTION_COMPENSATED,
-            ):
+        """Rebuild the ledger by folding action events. Cheap and verifiable.
+
+        Archived events (compaction, issue #239) fold too: a claim settled
+        before compaction must keep protecting afterwards, or exactly-once
+        would quietly reset at the anchor boundary and a month-old side
+        effect could fire a second time. Both streams are already sequence-
+        sorted, so they merge linearly instead of paying a re-sort on this
+        hot path.
+        """
+        merged = merge(
+            self.storage.read_archived_events(self.run_id),
+            self.storage.read_events(self.run_id),
+            key=lambda e: e.sequence,
+        )
+        return fold_action_events(merged)
+
+    def folded(self) -> dict[str, Action]:
+        """Public view of the ``key -> newest action`` fold, archive included."""
+        return self._replay()
+
+    def _foreign_action(self, key: str) -> Action | None:
+        """Find ``key`` in another run's ledger, for unscoped claims.
+
+        An unscoped idempotency key carries no run prefix, so the same key is
+        directly comparable across runs. When a claim declares itself
+        run-global (``scoped_to_run=False``), honouring that promise requires
+        looking at every other run in the store before opening a fresh slot,
+        not just this run's log. Returns the most recent action recorded under
+        ``key`` outside this run, or None.
+
+        Engines that maintain the action index (issue #216) answer this as an
+        indexed read; the rest pay the historical scan, O(total logged
+        events), only on the unscoped path after the local lookup missed.
+        """
+        if getattr(self.storage, "supports_action_index", False):
+            return self.storage.foreign_action(key, exclude_run=self.run_id)
+        found: Action | None = None
+        for run in self.storage.list_runs():
+            if run.run_id == self.run_id:
                 continue
-            payload = dict(event.payload)
-            key = str(payload.get("key", ""))
-            if not key:
-                continue
-            actions[key] = Action.model_validate(payload["action"])
-        return actions
+            folded = fold_action_events(self.storage.read_all_events(run.run_id))
+            candidate = folded.get(key)
+            if candidate is not None:
+                found = candidate
+        return found
 
     def get(self, key: str) -> Action | None:
+        """Return the current action state for ``key``, or ``None`` if unclaimed."""
         return self._replay().get(key)
+
+    def resolve_key(self, identifier: str) -> str | None:
+        """The ledger key for ``identifier``, which may be a key or an ``action_id``.
+
+        The ledger is keyed by idempotency key, but almost everything a caller
+        reads back is keyed by ``action_id``: ``Action.action_id`` itself, the
+        recovery plan's ``reconcile_action:<target>`` steps, the contract's
+        ``required_actions``, and the rendered report. So the identifier a
+        recovering caller has in hand is usually the one the settle methods did
+        not accept, and the two are indistinguishable by shape (issue #367).
+
+        Resolving both here rather than at one call site means every settle
+        method inherits it, and the recovery guidance that names an ``action_id``
+        becomes executable as written instead of needing to be rewritten in terms
+        of an identifier no output exposes.
+
+        The mapping is unambiguous: one key holds one action, and a re-claim after
+        FAILED or COMPENSATED copies the existing action, so ``action_id`` stays
+        with its key rather than being reissued. Returns ``None`` when neither
+        space matches.
+        """
+        folded = self._replay()
+        if identifier in folded:
+            return identifier
+        for stored_key, action in folded.items():
+            if action.action_id == identifier:
+                return stored_key
+        return None
 
     def _identity_match(
         self,
@@ -270,6 +637,16 @@ class ActionLedger:
         second side effect would be silently swallowed -- the exact failure this
         ledger exists to prevent.
 
+        Leaf comparison alone was not enough either, for the same reason in a
+        different disguise: two files with the same name in different directories
+        share every leaf, so ``/tenants/acme/report.csv`` matched
+        ``/tenants/globex/report.csv`` and globex was never notified (issue #365).
+        A match therefore also requires the *locations* to agree, which
+        ``locations_agree`` decides by suffix rather than equality so the drift
+        case that motivated leaf comparison (``invoices/INV-5.pdf`` for
+        ``/data/invoices/INV-5.pdf``) still matches. A side carrying no path at
+        all makes no claim about location and so contradicts nothing.
+
         Containment on its own is still too loose: a completed action folds its
         outcome ``external_id`` and any optional descriptive argument into its
         token set, so the stored set is a *superset* of a sparser re-claim even
@@ -290,7 +667,9 @@ class ActionLedger:
         # common to every claim in the run, so it must never count as a
         # resource token when deciding whether two claims are the same work.
         plumbing = leaf_tokens(identity_tokens(external_id=self.run_id))
-        incoming = leaf_tokens(identity_tokens(arguments, volatile=volatile)) - plumbing
+        incoming_all = identity_tokens(arguments, volatile=volatile)
+        incoming = leaf_tokens(incoming_all) - plumbing
+        incoming_where = location_tokens(incoming_all)
         if not incoming:
             return None
 
@@ -303,11 +682,15 @@ class ActionLedger:
             # is never present on the incoming claim, so folding it into ``known``
             # would make the stored set a systematic superset of every sparser
             # re-claim. It is therefore excluded from the comparison (issue #64).
-            known = leaf_tokens(identity_tokens(action.arguments)) - plumbing
+            known_all = identity_tokens(action.arguments)
+            known = leaf_tokens(known_all) - plumbing
             # An empty ``known`` is contained in everything; treat a stored
             # action with no identity of its own as unrecognisable, not as a
             # match for every claim of the same type.
             if not known:
+                continue
+            # Same leaves, different directories, is different work (issue #365).
+            if not locations_agree(incoming_where, location_tokens(known_all)):
                 continue
             if incoming <= known:
                 # The stored action carries more tokens than the claim. That is
@@ -335,6 +718,7 @@ class ActionLedger:
         return None
 
     def all(self) -> Sequence[Action]:
+        """Return all action records currently in the folded ledger."""
         return list(self._replay().values())
 
     def pending(self) -> Sequence[Action]:
@@ -352,22 +736,51 @@ class ActionLedger:
     # -- writing ---------------------------------------------------------- #
 
     def _record(
-        self, key: str, action: Action, event_type: EventType = EventType.ACTION_RECORDED
+        self,
+        key: str,
+        action: Action,
+        event_type: EventType = EventType.ACTION_RECORDED,
+        pinning: dict[str, str] | None = None,
+        grant: dict[str, str] | None = None,
+        origin_digest: str | None = None,
+        rendered_key: str | None = None,
     ) -> Action:
-        self.storage.append_event(
-            self.run_id,
-            event_type,
-            {
-                "key": key,
-                "action_id": action.action_id,
-                "action_type": action.action_type,
-                "status": action.status.value,
-                "external_id": action.external_id,
-                "action": action.model_dump(mode="json"),
-            },
-        )
+        payload: dict[str, Any] = {
+            "key": key,
+            "action_id": action.action_id,
+            "action_type": action.action_type,
+            "status": action.status.value,
+            "external_id": action.external_id,
+            "action": action.model_dump(mode="json"),
+        }
+        if pinning:
+            # Issue #241: caller-asserted environment hashes ride on the
+            # STARTED record so drift is diffable per attempt. Settlements
+            # omit it; the fold keeps the newest non-empty anyway.
+            payload["pinning"] = dict(pinning)
+        if grant:
+            # Issue #269: single-use authority reference attached at claim
+            # time; terminal records inherit it via the shared payload keys,
+            # so scan_grants can mark consumption from either event type.
+            payload["grant"] = dict(grant)
+        if origin_digest is not None or action.origin_digest is not None:
+            # Origin digest (issue #304, #566): hash of the originating
+            # observation that motivated this write. Stored both top-level
+            # for forensic filtering and inside the action for round-trip.
+            digest = origin_digest if origin_digest is not None else action.origin_digest
+            if digest is not None:
+                payload["origin_digest"] = digest
+        if rendered_key is not None:
+            payload["rendered_key"] = rendered_key
+        elif action.arguments and "record_key" in action.arguments:
+            # Fallback for callers that supplied record_key via arguments
+            # rather than explicit key; keep forensic searchable.
+            with suppress(Exception):
+                payload["rendered_key"] = str(action.arguments.get("record_key"))
+        self.storage.append_event(self.run_id, event_type, payload, source=self._source)
         return action
 
+    @_single_writer
     def claim(
         self,
         action_type: str,
@@ -377,18 +790,40 @@ class ActionLedger:
         scoped_to_run: bool = True,
         key: str | None = None,
         on_unknown: Callable[[Action], ActionOutcome | None] | None = None,
+        dep_scope: str | None = None,
+        pinning: dict[str, str] | None = None,
+        grant: Mapping[str, str] | None = None,
+        origin_digest: str | None = None,
     ) -> ActionOutcome:
         """Register intent to perform an action, or report it already happened.
+
+        ``pinning`` (issue #241) is an optional validated dict of environment
+        hashes/ids recorded verbatim in the ACTION_RECORDED payload so replay
+        correctness can diff the agent's moving parts across a run.
+
+        ``grant`` (issue #269) attaches a single-use authority reference,
+        ``{"id": ..., "scope": ...}``, to this attempt. A grant whose attempt
+        reached a terminal status counts as consumed: a later claim carrying
+        it is refused with GrantDenied and an audited GRANT_DENIED event,
+        which is what stops a restored agent from resurrecting spent
+        authority (the Authority Resurrection attack class). A live mid-flight
+        retry under the same key and grant is untouched.
 
         Returns ``fresh=True`` when the caller should go ahead. Returns
         ``fresh=False`` with the stored result when the action already
         completed.
+
+        With ``scoped_to_run=False`` the key carries no run prefix and is
+        honoured store-wide: a completed record in any run deduplicates the
+        claim, and an unresolved attempt in another run raises
+        ``UnknownSideEffect`` rather than opening a parallel slot (issue 34).
 
         Raises ``UnknownSideEffect`` when a previous attempt was interrupted and
         its real-world outcome cannot be determined, unless ``on_unknown``
         resolves it.
         """
         explicit_key = key is not None
+        _explicit_rendered = key
         idem = idempotency_key(
             action_type,
             arguments,
@@ -397,7 +832,29 @@ class ActionLedger:
             key=key,
         )
         key = idem
+        rendered_key = _explicit_rendered
         existing = self.get(key)
+
+        if existing is None and not scoped_to_run:
+            # The local log has no such action, but an unscoped key claims
+            # global identity: another run may already hold it (issue 34).
+            foreign = self._foreign_action(key)
+            if foreign is not None:
+                if foreign.status is ActionStatus.COMPLETED:
+                    # The effect already happened under this identity, wherever
+                    # it happened. Report it instead of duplicating it.
+                    return ActionOutcome(key=key, action=foreign, fresh=False)
+                if foreign.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+                    # Another run is mid-flight on the same identity and this
+                    # ledger cannot reconcile a foreign record (its outcome
+                    # belongs to that run's log), so refuse rather than guess.
+                    raise UnknownSideEffect(
+                        f"action {foreign.action_type!r} (key {key[:12]}...) has an "
+                        f"unresolved attempt recorded by another run; reconcile "
+                        f"that run before claiming the same unscoped identity."
+                    )
+                # FAILED or COMPENSATED elsewhere means no live effect stands
+                # in the way; this run may open its own slot.
 
         if existing is None and not explicit_key:
             # No explicit key was supplied (the caller did not assert an
@@ -413,16 +870,122 @@ class ActionLedger:
                 # record we are deferring to, not the freshly-derived one.
                 key = matched[0]
 
+        # Single-use grants (#269): refuse resurrection of spent authority
+        # before anything fires. A live attempt carrying the same grant under
+        # the same key is an ordinary mid-flight retry and passes through.
+        grant_clean = normalize_grant(grant)
+        authority_history: Sequence[Event] | None = None
+        if grant_clean is not None:
+            authority_history = self.storage.read_all_events(self.run_id)
+            spent, grants_by_key = scan_grants(authority_history)
+            prior = spent.get(grant_clean["id"])
+            live_match = (
+                existing is not None
+                and existing.status is ActionStatus.STARTED
+                and grants_by_key.get(key, {}).get("id") == grant_clean["id"]
+            )
+            if prior is not None and not live_match:
+                denied = GrantDenied(grant_clean["id"], prior, key)
+                self.storage.append_event(
+                    self.run_id,
+                    EventType.GRANT_DENIED,
+                    {
+                        "grant_id": grant_clean["id"],
+                        "scope": grant_clean["scope"],
+                        "prior_action_id": prior.action_id,
+                        "prior_status": prior.status,
+                        "attempted_key": key,
+                        "attempted_action_type": action_type,
+                    },
+                )
+                raise denied
+
+        # Authority resurrection via AUTHORITY_CONSUMED (issue #289b): a
+        # consumed authority must not be reused even with a fresh key or
+        # drifted arguments. The check mirrors the grant check but scans
+        # AUTHORITY_CONSUMED events. A live retry under the same key and
+        # authority is allowed, mirroring the grant live_match rule.
+        authority_id = None
+        if grant_clean is not None:
+            authority_id = grant_clean["id"]
+        elif isinstance(arguments, Mapping):
+            for _k in ("authority_id", "authority", "token", "approval_id"):
+                if _k in arguments and isinstance(arguments[_k], str) and arguments[_k].strip():
+                    authority_id = arguments[_k].strip()
+                    break
+        if authority_id is not None:
+            from continuum.gate import collect_consumed_authorities
+
+            if authority_history is None:
+                authority_history = self.storage.read_all_events(self.run_id)
+            consumed = collect_consumed_authorities(authority_history)
+            prior_ev = consumed.get(authority_id)
+            # Allow live retry under same key with same authority
+            live_auth_match = (
+                existing is not None
+                and existing.status is ActionStatus.STARTED
+                and prior_ev is not None
+                and prior_ev.payload.get("via_action_id") == existing.action_id
+            )
+            if prior_ev is not None and not live_auth_match:
+                self.storage.append_event(
+                    self.run_id,
+                    EventType.GRANT_DENIED,
+                    {
+                        "grant_id": authority_id,
+                        "scope": prior_ev.payload.get("consumer_run_id", ""),
+                        "prior_action_id": prior_ev.payload.get("via_action_id", ""),
+                        "prior_status": "consumed",
+                        "attempted_key": key,
+                        "attempted_action_type": action_type,
+                        "authority_id": authority_id,
+                        "consumed_at_seq": prior_ev.sequence,
+                    },
+                )
+                raise LedgerError(
+                    f"Authority {authority_id!r} consumed at seq {prior_ev.sequence} by run {prior_ev.payload.get('consumer_run_id')!r}. Obtain a fresh authority."
+                )
+
+        # Authorization-bound budget (issue #413): derive the stable
+        # authorization bucket for this attempt. Unbound (None) means no
+        # budget to enforce, which keeps runs without authorization data
+        # byte-identical to today. The bucket is token-derived and
+        # ledger-anchored, so distinct fresh idempotency keys for the same
+        # resource (same invoice id) share the same counter and cannot
+        # bypass the cap by minting new keys (the #390 amplification fix).
+        budget_auth_id = self._budget_authorization_id(action_type, None, arguments, volatile)
+
         if existing is None:
+            if budget_auth_id is not None:
+                self._budget_consume_claim(action_type, budget_auth_id)
+            # Origin digest (issue #566): optional 64 hex, validated by Action.
+            # Fail closed on bad digest rather than storing garbage that
+            # forensic joins would then misattribute.
+            if origin_digest is not None:
+                import re as _re
+
+                if not _re.fullmatch(r"[0-9a-f]{64}", origin_digest):
+                    raise LedgerError(
+                        f"origin_digest must be 64 lowercase hex, got {origin_digest!r}"
+                    )
             action = Action(
                 run_id=self.run_id,
                 action_type=action_type,
+                dep_scope=dep_scope,
                 arguments=dict(arguments or {}),
                 arguments_hash=arguments_hash(arguments, volatile=volatile),
                 status=ActionStatus.STARTED,
                 started_at=utcnow(),
+                origin_digest=origin_digest,
             )
-            self._record(key, action)
+            self._record(
+                key,
+                action,
+                pinning=pinning,
+                grant=grant_clean,
+                origin_digest=origin_digest,
+                rendered_key=rendered_key,
+            )
             return ActionOutcome(key=key, action=action, fresh=True)
 
         if existing.status is ActionStatus.COMPLETED:
@@ -430,6 +993,8 @@ class ActionLedger:
 
         if existing.status is ActionStatus.COMPENSATED:
             # The effect was undone, so performing it again is legitimate.
+            if budget_auth_id is not None:
+                self._budget_consume_claim(action_type, budget_auth_id)
             action = existing.model_copy(
                 update={
                     "status": ActionStatus.STARTED,
@@ -443,6 +1008,8 @@ class ActionLedger:
             return ActionOutcome(key=key, action=action, fresh=True)
 
         if existing.status is ActionStatus.FAILED:
+            if budget_auth_id is not None:
+                self._budget_consume_claim(action_type, budget_auth_id)
             action = existing.model_copy(
                 update={"status": ActionStatus.STARTED, "started_at": utcnow()}
             )
@@ -466,39 +1033,116 @@ class ActionLedger:
         raise UnknownSideEffect(
             f"action {existing.action_type!r} (key {key[:12]}...) was interrupted before its "
             f"outcome was recorded; the side effect may or may not have occurred. "
-            f"Reconcile it before retrying."
+            f"Reconcile it before retrying.",
+            # The caller is being told to reconcile, so it needs the identity to
+            # reconcile *with*. Truncating it into the message was the only place
+            # it appeared, which left a recovering session unable to act on its
+            # own instruction (issue #367).
+            action_key=str(key),
+            action_id=uncertain.action_id,
         )
 
+    @_single_writer
     def complete(
         self,
         key: str,
         *,
         external_id: str | None = None,
         result: Mapping[str, Any] | None = None,
+        consumed_inputs: ConsumedInputs | Mapping[str, Any] | None = None,
     ) -> Action:
-        """Record that the effect succeeded."""
-        existing = self._require(key)
+        """Record that the effect succeeded.
+
+        Settles a claim that is still in flight. Re-reporting an action that is
+        already ``COMPLETED`` is allowed, because a caller repeating itself after
+        a dropped response is not asserting anything new.
+
+        Every other status is refused (issue #366). Those are not settlements, they
+        are corrections of a recorded outcome, and correcting an outcome needs
+        evidence about the outside world that this method neither takes nor
+        records. ``UNKNOWN`` is the case that matters: the action reached that
+        status precisely because nobody could say whether the effect happened, and
+        completing it here erased the recovery blocker, wrote no note, and left an
+        ``ACTION_RECORDED`` event indistinguishable from an ordinary first-time
+        success. An auditor could not tell that an uncertain charge had been
+        resolved by assertion.
+
+        :meth:`reconcile` is the supported route for all of them. It takes the
+        same decision, demands the caller stand behind it, and records
+        ``ACTION_RECONCILED`` with a note so the correction is visible in the log.
+
+        Omitted arguments never erase what is on record. A caller repeating a
+        completion after a dropped response usually sends only the key, and
+        overwriting ``external_id`` and ``result`` with ``None`` would destroy the
+        receipt proving the effect happened. Same invariant :meth:`reconcile`
+        already documents, and a no-op on a first completion, where there is
+        nothing yet to preserve.
+        """
+        key, existing = self._require(key)
+        if existing.status not in (ActionStatus.STARTED, ActionStatus.COMPLETED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not in flight, so "
+                f"completing it would assert an outcome nothing has verified. "
+                f"Check the external system, then call reconcile(occurred=True) "
+                f"(continuum_reconcile_action over MCP), which records the evidence "
+                f"and the note alongside the correction."
+            )
+        settled_external = external_id if external_id is not None else existing.external_id
+        settled_result = dict(result) if result is not None else existing.result
+        normalized = _normalize_consumed_inputs(consumed_inputs)
+        settled_consumed = normalized if normalized is not None else existing.consumed_inputs
         action = existing.model_copy(
             update={
                 "status": ActionStatus.COMPLETED,
-                "external_id": external_id,
-                "result": dict(result) if result is not None else None,
-                "result_hash": stable_hash(dict(result)) if result is not None else None,
+                "external_id": settled_external,
+                "result": dict(settled_result) if settled_result is not None else None,
+                "result_hash": (
+                    stable_hash(dict(settled_result)) if settled_result is not None else None
+                ),
                 "completed_at": utcnow(),
                 "side_effect_uncertain": False,
+                "consumed_inputs": settled_consumed,
             }
         )
-        return self._record(key, action)
+        recorded = self._record(key, action)
+        # Settlement drawdown (issue #413): same per-authorization bucket as claims.
+        if existing.status is ActionStatus.STARTED:
+            auth_settle = self._budget_authorization_id(
+                existing.action_type, None, dict(existing.arguments), ()
+            )
+            if auth_settle is not None:
+                self._budget_consume_settlement(existing.action_type, auth_settle)
+        return recorded
 
+    @_single_writer
     def fail(self, key: str, error: str, *, certain: bool = True) -> Action:
         """Record that the effect did not happen.
 
-        ``certain=False`` is for failures where the effect may still have landed
-        — a timeout after the request was sent, for instance. Those become
+        ``certain=False`` is for failures where the effect may still have landed,
+        a timeout after the request was sent for instance. Those become
         ``UNKNOWN`` rather than ``FAILED``, because a timeout is not evidence of
         absence.
+
+        Only in-flight statuses settle here (issue #733). Re-reporting a
+        ``FAILED`` action is allowed, because a caller repeating itself after a
+        dropped response is not asserting anything new. Every other status is
+        refused, mirroring :meth:`complete` (issue #366): a late ``fail`` on a
+        ``COMPLETED`` action used to flip it to ``FAILED`` while its recorded
+        result stayed on the books, which reopened the key and let the next
+        claim re-fire a side effect that had already happened. ``UNKNOWN`` is
+        refused for the same reason ``complete`` refuses it: resolving an
+        uncertain outcome is a correction that needs evidence, which is what
+        :meth:`reconcile` records.
         """
-        existing = self._require(key)
+        key, existing = self._require(key)
+        if existing.status not in (ActionStatus.STARTED, ActionStatus.FAILED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not in flight, so "
+                f"failing it would erase a recorded outcome. If a check confirmed "
+                f"the effect did not happen, call reconcile(occurred=False) "
+                f"(continuum_reconcile_action over MCP), which records the evidence "
+                f"and the note alongside the correction."
+            )
         action = existing.model_copy(
             update={
                 "status": ActionStatus.FAILED if certain else ActionStatus.UNKNOWN,
@@ -509,6 +1153,15 @@ class ActionLedger:
         )
         return self._record(key, action)
 
+    def _authority_for_action(self, action: Action) -> str | None:
+        """Extract authority_id linked to an action, if any."""
+        if action.arguments and isinstance(action.arguments, Mapping):
+            for _k in ("authority_id", "authority", "token", "approval_id"):
+                if _k in action.arguments and isinstance(action.arguments[_k], str):
+                    return str(action.arguments[_k]).strip()
+        return None
+
+    @_single_writer
     def reconcile(
         self,
         key: str,
@@ -517,25 +1170,49 @@ class ActionLedger:
         external_id: str | None = None,
         result: Mapping[str, Any] | None = None,
         note: str = "",
+        consumed_inputs: ConsumedInputs | Mapping[str, Any] | None = None,
     ) -> Action:
         """Resolve an uncertain action using evidence from the outside world.
 
         ``occurred=True`` means a check confirmed the effect exists; the action
         becomes ``COMPLETED`` and will never be repeated. ``occurred=False``
         means it confirmed absence; the action becomes ``FAILED`` and may be
-        retried.
+        retried, and its now-falsified ``external_id`` and ``result`` are
+        cleared (issue #29) so no reader trusts evidence of a completion the
+        system has just decided never happened.
+
+        Reconciling an already-COMPLETED action is deliberately permitted: an
+        agent that optimistically called :meth:`complete` may be contradicted by
+        a later probe, and correcting that record is the point of this method.
+        The caller is trusted to have real evidence, because nothing here can
+        check the outside world on its behalf.
+
+        What is *not* permitted is losing evidence by omission. ``occurred=True``
+        keeps any ``external_id`` and ``result`` already on record when the
+        caller does not supply replacements, so confirming an effect happened can
+        never erase the receipt proving it did.
         """
-        existing = self._require(key)
+        key, existing = self._require(key)
         if occurred:
+            # Fall back to what is already recorded rather than overwriting with
+            # None. Confirming an effect occurred must never be the reason its
+            # receipt disappears; a caller replacing the evidence passes it.
+            settled_external = external_id if external_id is not None else existing.external_id
+            settled_result = dict(result) if result is not None else existing.result
+            normalized = _normalize_consumed_inputs(consumed_inputs)
+            settled_consumed = normalized if normalized is not None else existing.consumed_inputs
             action = existing.model_copy(
                 update={
                     "status": ActionStatus.COMPLETED,
-                    "external_id": external_id,
-                    "result": dict(result) if result is not None else None,
-                    "result_hash": stable_hash(dict(result)) if result is not None else None,
+                    "external_id": settled_external,
+                    "result": dict(settled_result) if settled_result is not None else None,
+                    "result_hash": (
+                        stable_hash(dict(settled_result)) if settled_result is not None else None
+                    ),
                     "completed_at": utcnow(),
                     "side_effect_uncertain": False,
                     "last_error": note or existing.last_error,
+                    "consumed_inputs": settled_consumed,
                 }
             )
         else:
@@ -547,13 +1224,22 @@ class ActionLedger:
                     "result_hash": None,
                     "side_effect_uncertain": False,
                     "last_error": note or "reconciliation found no external effect",
+                    "consumed_inputs": ConsumedInputs(),
                 }
             )
-        return self._record(key, action, EventType.ACTION_RECONCILED)
+        recorded = self._record(key, action, EventType.ACTION_RECONCILED)
+        # Settlement drawdown (issue #413): same bucket as claims.
+        auth_settle = self._budget_authorization_id(
+            existing.action_type, None, dict(existing.arguments), ()
+        )
+        if auth_settle is not None:
+            self._budget_consume_settlement(existing.action_type, auth_settle)
+        return recorded
 
+    @_single_writer
     def compensate(self, key: str, *, note: str = "", by: str | None = None) -> Action:
         """Record that a completed effect was deliberately undone."""
-        existing = self._require(key)
+        key, existing = self._require(key)
         action = existing.model_copy(
             update={
                 "status": ActionStatus.COMPENSATED,
@@ -564,16 +1250,178 @@ class ActionLedger:
         )
         return self._record(key, action, EventType.ACTION_COMPENSATED)
 
+    @_single_writer
     def flag_for_review(self, key: str, reason: str) -> Action:
         """Escalate an action a human must judge."""
-        existing = self._require(key)
+        key, existing = self._require(key)
         action = existing.model_copy(
             update={"status": ActionStatus.REQUIRES_REVIEW, "last_error": reason}
         )
         return self._record(key, action)
 
-    def _require(self, key: str) -> Action:
-        existing = self.get(key)
-        if existing is None:
-            raise LedgerError(f"no action recorded for key {key[:12]}...")
-        return existing
+    def forensic_lookup(self, record_key: str) -> list[dict[str, Any]]:
+        """Find actions whose rendered key contains ``record_key``.
+
+        Scans this run's ledger for memory writes whose stored
+        ``rendered_key`` contains the given substring. For each hit, also
+        resolves the originating observation event by ``origin_digest`` when
+        present. This is the poisoning forensics join: given a bad record,
+        walk back to what caused it, then enumerate siblings from the same
+        contaminated origin.
+
+        Returns a list of ``{"action": Action, "rendered_key": str,
+        "origin_digest": str | None, "observation_event": Event | None}``
+        entries. Empty when nothing matches. Searches only this run; for
+        store-global enumeration use :func:`forensic_join_across_runs`.
+        """
+        hits: list[dict[str, Any]] = []
+        # Map observation digest to event for this run
+        obs_by_digest: dict[str, Any] = {}
+        try:
+            from continuum.security.hashing import stable_hash as _sh
+
+            for ev in self.storage.read_all_events(self.run_id):
+                if ev.type == EventType.PERCEPTION_OBSERVED:
+                    try:
+                        digest = _sh(dict(ev.payload))
+                    except Exception:
+                        continue
+                    obs_by_digest[digest] = ev
+                    # Also index by content_hash if present
+                    ch = ev.payload.get("content_hash")
+                    if isinstance(ch, str):
+                        obs_by_digest[ch] = ev
+        except Exception:
+            obs_by_digest = {}
+        for ev in self.storage.read_all_events(self.run_id):
+            if ev.type not in _ACTION_EVENT_TYPES:
+                continue
+            payload = dict(ev.payload)
+            rendered = payload.get("rendered_key") or payload.get("key") or ""
+            # The stored key is hashed, so check rendered_key first, then
+            # fallback to substring search inside action arguments or key.
+            match = False
+            if isinstance(rendered, str) and record_key in rendered:
+                match = True
+            else:
+                # Fallback: check action arguments for record_key
+                try:
+                    act = payload.get("action") or {}
+                    args = act.get("arguments") or {}
+                    if record_key in str(args):
+                        match = True
+                    if record_key in str(payload.get("key", "")):
+                        match = True
+                except Exception:
+                    pass
+            if not match:
+                continue
+            try:
+                action = Action.model_validate(payload["action"])
+            except Exception:
+                continue
+            digest = payload.get("origin_digest") or action.origin_digest  # type: ignore[assignment]
+            obs_ev = obs_by_digest.get(digest) if isinstance(digest, str) else None
+            hits.append(
+                {
+                    "action": action,
+                    "rendered_key": rendered,
+                    "origin_digest": digest,
+                    "observation_event": obs_ev,
+                }
+            )
+        return hits
+
+    def _require(self, key: str) -> tuple[str, Action]:
+        """Resolve ``key`` to its stored key and action, or explain what is wrong.
+
+        Returns the *resolved* key alongside the action, because the caller has
+        to record its settlement under the key the fold uses, not under whatever
+        identifier the caller happened to hold (issue #367).
+
+        The message names both identifier spaces. The previous wording,
+        ``no action recorded for key <prefix>...``, left a caller that had passed
+        a perfectly valid ``action_id`` with no way to tell that it had reached
+        for the wrong identifier rather than a nonexistent action.
+        """
+        resolved = self.resolve_key(key)
+        if resolved is None:
+            known = len(self._replay())
+            raise LedgerError(
+                f"no action in run {self.run_id!r} matches {key[:16]!r} as either an "
+                f"idempotency key or an action_id ({known} action(s) recorded). "
+                f"List them with `continuum actions {self.run_id}` or "
+                f"continuum_list_actions, and pass the action_key or action_id from there."
+            )
+        return resolved, self._replay()[resolved]
+
+
+def forensic_join_across_runs(storage: Storage, record_key: str) -> list[dict[str, Any]]:
+    """Store-global forensic join: record_key -> originating observations.
+
+    Scans every run in ``storage`` for memory actions whose rendered key
+    contains ``record_key``, returning the same shape as
+    :meth:`ActionLedger.forensic_lookup` but across all runs. This powers
+    enumeration for poisoning forensics where a contaminated origin may have
+    produced sibling writes in different runs.
+
+    Each hit includes ``run_id``, ``action``, ``rendered_key``,
+    ``origin_digest`` and ``observation_event`` (or None when the digest
+    has no matching PERCEPTION_OBSERVED in that run).
+    """
+    from continuum.security.hashing import stable_hash as _sh
+
+    hits: list[dict[str, Any]] = []
+    for run in storage.list_runs():
+        run_id = run.run_id
+        # Build per-run observation index
+        obs_by_digest: dict[str, Any] = {}
+        try:
+            for ev in storage.read_all_events(run_id):
+                if ev.type == EventType.PERCEPTION_OBSERVED:
+                    try:
+                        digest = _sh(dict(ev.payload))
+                    except Exception:
+                        continue
+                    obs_by_digest[digest] = ev
+                    ch = ev.payload.get("content_hash")
+                    if isinstance(ch, str):
+                        obs_by_digest[ch] = ev
+        except Exception:
+            obs_by_digest = {}
+        try:
+            events = storage.read_all_events(run_id)
+        except Exception:
+            continue
+        for ev in events:
+            if ev.type not in _ACTION_EVENT_TYPES:
+                continue
+            payload = dict(ev.payload)
+            rendered = payload.get("rendered_key") or ""
+            match = isinstance(rendered, str) and record_key in rendered
+            if not match:
+                try:
+                    act = payload.get("action") or {}
+                    args = act.get("arguments") or {}
+                    if record_key in str(args):
+                        match = True
+                except Exception:
+                    pass
+            if not match:
+                continue
+            try:
+                action = Action.model_validate(payload["action"])
+            except Exception:
+                continue
+            digest = payload.get("origin_digest") or getattr(action, "origin_digest", None)  # type: ignore[assignment]
+            obs_ev = obs_by_digest.get(digest) if isinstance(digest, str) else None
+            hits.append(
+                {
+                    "run_id": run_id,
+                    "action": action,
+                    "rendered_key": rendered,
+                    "origin_digest": digest,
+                    "observation_event": obs_ev,
+                }
+            )
+    return hits

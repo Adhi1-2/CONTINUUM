@@ -4,6 +4,7 @@ from continuum.actions.idempotency import IdempotencyKey, arguments_hash, idempo
 from continuum.actions.ledger import (
     ActionLedger,
     ActionOutcome,
+    ClaimLockError,
     DuplicateAction,
     LedgerError,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ActionLedger",
     "ActionOutcome",
     "AssumeNotOccurredReconciler",
+    "ClaimLockError",
     "DuplicateAction",
     "IdempotencyKey",
     "LedgerError",

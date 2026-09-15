@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -113,8 +114,8 @@ def test_emit_routes_json_around_the_colouriser_even_with_a_live_palette() -> No
 
     JSON is protected twice: the palette is disabled for --json, *and* _emit
     never passes the JSON branch through the colouriser. Either alone suffices,
-    so this asserts the lower layer directly — otherwise a refactor could drop
-    it while the upper guard masked the loss.
+    so this asserts the lower layer directly. Otherwise a refactor could drop it
+    while the upper guard masked the loss.
     """
     from continuum.cli.main import _emit
 
@@ -178,7 +179,7 @@ def test_stripping_colour_reproduces_plain_output_exactly(db: str, argv: tuple[s
     """Colour is presentational: strip the codes and you get the plain text."""
     _, plain, _ = run("--db", db, *argv)
     _, coloured, _ = run("--db", db, "--color", *argv)
-    assert ANSI.sub("", coloured) == plain
+    assert _without_volatile_age(ANSI.sub("", coloured)) == _without_volatile_age(plain)
 
 
 @pytest.mark.parametrize(
@@ -265,15 +266,33 @@ def test_for_stream_infers_from_the_stream() -> None:
 # --- as a real process ------------------------------------------------------ #
 
 
+def _without_volatile_age(text: str) -> str:
+    """Normalize the live liveness age for byte-equality assertions.
+
+    The advisory embeds seconds since the last append, so two renders of one
+    unchanged run legitimately differ in that token. Everything else must be
+    byte-identical, which is what this test pins.
+    """
+    return re.sub(r"silence \d+\.\ds", "silence <age>s", text)
+
+
 def test_a_real_piped_process_emits_no_colour(db: str) -> None:
+    # The uncoloured in-process render is the reference: a real piped process
+    # must produce it byte for byte, exit code included.
+    expected_code, expected_out, _ = run("--db", db, "resume", "run_1")
+
     result = subprocess.run(
         [sys.executable, "-m", "continuum.cli", "--db", db, "resume", "run_1"],
-        env={
-            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-            "PATH": "/usr/bin:/bin",
-        },
+        # Inherit the parent environment; only PYTHONPATH is added, so the
+        # subprocess imports continuum from src/. A bare env= drops SystemRoot on
+        # Windows and the process dies on `import _overlapped` during startup.
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
         capture_output=True,
         text=True,
     )
+    # Assert the CLI actually ran. Checking only for absent escape sequences
+    # would pass for a process that died before producing any output at all.
+    assert result.returncode == expected_code, result.stderr
+    assert _without_volatile_age(result.stdout) == _without_volatile_age(expected_out)
     assert not ANSI.search(result.stdout)
     assert not ANSI.search(result.stderr)

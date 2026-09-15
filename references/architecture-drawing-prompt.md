@@ -84,7 +84,7 @@ Row 3:
 - Security (subtitle: canonical hashing, provenance)
 
 MCP pill (small rounded bar at the top-right inside the SDK container):
-- Text: "MCP server: deny by default, 10 tools (3 read-only, 7 mutating)"
+- Text: "MCP server: deny by default, 12 tools (3 read-only, 9 mutating)"
 
 ### Tier 4: two cards side by side
 Left card:
