@@ -716,21 +716,56 @@ def test_the_cursor_survives_a_refresh_tick(db: str, store: SQLiteStorage) -> No
     assert app.cursor == 3  # still parked on the third row
 
 
-def test_an_unreadable_store_degrades_the_splash_not_the_app(
+def test_switching_to_a_text_tab_does_not_inherit_the_table_selection(
+    db: str, store: SQLiteStorage
+) -> None:
+    """A selection parked on a table tab must not light up a text tab.
+
+    Text tabs own the scroll, not a cursor; inheriting the old position
+    would show a phantom highlight and flip navigation into cursor mode.
+    """
+    run("--db", db, "start", "r1", "--goal", "g")
+    ledger = ActionLedger(SQLiteStorage(db), "r1")
+    ledger.claim("send_invoice", {}, key="invoice:I-1")
+    ledger.claim("send_email", {}, key="email:E-1")
+    ledger.claim("send_fax", {}, key="fax:F-1")
+
+    app = TuiApp(store)
+    app.handle_key("enter")  # landing -> runs
+    app.handle_key("enter")  # runs -> detail
+    app.handle_key("4")  # actions tab
+    app.handle_key("j")
+    app.handle_key("j")  # park on the third action row
+    assert app.cursor == 3
+
+    app.handle_key("2")  # jump straight to the recovery tab (text)
+
+    assert app.cursor == -1  # no selection on a text tab
+    # and a refresh while parked there still moves nothing
+    app.handle_key("r")
+    assert app.cursor == -1
+    # switching back re-renders the table without resurrecting the old row
+    app.handle_key("4")
+    assert "send_invoice" in "\n".join(app.body_lines())
+
+
+def test_a_recovered_splash_count_retires_the_old_error(
     db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A splash count that fails shows the reason on the landing page, not a crash."""
+    """Once the count succeeds again, the splash must not keep the stale error."""
     app = TuiApp(store)
 
     def boom() -> int:
         raise RuntimeError("count failed")
 
     monkeypatch.setattr(app, "_count_runs", boom)
-    app.refresh()  # what an auto-refresh tick does on the splash
+    app.refresh()
+    assert "cannot count runs" in "\n".join(app.body_lines())
 
-    body = "\n".join(app.body_lines())
-    assert "cannot count runs" in body
-    assert "count failed" in body
+    monkeypatch.undo()
+    app.refresh()  # the next auto-refresh tick counts again
+
+    assert "cannot count runs" not in "\n".join(app.body_lines())
 
 
 def test_an_unreadable_run_degrades_the_actions_tab_not_the_app(

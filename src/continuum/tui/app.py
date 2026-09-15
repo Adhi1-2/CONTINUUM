@@ -100,6 +100,7 @@ class TuiApp:
             self.cursor = -1
             try:
                 self._run_count = self._count_runs()
+                self._read_error = ""  # a recovered count must retire the old error
             except Exception as exc:
                 self._run_count = None
                 self._read_error = f"cannot count runs: {exc}"
@@ -144,6 +145,9 @@ class TuiApp:
         # Preserve the selected row across a refresh: an auto-refresh tick
         # must not silently move the cursor while the operator reads the
         # footer, or a keypress settles a different action than parked on.
+        # Table tabs only — a text tab owns the scroll, not a selection, so
+        # restoring a table tab's cursor onto it would light a phantom
+        # highlight and flip navigation into cursor mode.
         preserved = self.cursor
         self.cursor = -1
         try:
@@ -159,7 +163,7 @@ class TuiApp:
                 "r to retry, or run `continuum verify` outside the dashboard for detail.",
             ]
         else:
-            if 1 <= preserved < len(self.lines):
+            if tab in self._TABLE_TABS and 1 <= preserved < len(self.lines):
                 self.cursor = preserved
         if self.scroll > max(0, len(self.lines) - 1):
             self.scroll = 0
