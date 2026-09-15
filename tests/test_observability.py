@@ -1,4 +1,9 @@
-"""Tests for the observability module (metrics collector + Phase 14 dashboard)."""
+"""Tests for the Phase 14 recovery dashboard renderer.
+
+The metrics collector that used to share this module was removed in #1032
+(never wired, superseded by the recovery ledger); these tests cover the
+surviving read-only dashboard surface.
+"""
 
 from __future__ import annotations
 
@@ -17,26 +22,14 @@ from continuum.models import (
     StateStatus,
     StateValidationResult,
 )
-from continuum.observability import (
-    CHECKPOINTS_CREATED,
-    RECOVERIES_BLOCKED,
-    RECOVERIES_RESUMED,
-    UNKNOWN_SIDE_EFFECTS,
-    VALIDATIONS_RUN,
-    Metrics,
-    collect_from_decision,
-    get_metrics,
-    render_dashboard,
-    reset_metrics,
-    set_metrics,
-)
+from continuum.observability import render_dashboard
 from continuum.recovery.engine import RecoveryDecision
 from continuum.recovery.planner import RepairKind, RepairPlan, RepairStep
 from continuum.state.validator import ValidationOutcome
 
 
 def _decision(can_resume: bool, uncertain: tuple[Action, ...] = ()) -> RecoveryDecision:
-    """Build a minimal RecoveryDecision for dashboard/metrics tests."""
+    """Build a minimal RecoveryDecision for dashboard tests."""
     state = SemanticState(run_id="run_x", goal=Goal(description="recover"))
     contract = RecoveryContract(
         run_id="run_x",
@@ -89,56 +82,6 @@ def _decision(can_resume: bool, uncertain: tuple[Action, ...] = ()) -> RecoveryD
     )
 
 
-def test_metrics_counter_is_monotonic_and_rejects_negative() -> None:
-    m = Metrics()
-    m.increment(CHECKPOINTS_CREATED, 3)
-    m.increment(CHECKPOINTS_CREATED)
-    assert m.counters[CHECKPOINTS_CREATED] == 4
-    try:
-        m.increment(CHECKPOINTS_CREATED, -1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("negative increment should raise")
-
-
-def test_metrics_timer_accumulates() -> None:
-    m = Metrics()
-    with m.timer("validate"):
-        pass
-    assert "validate" in m.timers
-    assert m.timers["validate"] >= 0.0
-
-
-def test_get_metrics_returns_active_collector() -> None:
-    reset_metrics()
-    before = get_metrics()
-    token = set_metrics(Metrics())
-    try:
-        assert get_metrics() is not before
-    finally:
-        token.var.reset(token)
-
-
-def test_collect_from_decision_counts_resumed() -> None:
-    reset_metrics()
-    collect_from_decision(_decision(can_resume=True))
-    snap = get_metrics().snapshot()
-    assert snap["counters"][VALIDATIONS_RUN] == 1
-    assert snap["counters"][RECOVERIES_RESUMED] == 1
-    assert snap["counters"].get(RECOVERIES_BLOCKED, 0) == 0
-    assert snap["gauges"]["validation.invalid"] == 1
-
-
-def test_collect_from_decision_counts_blocked_and_unknown() -> None:
-    reset_metrics()
-    action = Action(run_id="run_x", action_type="github.create_issue", status=ActionStatus.UNKNOWN)
-    collect_from_decision(_decision(can_resume=False, uncertain=(action,)))
-    snap = get_metrics().snapshot()
-    assert snap["counters"][RECOVERIES_BLOCKED] == 1
-    assert snap["counters"][UNKNOWN_SIDE_EFFECTS] == 1
-
-
 def test_render_dashboard_contains_state_components_and_plan() -> None:
     out = render_dashboard(_decision(can_resume=False))
     assert "CONTINUUM RECOVERY DASHBOARD" in out
@@ -152,3 +95,10 @@ def test_render_dashboard_contains_state_components_and_plan() -> None:
 def test_render_dashboard_marks_resume() -> None:
     out = render_dashboard(_decision(can_resume=True))
     assert "safe to resume:     yes" in out
+
+
+def test_render_dashboard_lists_uncertain_side_effects() -> None:
+    action = Action(run_id="run_x", action_type="github.create_issue", status=ActionStatus.UNKNOWN)
+    out = render_dashboard(_decision(can_resume=False, uncertain=(action,)))
+    assert "UNCERTAIN SIDE EFFECTS" in out
+    assert "github.create_issue" in out
