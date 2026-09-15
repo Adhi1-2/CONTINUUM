@@ -714,3 +714,89 @@ def test_the_cursor_survives_a_refresh_tick(db: str, store: SQLiteStorage) -> No
     app.handle_key("r")  # what an auto-refresh tick does
 
     assert app.cursor == 3  # still parked on the third row
+
+
+def test_an_unreadable_store_degrades_the_splash_not_the_app(
+    db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A splash count that fails shows the reason on the landing page, not a crash."""
+    app = TuiApp(store)
+
+    def boom() -> int:
+        raise RuntimeError("count failed")
+
+    monkeypatch.setattr(app, "_count_runs", boom)
+    app.refresh()  # what an auto-refresh tick does on the splash
+
+    body = "\n".join(app.body_lines())
+    assert "cannot count runs" in body
+    assert "count failed" in body
+
+
+def test_an_unreadable_run_degrades_the_actions_tab_not_the_app(
+    db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run whose action rows cannot be read shows a message, and a pending
+    selection on that tab reads as nothing selected rather than raising."""
+    run("--db", db, "start", "r1", "--goal", "g")
+    app = TuiApp(store)
+    app.handle_key("enter")  # landing -> runs
+    app.handle_key("enter")  # runs -> detail
+    app.handle_key("4")  # actions tab
+
+    def boom(storage: Any, run_id: str) -> list[Any]:
+        raise RuntimeError("index corrupted")
+
+    monkeypatch.setattr(tui_model, "action_rows", boom)
+    app.handle_key("r")  # refresh the actions tab through the failure
+
+    body = "\n".join(app.body_lines())
+    assert "Cannot read run r1 (actions tab)" in body
+    assert "index corrupted" in body
+
+    # the guarded selection read degrades to "nothing selected", not a raise
+    app.lines = ["header", "row one"]
+    app.cursor = 1
+    assert app._selected_action() is None
+    assert app._selected_action() is None  # and repeated probes stay quiet
+
+
+def test_family_lines_find_children_written_before_the_parent_column(
+    db: str, store: SQLiteStorage
+) -> None:
+    """A child recorded only in Run.metadata still shows on the tree tab.
+
+    The parent_run_id column postdates some deployments; those runs' children
+    must not vanish from the family view.
+    """
+    run("--db", db, "start", "parent", "--goal", "supervise")
+    run("--db", db, "start", "legacy_child", "--goal", "work", "--parent", "parent")
+    # Simulate the pre-column record: parent linkage only in metadata.
+    store._connection.execute(
+        "UPDATE runs SET parent_run_id = NULL, metadata = ? WHERE run_id = ?",
+        ('{"parent_run_id": "parent"}', "legacy_child"),
+    )
+    store._connection.commit()
+
+    lines = "\n".join(tui_model.family_lines(store, "parent"))
+    assert "legacy_child" in lines
+
+
+def test_budget_rows_show_configured_types_with_no_attempts(
+    db: str, store: SQLiteStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured action type appears even before its first recorded attempt,
+    and a malformed payload in the log cannot crash the view."""
+    run("--db", db, "start", "r1", "--goal", "g")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".continuum").mkdir(exist_ok=True)
+    (tmp_path / ".continuum" / "budgets.json").write_text(
+        '{"action_types": {"send_invoice": {"max_attempts": 5}}}'
+    )
+
+    rows = {r.action_type: r for r in tui_model.budget_rows(store, "r1")}
+
+    assert "send_invoice" in rows  # configured, though never attempted
+    assert rows["send_invoice"].attempts == 0
+    assert rows["send_invoice"].max_attempts == 5
+    assert rows["send_invoice"].remaining == 5
