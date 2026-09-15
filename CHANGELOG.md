@@ -103,6 +103,18 @@ All notable changes to this project are documented here. The format follows
   noise. A genuine lookup miss still falls through to the version and
   source-sequence strategies exactly as before.
 
+- **Every run-completion path now clears the instant-resume pointer (#394).**
+  `.continuum/resume.json` is written on every checkpoint so a `SessionStart`
+  hook can banner the interrupted run without opening the database. A run
+  closed as completed is no longer interrupted, but only `continuum complete`
+  removed the pointer; the TUI's and the dashboard HITL button's `complete_run`
+  claimed to mirror that command and did not, so completing a run from either
+  left the next session banner surfacing finished work as the active run. The
+  cleanup is now a single helper (`continuum.checkpoint.clear_resume_pointer`)
+  all three paths route through. A pointer naming any other run is left in
+  place, and an unreadable or undeletable file is tolerated rather than failing
+  the completion. `tests/test_resume_pointer.py` pins the helper and each of
+  the three completion paths, and was verified to fail without the fix.
 - **The horizon `abort_condition_year` scenario now reaches abort (#1028).**
   The scenario was labelled `correct_mode="abort"` but drove the abort through
   `DECISION_INVALIDATED`, an event the recovery engine never routes to `ABORT`
