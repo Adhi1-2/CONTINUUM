@@ -53,12 +53,17 @@ def _all_events(storage: Storage, run_id: str) -> list[Event]:
 
 
 def _children(storage: Storage, run_id: str) -> list[Run]:
-    """Find child runs using the current metadata-based run schema."""
-    return [
-        run
-        for run in storage.list_runs(limit=None)
-        if dict(run.metadata).get("parent_run_id") == run_id
-    ]
+    """Find child runs by the run row's parent_run_id field, falling back to
+    the older metadata-based convention so records written before the column
+    existed still show their children."""
+    children: list[Run] = []
+    for run in storage.list_runs(limit=None):
+        legacy_parent = dict(run.metadata).get("parent_run_id")
+        if run.parent_run_id == run_id or (
+            run.parent_run_id is None and legacy_parent == run_id
+        ):
+            children.append(run)
+    return children
 
 
 def _attempts_for_type(events: Sequence[Event], action_type: str) -> int:
