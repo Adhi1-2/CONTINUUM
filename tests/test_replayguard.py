@@ -327,3 +327,136 @@ def run(*argv: str) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     code = main(list(argv), out=out, err=err)
     return code, out.getvalue(), err.getvalue()
+
+
+# --- semantic similarity wiring (issue #291 / #1029) ----------------------------- #
+
+
+def _fuzzy_verdict(
+    db: str,
+    action_type: str,
+    rendered: str,
+    arguments: dict | None = None,
+    **cfg_kw: object,
+):
+    """Fold the ledger and classify with a fuzzy similarity backend."""
+    from continuum.actions.ledger import fold_action_events
+    from continuum.replay_similarity import SimilarityConfig, SimilarityKind
+
+    with SQLiteStorage(db) as store:
+        folded = fold_action_events(store.read_events("run_1"))
+    return evaluate(
+        action_type=action_type,
+        rendered_key=rendered,
+        run_id="run_1",
+        actions_by_key=folded,
+        arguments=arguments,
+        similarity=SimilarityConfig(kind=SimilarityKind.FUZZY, **cfg_kw),
+    )
+
+
+def _seed_with_args(db: str, action_type: str, rendered: str, arguments: dict) -> None:
+    """Journal a claim whose recorded arguments the guard can compare."""
+    with SQLiteStorage(db) as store:
+        ledger = ActionLedger(store, "run_1")
+        outcome = ledger.claim(action_type, arguments, key=rendered)
+        ledger.complete(outcome.key, external_id="ext-1")
+
+
+def test_fuzzy_backend_classifies_rephrased_retry_as_duplicate(db: str) -> None:
+    # The failure #291 was written for: exact key matching cannot see that
+    # "pay invoice INV-001" and "settle outstanding amount for INV-001" are
+    # the same intent, so a post-restore retry the LLM rephrased was denied
+    # as unclaimed (surfaced as fork divergence) instead of answered from
+    # the ledger. With a fuzzy backend configured the rephrased call scores
+    # above the replay threshold and classifies as SKIP_DUPLICATE.
+    _seed_with_args(db, "pay_invoice", "i:1", {"memo": "pay invoice INV-001"})
+    v = _fuzzy_verdict(
+        db,
+        "pay_invoice",
+        "settle outstanding amount for INV-001",
+        arguments={"memo": "pay the invoice INV-001"},
+        replay_threshold=0.70,
+    )
+    assert v.kind is GuardKind.SKIP_DUPLICATE
+    assert "semantically matches" in v.reason
+
+
+def test_fuzzy_backend_still_forks_a_genuinely_divergent_call(db: str) -> None:
+    # A call naming a different resource must stay DENY_UNCLAIMED so the
+    # gate's fork detection (gate.py #259) keeps rendering the divergence:
+    # fuzzy matching may never merge two deliberately different resources.
+    _seed_with_args(db, "pay_invoice", "i:1", {"memo": "pay invoice INV-001"})
+    v = _fuzzy_verdict(
+        db,
+        "pay_invoice",
+        "pay invoice INV-999",
+        arguments={"memo": "pay invoice INV-999"},
+        replay_threshold=0.70,
+    )
+    assert v.kind is GuardKind.DENY_UNCLAIMED
+
+
+def test_similarity_is_opt_in_and_exact_by_default(db: str) -> None:
+    # No similarity configured: behaviour identical to before #1029 — the
+    # rephrased call misses its key and is denied as unclaimed.
+    _seed_with_args(db, "pay_invoice", "i:1", {"memo": "pay invoice INV-001"})
+    v = verdict(db, "pay_invoice", "settle outstanding amount for INV-001")
+    assert v.kind is GuardKind.DENY_UNCLAIMED
+
+
+def test_semantic_match_never_crosses_action_types(db: str) -> None:
+    # Same arguments under a different action type are a different side
+    # effect; similarity must not merge them.
+    _seed_with_args(db, "send_email", "i:1", {"memo": "pay the invoice INV-001"})
+    v = _fuzzy_verdict(
+        db,
+        "pay_invoice",
+        "settle outstanding amount for INV-001",
+        arguments={"memo": "pay the invoice INV-001"},
+        replay_threshold=0.70,
+    )
+    assert v.kind is GuardKind.DENY_UNCLAIMED
+
+
+def test_gate_passes_similarity_through_to_the_core(db: str) -> None:
+    # The wiring the issue asks for: gate.decide threads the backend to
+    # replayguard.evaluate. A rephrased call under a fuzzy config passes the
+    # gate's unclaimed branch and lands in the already-completed message.
+    from continuum.actions.ledger import fold_action_events
+    from continuum.gate import decide as gate_decide
+    from continuum.replay_similarity import SimilarityConfig, SimilarityKind
+
+    _seed_with_args(db, "pay_invoice", "i:1", {"memo": "pay invoice INV-001"})
+    with SQLiteStorage(db) as store:
+        folded = fold_action_events(store.read_events("run_1"))
+    decision = gate_decide(
+        {"pay_invoice": {"key_template": "{memo}"}},
+        "pay_invoice",
+        {"memo": "pay the invoice INV-001"},
+        run_id="run_1",
+        actions_by_key=folded,
+        similarity=SimilarityConfig(kind=SimilarityKind.FUZZY, replay_threshold=0.70),
+    )
+    assert not decision.allow
+    assert "already completed" in decision.reason
+
+
+def test_load_similarity_config_reads_the_gate_registry(tmp_path: Path) -> None:
+    # The operator surface: a top-level "similarity" object in gate.json.
+    from continuum.gate import GateConfigError, load_similarity_config
+
+    registry = tmp_path / "gate.json"
+    registry.write_text(
+        '{"tools": {}, "similarity": {"kind": "fuzzy", "replay_threshold": 0.7}}',
+        encoding="utf-8",
+    )
+    cfg = load_similarity_config(registry)
+    assert cfg is not None and cfg.kind.value == "fuzzy" and cfg.replay_threshold == 0.7
+
+    registry.write_text('{"tools": {}}', encoding="utf-8")
+    assert load_similarity_config(registry) is None
+
+    registry.write_text('{"tools": {}, "similarity": {"kind": "bogus"}}', encoding="utf-8")
+    with pytest.raises(GateConfigError):
+        load_similarity_config(registry)

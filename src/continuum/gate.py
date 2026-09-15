@@ -33,10 +33,13 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from continuum.actions.idempotency import idempotency_key
 from continuum.events import EventType
+
+if TYPE_CHECKING:
+    from continuum.replay_similarity import SimilarityConfig
 
 __all__ = [
     "DEFAULT_GATE_CONFIG_PATH",
@@ -176,6 +179,41 @@ def load_gate_config(path: Path) -> dict[str, dict[str, Any]] | None:
     return tools
 
 
+def load_similarity_config(
+    path: Path, config: Mapping[str, Mapping[str, Any]] | None = None
+) -> SimilarityConfig | None:
+    """Read the replay-similarity backend from the gate registry.
+
+    The registry's optional top-level ``"similarity"`` object selects the
+    backend the guard uses when an exact key misses the ledger (issue #291):
+
+    ``{"tools": {...}, "similarity": {"kind": "fuzzy", "replay_threshold": 0.9}}``
+
+    Absent or exact → ``None`` (exact-only matching, the unchanged default).
+    Present but malformed raises :class:`GateConfigError`: a broken similarity
+    setting must not silently degrade into exact matching, since the operator
+    configured it expecting paraphrase detection.
+    """
+    if not path.exists():
+        return None
+    from continuum.replay_similarity import similarity_backend
+
+    location = path.resolve()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GateConfigError(f"{location} is not valid JSON ({exc})") from exc
+    similarity = raw.get("similarity") if isinstance(raw, dict) else None
+    if similarity is None:
+        return None
+    if not isinstance(similarity, dict):
+        raise GateConfigError(f"{location}: 'similarity' must be an object")
+    try:
+        return similarity_backend(similarity)
+    except ValueError as exc:
+        raise GateConfigError(f"{location}: invalid similarity config ({exc})") from exc
+
+
 def normalize_key_value(value: Any) -> Any:
     """Surrounding whitespace stripped from a string value, others untouched.
 
@@ -256,6 +294,7 @@ def decide(
     actions_by_key: Mapping[str, Any],
     storage: Any | None = None,
     consumed_authorities: Mapping[str, Any] | None = None,
+    similarity: SimilarityConfig | None = None,
 ) -> Decision:
     """Decide whether one tool call may proceed.
 
@@ -267,6 +306,11 @@ def decide(
     was completed in another run, which is the cross-run tenancy guarantee
     for memory writes (issue #565). Authority resurrection is also checked
     when ``consumed_authorities`` is supplied (issue #289b).
+
+    ``similarity`` (issue #291) selects the replay-similarity backend the
+    guard uses for calls whose exact key misses the ledger. ``None`` keeps
+    exact-only matching, so the default behaviour is unchanged; load it with
+    :func:`load_similarity_config` from the gate registry.
     """
     # Authority resurrection check (issue #289b): if any string value in the
     # tool input matches a consumed authority, refuse before any ledger check.
@@ -377,12 +421,17 @@ def decide(
     from continuum.replayguard import evaluate as core_evaluate
 
     # Single source of truth (#237): the gate classifies through the shared
-    # replayguard core, then renders its own registry-aware messages.
+    # replayguard core, then renders its own registry-aware messages. The
+    # similarity backend (#291) is threaded through so a configured
+    # fuzzy/embedding backend can classify a rephrased post-restore retry as
+    # a duplicate instead of a fork; None keeps exact-only matching.
     decision = core_evaluate(
         action_type=action_type,
         rendered_key=rendered,
         run_id=run_id,
         actions_by_key=actions_by_key,
+        arguments=tool_input,
+        similarity=similarity,
     )
     action = actions_by_key.get(decision.key) if decision.key else None
 

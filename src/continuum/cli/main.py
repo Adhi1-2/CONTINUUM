@@ -49,6 +49,7 @@ from continuum.gate import (
     GateConfigError,
     collect_consumed_authorities,
     load_gate_config,
+    load_similarity_config,
 )
 from continuum.gate import (
     decide as gate_decide,
@@ -2908,6 +2909,7 @@ def cmd_gate(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> 
     config_path = Path(args.config) if args.config else Path(DEFAULT_GATE_CONFIG_PATH)
     try:
         config = load_gate_config(config_path)
+        similarity = load_similarity_config(config_path)
     except GateConfigError as exc:
         print(f"gate: {exc}; denying until it is fixed", file=err)
         return 2
@@ -2944,6 +2946,7 @@ def cmd_gate(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> 
         run_id=run_id or "",
         actions_by_key=actions_by_key,
         consumed_authorities=consumed,
+        similarity=similarity,
     )
     if decision.allow:
         _emit(

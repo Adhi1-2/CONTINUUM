@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from continuum.replay_similarity import SimilarityConfig
+
 __all__ = [
     "GuardKind",
     "GuardDecision",
@@ -84,14 +86,37 @@ def evaluate(
     rendered_key: str,
     run_id: str,
     actions_by_key: Mapping[str, Any],
+    arguments: Mapping[str, Any] | None = None,
+    similarity: SimilarityConfig | None = None,
 ) -> GuardDecision:
-    """Classify one intended side effect against the folded ledger."""
+    """Classify one intended side effect against the folded ledger.
+
+    Classification is exact-key by default (issue #291 keeps ``exact`` the
+    safest default: no false duplicate-suppression). When ``similarity``
+    selects a non-exact backend and ``arguments`` carries the new call's
+    arguments, a key that misses is re-examined semantically against
+    same-type journalled work: a paraphrase of an already-completed call
+    classifies as SKIP_DUPLICATE instead of DENY_UNCLAIMED, so a post-restore
+    retry the LLM rephrased is answered from the ledger rather than surfaced
+    as divergence. A score in the fork band stays DENY_UNCLAIMED — the gate's
+    fork detection renders it — and anything the backends cannot place is
+    denied, never allowed: fail-closed.
+    """
     from continuum.actions.idempotency import idempotency_key
     from continuum.models import ActionStatus
 
     key = str(idempotency_key(action_type, None, scope=run_id, key=rendered_key))
     action = actions_by_key.get(key)
     if action is None or action.action_type != action_type:
+        semantic = _semantic_match(
+            action_type=action_type,
+            rendered_key=rendered_key,
+            arguments=arguments,
+            actions_by_key=actions_by_key,
+            similarity=similarity,
+        )
+        if semantic is not None:
+            return semantic
         return GuardDecision(
             GuardKind.DENY_UNCLAIMED,
             f"{action_type!r} {rendered_key!r} has no ledger claim",
@@ -116,6 +141,69 @@ def evaluate(
         GuardKind.DENY_RECLAIM,
         f"previous attempt of {action_type!r} {rendered_key!r} is closed "
         f"({status.value}); claim again before retrying",
+    )
+
+
+def _semantic_match(
+    *,
+    action_type: str,
+    rendered_key: str,
+    arguments: Mapping[str, Any] | None,
+    actions_by_key: Mapping[str, Any],
+    similarity: SimilarityConfig | None,
+) -> GuardDecision | None:
+    """Classify a key-missing call against similar journalled work.
+
+    Returns None when the call stays DENY_UNCLAIMED (no backend configured,
+    or the best score falls in the fork band), leaving the gate's fork
+    detection to render the divergence. Only same-type actions are compared.
+    """
+    from continuum.models import ActionStatus
+    from continuum.replay_similarity import SimilarityKind
+    from continuum.replay_similarity import similarity as score_of
+
+    if similarity is None or similarity.kind is SimilarityKind.EXACT or arguments is None:
+        return None
+
+    best_score = 0.0
+    best: tuple[str, Any] | None = None
+    for ledger_key, prior in actions_by_key.items():
+        if prior.action_type != action_type or prior.status is None:
+            continue
+        prior_args = dict(prior.arguments or {})
+        try:
+            score = score_of(dict(arguments), prior_args, similarity)
+        except Exception:
+            # A backend failure must never widen permission (fail-closed):
+            # skip the candidate rather than guessing its score.
+            continue
+        if score > best_score:
+            best_score = score
+            best = (ledger_key, prior)
+
+    if best is None or best_score < similarity.replay_threshold:
+        return None
+    ledger_key, prior = best
+    matched = f"semantically matches journalled {action_type!r} claim (score {best_score:.2f})"
+    if prior.status is ActionStatus.STARTED:
+        return GuardDecision(GuardKind.ALLOW, f"{matched}; live claim", key=ledger_key)
+    if prior.status is ActionStatus.COMPLETED:
+        return GuardDecision(
+            GuardKind.SKIP_DUPLICATE,
+            f"{action_type!r} {rendered_key!r} {matched}; already completed",
+            key=ledger_key,
+        )
+    if prior.status is ActionStatus.UNKNOWN:
+        return GuardDecision(
+            GuardKind.BLOCK_UNCERTAIN,
+            f"{action_type!r} {rendered_key!r} {matched}; outcome unknown, reconcile first",
+            key=ledger_key,
+        )
+    return GuardDecision(
+        GuardKind.DENY_RECLAIM,
+        f"{action_type!r} {rendered_key!r} {matched}; previous attempt is closed "
+        f"({prior.status.value}), claim again before retrying",
+        key=ledger_key,
     )
 
 

@@ -168,10 +168,33 @@ def classify_call(
     return "fresh", None
 
 
-def similarity_backend(name_or_config: str | SimilarityConfig) -> SimilarityConfig:
-    """Build a SimilarityConfig from a registry entry name or explicit config."""
+def similarity_backend(name_or_config: str | dict[str, Any] | SimilarityConfig) -> SimilarityConfig:
+    """Build a SimilarityConfig from a registry entry name or explicit config.
+
+    Accepts a ``SimilarityConfig`` unchanged, a backend name (``"exact"``,
+    ``"fuzzy"``, ``"embedding"``), or a config dict with ``kind`` plus
+    optional ``replay_threshold`` and ``fork_threshold`` keys — the shape the
+    gate registry (``.continuum/gate.json``'s top-level ``"similarity"``
+    object) stores.
+    """
     if isinstance(name_or_config, SimilarityConfig):
         return name_or_config
+    if isinstance(name_or_config, dict):
+        raw_kind = name_or_config.get("kind", "exact")
+        if not isinstance(raw_kind, str):
+            raise ValueError(f"unknown similarity backend kind {raw_kind!r}")
+        base = similarity_backend(raw_kind)
+        replay = name_or_config.get("replay_threshold", base.replay_threshold)
+        fork = name_or_config.get("fork_threshold", base.fork_threshold)
+        for name, value in (("replay_threshold", replay), ("fork_threshold", fork)):
+            if not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"similarity {name!r} must be a number in [0, 1]")
+        return SimilarityConfig(
+            kind=base.kind,
+            replay_threshold=float(replay),
+            fork_threshold=float(fork),
+            embedder=base.embedder,
+        )
     kind_map: dict[str, SimilarityKind] = {
         "exact": SimilarityKind.EXACT,
         "fuzzy": SimilarityKind.FUZZY,
