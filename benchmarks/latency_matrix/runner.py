@@ -16,6 +16,7 @@ recovery decision, and never turns the soft SLO into a hard production limit.
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import statistics
@@ -181,7 +182,9 @@ def _percentile(sorted_samples: list[float], q: float) -> float:
     """Deterministic nearest-rank percentile of already-sorted samples."""
     if not sorted_samples:
         raise ValueError("percentile of an empty sample set")
-    idx = min(int(q * (len(sorted_samples) - 1)), len(sorted_samples) - 1)
+    # Nearest-rank: the ceil(q * n)-th value. Clamped at both ends because
+    # ceil(0 * n) is 0 and a negative index would silently select the maximum.
+    idx = max(0, min(math.ceil(q * len(sorted_samples)) - 1, len(sorted_samples) - 1))
     return sorted_samples[idx]
 
 
@@ -265,6 +268,10 @@ def run_matrix(
     tolerance = tolerance or Tolerance.from_env()
     if baseline_path is None:
         baseline_path = baseline_mod.BASELINE_PATH
+    # Materialized once so a generator input can feed both the measurements and
+    # the recorded config; reading it twice would exhaust it and silently log
+    # an empty grid beside the points that were actually run.
+    points = tuple(points)
     dimensions = [
         measure_point(
             files,

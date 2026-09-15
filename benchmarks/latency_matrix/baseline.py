@@ -29,6 +29,7 @@ A soft-budget miss is a different thing entirely and is never a CI failure: see
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,12 @@ class Tolerance:
         """
         factor = _env_float(_REGRESSION_FACTOR_ENV, DEFAULT_REGRESSION_FACTOR)
         floor = _env_float(_ABSOLUTE_FLOOR_ENV, DEFAULT_ABSOLUTE_FLOOR_MS)
+        # NaN or infinity would not raise here but silently disables the gate:
+        # every comparison against NaN is False, and no median can exceed
+        # infinity, so no point could ever regress.
+        for name, value in ((_REGRESSION_FACTOR_ENV, factor), (_ABSOLUTE_FLOOR_ENV, floor)):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value}")
         if factor <= 1.0:
             raise ValueError(
                 f"{_REGRESSION_FACTOR_ENV} must be > 1.0 (got {factor}); a factor at or "
@@ -121,6 +128,30 @@ def classify_regression(
     return PASS
 
 
+def _well_formed(data: Any) -> bool:
+    """Whether ``data`` has the shape ``baseline_median`` is about to assume.
+
+    Every field read without a guard is checked here, so a malformed artifact
+    degrades to ``no_baseline`` instead of raising partway through a lookup.
+    """
+    if not isinstance(data, dict):
+        return False
+    points = data.get("points")
+    if not isinstance(points, list):
+        return False
+    for point in points:
+        if not isinstance(point, dict):
+            return False
+        median = point.get("median_ms")
+        if not isinstance(median, (int, float)) or isinstance(median, bool):
+            return False
+        if not isinstance(point.get("files"), int) or isinstance(point.get("files"), bool):
+            return False
+        if not isinstance(point.get("decisions"), int) or isinstance(point.get("decisions"), bool):
+            return False
+    return True
+
+
 def load_baseline(path: Path | None = None) -> dict[str, Any] | None:
     """Read the committed baseline, or ``None`` when it is absent or unreadable.
 
@@ -135,6 +166,8 @@ def load_baseline(path: Path | None = None) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict) or data.get("benchmark") != BENCHMARK_NAME:
         return None
+    if not _well_formed(data):
+        return None
     return data
 
 
@@ -147,12 +180,9 @@ def baseline_median(
     data = load_baseline(path)
     if data is None:
         return None
-    for point in data.get("points", []):
-        if point.get("files") == files and point.get("decisions") == decisions:
-            median = point.get("median_ms")
-            if isinstance(median, (int, float)) and not isinstance(median, bool):
-                return float(median)
-            return None
+    for point in data["points"]:
+        if point["files"] == files and point["decisions"] == decisions:
+            return float(point["median_ms"])
     return None
 
 

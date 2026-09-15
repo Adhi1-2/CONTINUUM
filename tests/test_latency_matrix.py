@@ -21,6 +21,7 @@ from benchmarks.latency_matrix.runner import (
     DECISIONS,
     DEFAULT_MATRIX,
     FILES,
+    _percentile,
     run_matrix,
     soft_budget_ms,
     soft_budget_status,
@@ -120,6 +121,29 @@ def test_environment_metadata_records_runner_without_network(tmp_path: Path) -> 
     assert isinstance(env["ci"], bool)
 
 
+def test_percentile_is_nearest_rank() -> None:
+    """``ceil(q * n)`` selects the rank the docstring names, not an interpolated index."""
+    nine = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    assert _percentile(nine, 0.95) == 9.0
+    assert _percentile(nine, 0.0) == 1.0
+    assert _percentile(nine, 1.0) == 9.0
+    with pytest.raises(ValueError, match="empty sample set"):
+        _percentile([], 0.5)
+
+
+def test_run_matrix_records_generator_points(tmp_path: Path) -> None:
+    """A generator input must feed both the measurements and the recorded grid."""
+    report = run_matrix(
+        points=(p for p in SMALL_POINTS),
+        samples=2,
+        warmup=0,
+        tolerance=DEFAULT_TOLERANCE,
+        baseline_path=tmp_path / "absent.json",
+    )
+    assert [(d.files, d.decisions) for d in report.dimensions] == list(SMALL_POINTS)
+    assert [tuple(p) for p in report.config["matrix_points"]] == list(SMALL_POINTS)
+
+
 # --- Tolerance policy -------------------------------------------------------
 
 
@@ -175,6 +199,24 @@ def test_tolerance_rejects_nonsensical_factor(monkeypatch: pytest.MonkeyPatch) -
         Tolerance.from_env()
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_tolerance_rejects_non_finite_thresholds(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """NaN and infinity silently disable the gate rather than raising, so reject them.
+
+    Every comparison against NaN is False and nothing can exceed infinity, so
+    either one would turn every run into a pass without an error to signal it.
+    """
+    monkeypatch.setenv("CONTINUUM_LATENCY_REGRESSION_FACTOR", value)
+    with pytest.raises(ValueError, match="must be a finite number"):
+        Tolerance.from_env()
+    monkeypatch.delenv("CONTINUUM_LATENCY_REGRESSION_FACTOR")
+    monkeypatch.setenv("CONTINUUM_LATENCY_ABSOLUTE_FLOOR_MS", value)
+    with pytest.raises(ValueError, match="must be a finite number"):
+        Tolerance.from_env()
+
+
 # --- Baseline artifact ------------------------------------------------------
 
 
@@ -206,6 +248,30 @@ def test_missing_or_malformed_baseline_degrades_to_none(tmp_path: Path) -> None:
     assert baseline_mod.load_baseline(other) is None
 
 
+def _write(tmp_path: Path, payload: object) -> Path:
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        "not-a-list",
+        None,
+        ["not-a-dict"],
+        [{"files": 10, "decisions": 2}],  # no median_ms
+        [{"files": "ten", "decisions": 2, "median_ms": 1.0}],
+        [{"files": 10, "decisions": 2, "median_ms": "fast"}],
+    ],
+)
+def test_malformed_baseline_degrades_to_no_baseline(tmp_path: Path, points: object) -> None:
+    """A lookup must never raise on a hand-edited artifact; it reads as absent."""
+    path = _write(tmp_path, {"benchmark": baseline_mod.BENCHMARK_NAME, "points": points})
+    assert baseline_mod.load_baseline(path) is None
+    assert baseline_mod.baseline_median(10, 2, path) is None
+
+
 def test_matrix_uses_the_committed_baseline(tmp_path: Path) -> None:
     """A recorded baseline close to the measurement classifies as pass."""
     probe = _run_small(tmp_path)
@@ -232,20 +298,24 @@ def test_matrix_detects_regression_against_a_stale_baseline(tmp_path: Path) -> N
                 "schema_version": 1,
                 "tolerance": DEFAULT_TOLERANCE.as_dict(),
                 "points": [
-                    # The 100-decision point measures tens of ms, so a 1 ms
-                    # expectation breaches both thresholds.
-                    {"files": 10, "decisions": 100, "median_ms": 1.0},
-                    {"files": 10, "decisions": 2, "median_ms": 0.1},
+                    # An implausibly fast expectation for the 100-decision point
+                    # and an implausibly slow one for the 2-decision point.
+                    {"files": 10, "decisions": 100, "median_ms": 0.001},
+                    {"files": 10, "decisions": 2, "median_ms": 1000.0},
                 ],
             }
         ),
         encoding="utf-8",
     )
+    # A zero absolute floor makes the classification depend on the ratio alone,
+    # so the assertion holds on a fast runner as well as a slow one; the
+    # default 25 ms floor would otherwise set a minimum machine speed.
+    integration_tolerance = Tolerance(regression_factor=1.5, absolute_floor_ms=0.0)
     report = run_matrix(
         points=SMALL_POINTS,
         samples=3,
         warmup=0,
-        tolerance=DEFAULT_TOLERANCE,
+        tolerance=integration_tolerance,
         baseline_path=baseline_path,
     )
     heavy = next(d for d in report.dimensions if d.decisions == 100)
