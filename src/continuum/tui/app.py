@@ -163,7 +163,12 @@ class TuiApp:
     def _selected_action(self) -> model.ActionRow | None:
         """The action row under the cursor, on the actions tab only."""
         storage = self.storage
-        if storage is None or self.view != "detail" or self.TABS[self.tab] != "actions" or self.cursor < 1:
+        if (
+            storage is None
+            or self.view != "detail"
+            or self.TABS[self.tab] != "actions"
+            or self.cursor < 1
+        ):
             return None
         rows = model.action_rows(storage, self._run_id() or "")
         offset = self.cursor - 1

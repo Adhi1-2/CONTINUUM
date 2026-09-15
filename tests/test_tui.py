@@ -441,8 +441,7 @@ def test_the_incompatible_database_splash_still_draws_the_logo() -> None:
     app = TuiApp(
         None,
         database_error=(
-            "database schema v6 was written by a newer CONTINUUM; "
-            "this build understands v2"
+            "database schema v6 was written by a newer CONTINUUM; this build understands v2"
         ),
     )
     screen = _FakeScreen([])
@@ -526,8 +525,7 @@ def test_bare_continuum_restores_splash_for_an_incompatible_database(
 
     def fail_open(path: str) -> Any:
         raise SchemaVersionError(
-            "database schema v6 was written by a newer CONTINUUM; "
-            "this build understands v2"
+            "database schema v6 was written by a newer CONTINUUM; this build understands v2"
         )
 
     def fake_run_tui(storage: Any, **kw: Any) -> int:
@@ -546,7 +544,6 @@ def test_bare_continuum_restores_splash_for_an_incompatible_database(
     assert code == 77
     assert seen["storage"] is None
     assert "schema v6" in seen["database_error"]
-
 
     """A script running `continuum` blind must find usage text, not curses."""
     code, out, _ = run("--db", db)

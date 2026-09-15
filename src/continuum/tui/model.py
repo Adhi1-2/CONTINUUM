@@ -59,9 +59,7 @@ def _children(storage: Storage, run_id: str) -> list[Run]:
     children: list[Run] = []
     for run in storage.list_runs(limit=None):
         legacy_parent = dict(run.metadata).get("parent_run_id")
-        if run.parent_run_id == run_id or (
-            run.parent_run_id is None and legacy_parent == run_id
-        ):
+        if run.parent_run_id == run_id or (run.parent_run_id is None and legacy_parent == run_id):
             children.append(run)
     return children
 
@@ -78,6 +76,7 @@ def _attempts_for_type(events: Sequence[Event], action_type: str) -> int:
         key = str(event.payload.get("key", ""))
         attempts[key] = attempts.get(key, 0) + 1
     return max(attempts.values(), default=0)
+
 
 __all__ = [
     "ActionRow",
