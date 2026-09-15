@@ -65,6 +65,7 @@ class TuiApp:
         self.cursor = -1  # selected body line in a table tab, -1 when none
         self.scroll = 0
         self.rows: list[RunRow] = []
+        self._run_count: int | None = None
         self.lines: list[str] = []
         self.pending: tuple[str, Callable[[], str]] | None = None
         self.message = ""
@@ -85,15 +86,24 @@ class TuiApp:
                 "Run `continuum --db <compatible-database> tui` to open run data.",
             ]
             return
-        if self.view in ("landing", "runs"):
-            # the landing screen shows the run count, and leaving it lands on
-            # the runs list, so both views read the same rows
+        if self.view == "landing":
+            # the splash only needs a count; assessing recovery for every run
+            # on every tick would price the idle screen at a full store scan
+            self.rows = []
+            self._run_count = self._count_runs()
+            self.cursor = -1
+        elif self.view == "runs":
             self.rows = model.run_rows(self.storage)
             self.cursor = -1  # the runs list marks its selection itself
             if self.rows:
                 self.index = min(self.index, len(self.rows) - 1)
         else:
             self._refresh_detail()
+
+    def _count_runs(self) -> int:
+        """Count runs without assessing recovery for each: a bare list read."""
+        assert self.storage is not None
+        return len(self.storage.list_runs())
 
     def _run_id(self) -> str | None:
         if 0 <= self.index < len(self.rows):
@@ -116,6 +126,24 @@ class TuiApp:
             return
         tab = self.TABS[self.tab]
         self.cursor = -1
+        try:
+            self._render_detail_tab(storage, run_id, tab)
+        except Exception as exc:
+            # One unreadable run must fail this view alone, never the process:
+            # the dashboard is the operator's window into a broken store, so
+            # crashing here would hide the very thing being investigated.
+            self.lines = [
+                f"Cannot read run {run_id} ({tab} tab): {exc}",
+                "",
+                "The rest of the dashboard is unaffected. Press esc for the runs list,",
+                "r to retry, or run `continuum verify` outside the dashboard for detail.",
+            ]
+        if self.scroll > max(0, len(self.lines) - 1):
+            self.scroll = 0
+
+    def _render_detail_tab(self, storage: Storage, run_id: str, tab: str) -> None:
+        """Fill self.lines for one tab. Raises on an unreadable run; the
+        caller renders the failure instead of letting it escape the app."""
         rows: list[Any]  # one of the model's table row types, per tab
         if tab == "overview":
             self.lines = model.overview_lines(storage, run_id)
@@ -157,8 +185,6 @@ class TuiApp:
                 for r in rows
             ] or ["No action attempts recorded."]
             self.cursor = 1 if len(self.lines) > 1 else -1
-        if self.scroll > max(0, len(self.lines) - 1):
-            self.scroll = 0
 
     def _selected_action(self) -> model.ActionRow | None:
         """The action row under the cursor, on the actions tab only."""
@@ -204,7 +230,8 @@ class TuiApp:
             art: list[str] = list(_LOGO_LINES)
         else:  # too narrow for the logo: a banner that fits, not one that clips
             art = ["C O N T I N U U M"]
-        runs_line = f"{len(self.rows)} run(s) recorded" if self.rows else "no runs recorded yet"
+        count = self._run_count or 0
+        runs_line = f"{count} run(s) recorded" if count else "no runs recorded yet"
         status: list[str] = []
         if self.database_error:
             status = [
