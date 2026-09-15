@@ -9,6 +9,7 @@ never half-render.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import types
 from collections.abc import Iterator
@@ -147,6 +148,33 @@ def test_budget_rows_count_attempts_over_the_whole_log(db: str, store: SQLiteSto
     assert rows["send_invoice"].remaining == rows["send_invoice"].max_attempts - 2
 
 
+def test_budget_rows_read_the_configured_registry(
+    db: str, store: SQLiteStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limits come from .continuum/budgets.json, and configured types with no
+    attempts still appear with a full allowance."""
+    run("--db", db, "start", "r1", "--goal", "g")
+    ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:I-1")
+    registry = tmp_path / ".continuum" / "budgets.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "default_max_attempts": 3,
+                "action_types": {"send_invoice": {"max_attempts": 5}, "unused_type": 2},
+            }
+        )
+    )
+    monkeypatch.setattr(tui_model, "DEFAULT_BUDGETS_PATH", str(registry))
+
+    rows = {r.action_type: r for r in tui_model.budget_rows(store, "r1")}
+    assert rows["send_invoice"].max_attempts == 5
+    assert rows["send_invoice"].remaining == 4
+    assert rows["unused_type"].attempts == 0
+    assert rows["unused_type"].max_attempts == 2
+    assert rows["unused_type"].remaining == 2
+
+
 def test_family_lines_show_every_child_verdict(db: str, store: SQLiteStorage) -> None:
     run("--db", db, "start", "par", "--goal", "supervise")
     run("--db", db, "start", "kid", "--goal", "work", "--parent", "par")
@@ -168,6 +196,19 @@ def test_recovery_lines_render_the_verdict_and_the_family_block(
     assert "CONTINUUM RECOVERY" in lines
     assert "Recovery decision:" in lines
     assert "FAMILY BLOCKED" in lines
+
+
+def test_a_completed_child_never_blocks_the_parent(db: str, store: SQLiteStorage) -> None:
+    """Terminal children are excluded, matching roll_up_children and resume."""
+    run("--db", db, "start", "par", "--goal", "supervise")
+    run("--db", db, "start", "kid", "--goal", "work", "--parent", "par")
+    run("--db", db, "start", "done", "--goal", "finished", "--parent", "par")
+    ActionLedger(SQLiteStorage(db), "kid").claim("send_invoice", {}, key="invoice:I-9")
+    run("--db", db, "complete", "done")
+
+    lines = "\n".join(tui_model.recovery_lines(store, "par"))
+    assert "FAMILY BLOCKED" in lines  # the live child still blocks
+    assert "done" not in lines  # but the completed child is not counted
 
 
 # --------------------------------------------------------------------------- #
