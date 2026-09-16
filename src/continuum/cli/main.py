@@ -1485,7 +1485,27 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
     # spamming, and delivery failure is dead-lettered, never raised - the
     # verdict above is already final.
     if presented_mode == RecoveryMode.REQUEST_HUMAN.value:
+        from continuum.recovery.webhooks import EVENT_REQUIRES_REVIEW
+
         _notify_blocked_run(storage, run_id, presented_mode, payload, decision, args, err)
+        # A run parked on self-certified state is a distinct signal from a
+        # plain human gate, and the requires_review filter exists to carry it
+        # (issue #1180). RecoveryMode has no such member by design: the mode
+        # is derived from the validation report, which is the only place that
+        # knows a component was downgraded for a self-certified origin.
+        if any(
+            entry.status is StateStatus.REQUIRES_REVIEW
+            for entry in decision.validation.report.statuses
+        ):
+            _notify_blocked_run(
+                storage,
+                run_id,
+                EVENT_REQUIRES_REVIEW,
+                {**payload, "mode": EVENT_REQUIRES_REVIEW},
+                decision,
+                args,
+                err,
+            )
 
     if effective_mode is not RecoveryMode.RESUME and not args.repair:
         print(

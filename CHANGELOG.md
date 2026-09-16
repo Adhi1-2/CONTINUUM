@@ -33,6 +33,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The `requires_review` webhook event filter now fires, instead of being
+  accepted by the registry and silently never delivered (#1180).**
+  `notify_blocked` selects endpoints by matching the `mode` string it is
+  handed, and `cmd_resume` only ever forwards a `RecoveryMode` value, which
+  has no `requires_review` member. An operator who configured the documented
+  filter got zero notifications, forever, with no warning: the exact silent
+  failure the strict loader validation was written to prevent. The CLI now
+  derives the review mode from the validation report rather than the enum,
+  and when a blocked run's goal or progress was downgraded for a
+  self-certified origin it delivers a second round to endpoints subscribed
+  to `requires_review`, alongside the human-gate round and under its own
+  dedup key. A run with nothing to review still fires it not at all, and the
+  payload reports its own mode so the recipient can tell which bell rang.
+  `docs/guides/webhooks.md` now states when the filter fires.
+
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
   types at the top level (`{"send_invoice": {...}}`) instead of nesting them
