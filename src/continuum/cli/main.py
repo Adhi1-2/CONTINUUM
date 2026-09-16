@@ -4265,7 +4265,8 @@ def build_parser() -> argparse.ArgumentParser:
     tui = add(
         "tui",
         cmd_tui,
-        "Full-screen terminal dashboard: monitor and control runs (q quits).",
+        "Full-screen terminal dashboard: monitor and control runs (q quits). "
+        "The landing splash animates; set CONTINUUM_NO_ANIMATION to keep it static.",
     )
     tui.add_argument(
         "--refresh",
