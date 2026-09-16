@@ -31,6 +31,7 @@ from typing import Any
 
 from continuum import __version__
 from continuum.actions import ActionLedger
+from continuum.actions.ledger import UNCERTAIN_STATUSES
 from continuum.checkpoint import CheckpointError, CheckpointManager, CheckpointTrigger
 from continuum.cli.colour import Palette
 from continuum.cli.exitcodes import ExitCode, exit_code_for
@@ -54,7 +55,6 @@ from continuum.gate import (
     decide as gate_decide,
 )
 from continuum.models import (
-    ActionStatus,
     EnvironmentSnapshot,
     EnvResource,
     Origin,
@@ -3190,11 +3190,7 @@ def cmd_actions(args: argparse.Namespace, storage: Storage, out: Any, err: Any) 
 
     lines = [f"{'STATUS':<16} {'TYPE':<28} EXTERNAL ID"]
     lines += [f"{a.status.value:<16} {a.action_type:<28} {a.external_id or '-'}" for a in actions]
-    uncertain = [
-        a
-        for a in actions
-        if a.status in (ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW)
-    ]
+    uncertain = [a for a in actions if a.status in UNCERTAIN_STATUSES]
     if uncertain:
         lines.append("")
         lines.append(

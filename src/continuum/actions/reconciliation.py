@@ -237,7 +237,14 @@ def _key_for(ledger: ActionLedger, action: Action) -> str | None:
 
 
 def unresolved_actions(ledger: ActionLedger) -> tuple[Action, ...]:
-    """Actions a human must judge before the run can safely continue."""
+    """Actions a human must judge before the run can safely continue.
+
+    Deliberately narrower than :data:`~continuum.actions.ledger.UNCERTAIN_STATUSES`:
+    this excludes ``STARTED``, because an in-flight action may still settle
+    itself when the run resumes and is therefore the agent's to reconcile,
+    not yet a human's to judge (issue #1183). ``UNKNOWN`` and ``REQUIRES_REVIEW``
+    are the two statuses that say the ledger stopped and a person must decide.
+    """
     return tuple(
         a for a in ledger.all() if a.status in (ActionStatus.UNKNOWN, ActionStatus.REQUIRES_REVIEW)
     )

@@ -1107,3 +1107,39 @@ def test_reconciling_an_unknown_outcome_as_occurred_needs_no_prior_receipt(
     assert settled is not None
     assert settled.status is ActionStatus.COMPLETED
     assert settled.external_id == "found-it"
+
+
+# --- the one settle set (issue #1183) ------------------------------------- #
+
+
+def test_every_uncertain_surface_agrees_on_one_settle_set(ledger: ActionLedger) -> None:
+    """The console, the recovery engine, the TUI and the dashboard must agree.
+
+    `continuum actions` (``cmd_actions``), the engine's uncertain set, the TUI's
+    Actions tab and the dashboard's HITL button list all derive from one
+    constant, so a status one surface treats as settleable cannot be silently
+    dropped by another. Escalation via ``flag_for_review`` is the case that
+    used to slip through: it is the status that exists precisely because a
+    human must judge it, and the dashboard rendered no button for it.
+    """
+    from continuum.actions.ledger import UNCERTAIN_STATUSES
+    from continuum.dashboard.hitl import pending_actions_with_keys
+    from continuum.tui import model as tui
+
+    claim = ledger.claim("payout", {"amount": 5}, key="payout:1")
+    ledger.flag_for_review(claim.key, "compliance hold: needs a human")
+    escalated = ledger.get(claim.key)
+    assert escalated is not None
+    assert escalated.status is ActionStatus.REQUIRES_REVIEW
+
+    # The constant is the set the issue's three statuses already described.
+    expected = frozenset({ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW})
+    assert expected == UNCERTAIN_STATUSES
+
+    # The TUI flags it uncertain...
+    assert tui.action_rows(ledger.storage, "run_1")[0].uncertain is True
+    # the dashboard offers it a settle button...
+    pending = pending_actions_with_keys(ledger.storage, "run_1")
+    assert [action.status for _, action in pending] == [ActionStatus.REQUIRES_REVIEW]
+    # and cmd_actions' predicate is the same constant, so it exits REQUIRES_HUMAN.
+    assert escalated.status in UNCERTAIN_STATUSES

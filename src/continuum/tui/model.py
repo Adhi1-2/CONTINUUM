@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from continuum.actions import ActionLedger
-from continuum.actions.ledger import fold_action_events
+from continuum.actions.ledger import UNCERTAIN_STATUSES, fold_action_events
 from continuum.budgets import (
     DEFAULT_BUDGETS_PATH,
     attempts_for_type,
@@ -25,7 +25,7 @@ from continuum.budgets import (
 )
 from continuum.checkpoint import CheckpointManager
 from continuum.events import EventType
-from continuum.models import Action, ActionStatus, Origin, RunStatus, StateStatus
+from continuum.models import Action, Origin, RunStatus, StateStatus
 from continuum.recovery import RecoveryEngine
 from continuum.recovery.family import children_of, roll_up_children
 from continuum.storage.base import Storage
@@ -49,13 +49,6 @@ __all__ = [
     "recovery_lines",
     "run_rows",
 ]
-
-
-#: The statuses an operator may still settle from the keyboard, matching the
-#: set `continuum actions` flags and `pending_actions_with_keys` offers.
-UNCERTAIN_STATUSES = frozenset(
-    {ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW}
-)
 
 
 @dataclass(frozen=True)

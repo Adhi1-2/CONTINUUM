@@ -19,7 +19,7 @@ import pytest
 from continuum.actions import ActionLedger
 from continuum.dashboard.app import make_dashboard_server
 from continuum.events import EventType
-from continuum.models import Origin, Run
+from continuum.models import ActionStatus, Origin, Run
 from continuum.storage import SQLiteStorage
 
 
@@ -187,6 +187,29 @@ def test_archived_uncertain_action_remains_visible_after_compaction(db: str) -> 
     assert [(ledger_key, action.status.value) for ledger_key, action in pending] == [
         (key, "started")
     ]
+
+
+def test_requires_review_action_is_offered_a_button(db: str) -> None:
+    """Issue #1183: the escalation status is settleable, so it must be listed.
+
+    `continuum actions` and the TUI's Actions tab both flag REQUIRES_REVIEW as
+    unresolved; the dashboard's button list used to miss it, so the one surface
+    built around "press a button to settle" rendered no button for the one
+    status that exists because a human must judge it.
+    """
+    from continuum.actions.ledger import UNCERTAIN_STATUSES
+    from continuum.dashboard.hitl import pending_actions_with_keys
+
+    ledger = ActionLedger(SQLiteStorage(db), "run_1")
+    outcome = ledger.claim("send_invoice", {}, key="invoice:review")
+    ledger.flag_for_review(outcome.key, "compliance hold: needs a human")
+    del outcome
+
+    with SQLiteStorage(db) as store:
+        pending = pending_actions_with_keys(store, "run_1")
+
+    assert ActionStatus.REQUIRES_REVIEW in UNCERTAIN_STATUSES
+    assert [action.status.value for _, action in pending] == ["requires_review"]
 
 
 def test_reconcile_false_frees_the_action_for_retry(db: str, addr: str) -> None:

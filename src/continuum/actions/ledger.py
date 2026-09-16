@@ -83,6 +83,25 @@ _ACTION_EVENT_TYPES = (
     EventType.ACTION_COMPENSATED,
 )
 
+#: The statuses whose outcome an operator may still settle from a surface.
+#:
+#: Every "is this action unresolved?" surface must agree, or the console, the
+#: terminal and the web dashboard point at different runs. ``continuum actions``
+#: (``cmd_actions``), the recovery engine's uncertain set, the TUI's Actions tab
+#: and the dashboard's HITL button list all read this constant (issue #1183).
+#:
+#: ``STARTED`` is in because an interrupted run left the effect in flight and
+#: the record never advanced past intent; ``UNKNOWN`` because the ledger
+#: refused to guess; ``REQUIRES_REVIEW`` because :meth:`ActionLedger.flag_for_review`
+#: escalated exactly when a human must judge it. Note this is deliberately a
+#: wider predicate than :meth:`ActionLedger.pending` and
+#: :func:`~continuum.actions.reconciliation.unresolved_actions`, which exclude
+#: ``STARTED``: an in-flight action may still settle itself, so it is the
+#: recovering *agent's* to reconcile, not yet a human's to judge.
+UNCERTAIN_STATUSES = frozenset(
+    {ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW}
+)
+
 
 def fold_action_events(events: Any) -> dict[str, Action]:
     """Fold action events into ``{key: Action}``, last write per key wins.
@@ -110,6 +129,7 @@ __all__ = [
     "ClaimLockError",
     "fold_action_events",
     "forensic_join_across_runs",
+    "UNCERTAIN_STATUSES",
 ]
 
 
@@ -725,7 +745,9 @@ class ActionLedger:
         """Actions whose real-world outcome is not known.
 
         These are exactly the actions a recovering agent must reconcile before
-        it is safe to continue.
+        it is safe to continue. Narrower than :data:`UNCERTAIN_STATUSES` by
+        design: ``REQUIRES_REVIEW`` has already been escalated past what an
+        agent may settle on its own, so it is a human's to judge, not pending.
         """
         return [
             action

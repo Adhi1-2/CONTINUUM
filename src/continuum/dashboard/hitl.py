@@ -22,7 +22,7 @@ from typing import Any
 
 from continuum.actions import ActionLedger
 from continuum.events import EventType
-from continuum.models import ActionStatus, Origin, RunStatus
+from continuum.models import Origin, RunStatus
 from continuum.storage.base import Storage
 
 __all__ = [
@@ -125,11 +125,11 @@ def reconcile_action(
 
 def pending_actions_with_keys(storage: Storage, run_id: str) -> list[tuple[str, Any]]:
     """Uncertain actions paired with their full ledger key (for buttons)."""
-    from continuum.actions.ledger import fold_action_events
+    from continuum.actions.ledger import UNCERTAIN_STATUSES, fold_action_events
 
     folded = fold_action_events(storage.read_all_events(run_id))
     out: list[tuple[str, Any]] = []
     for key, action in folded.items():
-        if action.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+        if action.status in UNCERTAIN_STATUSES:
             out.append((key, action))
     return out
