@@ -33,6 +33,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The agent summary no longer vanishes from `briefing` after compaction
+  (#1128).** Both summary readers, the curated section in
+  `curate_briefing` and the `--raw-summary` diagnostic, scanned the live tail
+  only. `compact` moves the pre-anchor prefix into the archive, so on exactly
+  the long, summary-bearing runs compaction exists for the newest
+  `REASONING_SUMMARY` was archived away: the curated briefing dropped its most
+  context-rich section without even listing it under `omitted`, and
+  `--raw-summary`, the path that exists to debug such cases, claimed no summary
+  was recorded. Both now read the full history through `read_all_events`, which
+  folds the archived prefix back in by sequence, so "newest summary" stays
+  correct across compaction.
+
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
   types at the top level (`{"send_invoice": {...}}`) instead of nesting them

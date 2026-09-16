@@ -73,8 +73,15 @@ def _latest_agent_summary(
     Unpinned summaries carry no world to contradict, so they pass.
 
     Returns ``(summary, pins_hold)`` or ``None`` when the run has no summary.
+
+    Reads the full history: ``compact`` moves the pre-anchor prefix into the
+    archive (issue #1128), and a summary recorded before the anchor is still
+    the newest one the briefing has. ``read_all_events`` folds the archived
+    prefix back in by sequence, so "newest" stays correct across compaction.
     """
-    summaries = [e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY]
+    summaries = [
+        e for e in storage.read_all_events(run_id) if e.type is EventType.REASONING_SUMMARY
+    ]
     if not summaries:
         return None
     payload = dict(summaries[-1].payload)

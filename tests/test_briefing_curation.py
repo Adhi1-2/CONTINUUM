@@ -145,3 +145,47 @@ def test_agent_summary_bounds_honoured(db: str) -> None:
     _, out, _ = run("--db", db, "briefing")
     assert "plan 0" in out and "plan 2" in out
     assert "plan 3" not in out and "plan 5" not in out
+
+
+def _summary_recorded(store: SQLiteStorage) -> None:
+    store.append_event(
+        "run_1",
+        EventType.REASONING_SUMMARY,
+        {"summary": {"plan_stack": ["send for review"], "open_questions": ["who signed off?"]}},
+        source=Origin.EXTERNAL_AGENT,
+    )
+
+
+def test_curated_briefing_keeps_the_agent_summary_after_compaction(db: str) -> None:
+    """A compacted run still shows its summary; the archive holds it (#1128).
+
+    ``compact`` moves the pre-anchor prefix into ``events_archive``. The
+    summary is part of that prefix on exactly the long runs compaction exists
+    for, so both readers must fold the archive back in.
+    """
+    with SQLiteStorage(db) as store:
+        _summary_recorded(store)
+        assert any(e.type is EventType.REASONING_SUMMARY for e in store.read_events("run_1"))
+        store.compact_run("run_1")
+        # The summary really is archived: the live tail no longer carries it.
+        assert not any(e.type is EventType.REASONING_SUMMARY for e in store.read_events("run_1"))
+        assert any(e.type is EventType.REASONING_SUMMARY for e in store.read_all_events("run_1"))
+
+    code, out, err = run("--db", db, "briefing")
+    assert code == ExitCode.OK, err
+    assert "where the last session left off" in out
+    assert "send for review" in out
+
+
+def test_raw_summary_diagnostic_survives_compaction(db: str) -> None:
+    """--raw-summary still prints the verbatim payload on a compacted run (#1128)."""
+    payload = {"summary": {"plan_stack": ["send for review"]}, "extra": "kept"}
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1", EventType.REASONING_SUMMARY, payload, source=Origin.EXTERNAL_AGENT
+        )
+        store.compact_run("run_1")
+
+    code, out, err = run("--db", db, "briefing", "--raw-summary")
+    assert code == ExitCode.OK, err
+    assert json.loads(out) == payload
