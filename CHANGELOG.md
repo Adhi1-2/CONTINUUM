@@ -23,6 +23,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
+- **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
+  `DuplicateAction` (`continuum.actions.ledger`) and `LeaseError`
+  (`continuum.concurrency.lease`) were exported exceptions that no code path
+  could raise: duplicate attempts are handled via `fresh=False` outcomes,
+  `UnknownSideEffect`, or `GrantDenied`, while lease contention is signaled by
+  `acquire() -> False`. Dead exception definitions and exports removed.
 - **Dead `observations_evidence_lines` helper (#867).** The function in
   `src/continuum/recovery/observations.py` was defined once and called
   nowhere: leftover scaffolding from #208 whose engine-side rendering at
