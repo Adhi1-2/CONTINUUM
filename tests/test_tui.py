@@ -26,7 +26,7 @@ from continuum.models import ActionStatus, RunStatus
 from continuum.storage import SQLiteStorage
 from continuum.tui import TuiApp, animate, run_tui
 from continuum.tui import model as tui_model
-from continuum.tui.app import _LOGO_LINES, _driver, _runs
+from continuum.tui.app import _LOGO_LINES, _colour_pairs, _driver, _runs
 
 
 def run(*argv: str) -> tuple[int, str, str]:
@@ -921,6 +921,7 @@ def test_a_legacy_child_blocks_the_recovery_verdict_like_a_recorded_one(
     assert "FAMILY BLOCKED" in verdict
     assert "kid" in verdict
 
+
 # --------------------------------------------------------------------------- #
 # the landing splash animation
 #
@@ -978,7 +979,7 @@ def test_frame_zero_already_holds_the_whole_logo(db: str) -> None:
     settled = app._landing_lines()
     # lines[0] is blank and the logo follows it. The slice is taken from the
     # art itself rather than hardcoded, so a logo that grows or shrinks moves
-    # this bound with it — and a blank row landing in the range would make
+    # this bound with it, and a blank row landing in the range would make
     # `line in body` vacuously true, which is how a six-row slice quietly
     # asserted a spacer and nothing else.
     logo = settled[1 : 1 + len(_LOGO_LINES)]
@@ -1065,7 +1066,7 @@ def test_a_narrow_splash_animates_within_its_own_width(db: str) -> None:
 
 def test_runs_merge_equal_emphasis_so_the_text_is_unchanged() -> None:
     """A line whose spans all resolve to one attribute is written in a single
-    call — on a monochrome terminal that keeps the drawn text identical to the
+    call, so on a monochrome terminal the drawn text stays identical to the
     unsegmented path."""
     line = "the quick brown fox"
     spans = [(0, 9, animate.ACCENT), (4, 12, animate.BRIGHT), (12, 19, animate.ACCENT)]
@@ -1111,3 +1112,92 @@ def test_the_driver_uses_the_configured_clock_off_the_splash(db: str) -> None:
     assert 90 in screen.timeouts  # animated while on the splash
     assert 5000 in screen.timeouts  # the configured --refresh once off it
     assert app.view == "runs"  # the first key left the splash
+
+
+class _ColourCurses:
+    """A curses that reports colour support, with hooks that can fail.
+
+    The real library can accept ``init_pair`` and then raise out of
+    ``color_pair``; the fakes below hold each failure mode separately so the
+    degrade path is pinned rather than hoped for.
+    """
+
+    A_BOLD = 1
+    A_DIM = 2
+    COLOR_CYAN = 6
+    COLOR_BLACK = 0
+    COLOR_WHITE = 7
+
+    class error(Exception):
+        pass
+
+    def __init__(
+        self, *, has_colors: bool = True, init_fails: bool = False, pair_fails: bool = False
+    ) -> None:
+        self._has_colors = has_colors
+        self._init_fails = init_fails
+        self._pair_fails = pair_fails
+
+    def has_colors(self) -> bool:
+        return self._has_colors
+
+    def start_color(self) -> None:
+        return None
+
+    def init_pair(self, pair: int, fg: int, bg: int) -> None:
+        if self._init_fails:
+            raise self.error("the terminal took the colour calls back")
+
+    def color_pair(self, pair: int) -> int:
+        if self._pair_fails:
+            raise self.error("color_pair is decorative on this terminal")
+        return pair * 256
+
+
+@pytest.mark.parametrize(
+    ("env", "curses", "reason"),
+    [
+        ({"NO_COLOR": "1"}, _ColourCurses(), "NO_COLOR is set"),
+        ({"TERM": "dumb"}, _ColourCurses(), "the terminal is dumb"),
+        ({}, _ColourCurses(has_colors=False), "the terminal reports no colour"),
+    ],
+)
+def test_colour_steps_down_to_monochrome_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    curses: _ColourCurses,
+    reason: str,
+) -> None:
+    """Every off switch returns an empty map, so the driver falls back to bold
+    and dim rather than to a traceback."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert _colour_pairs(curses) == {}, f"{reason} should disable colour"
+
+
+def test_colour_survives_a_terminal_that_fails_midway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal that accepts init_pair and then rejects color_pair still
+    degrades: the failure is on the colour path, not on the screen."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    assert _colour_pairs(_ColourCurses(init_fails=True)) == {}
+    assert _colour_pairs(_ColourCurses(pair_fails=True)) == {}
+
+
+def test_colour_maps_every_emphasis_flag_when_the_terminal_allows_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Colour on means the three emphasis flags each resolve to an attribute,
+    and the map is indexed by flag so the driver can OR overlapping spans."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    pairs = _colour_pairs(_ColourCurses())
+
+    assert set(pairs) == {animate.ACCENT, animate.BRIGHT, animate.DIM}
+    assert all(isinstance(attr, int) for attr in pairs.values())
+    assert len(set(pairs.values())) == 3  # distinct, so spans stay distinguishable

@@ -118,7 +118,7 @@ def shimmer_span(
 def pulse(frame: int, *, period: float = 1.6) -> int:
     """Emphasis for a line that breathes: ``DIM`` and ``BRIGHT`` by turns.
 
-    Settles on ``PLAIN`` — an animation-free screen shows the line exactly as
+    Settles on ``PLAIN``. An animation-free screen shows the line exactly as
     it rendered before animation existed.
     """
     if frame < 0:

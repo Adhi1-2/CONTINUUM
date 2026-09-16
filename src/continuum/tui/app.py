@@ -320,7 +320,7 @@ class TuiApp:
         Line for line this is the old static layout; the only textual change is
         the tagline typing itself in. Everything else is emphasis (the logo's
         accent colour, a sheen sweeping it, a prompt that breathes) layered over
-        text that is already complete — so any single frame of the splash,
+        text that is already complete, so any single frame of the splash,
         including the first, already holds the whole logo. The animation never
         hides a glyph, which also keeps a snapshot of the screen readable.
         """
@@ -337,7 +337,7 @@ class TuiApp:
 
         typed = animate.typewriter(_LANDING_TAGLINE, self.frame)
         # the cursor blinks only while there is still something to type, and
-        # only when the line has room for it — a splash wider than the terminal
+        # only when the line has room for it. A splash wider than the terminal
         # is clipped by the driver, but the line itself must not overflow
         typing = len(typed) < len(_LANDING_TAGLINE)
         show_cursor = typing and animate.cursor_visible(self.frame)
@@ -437,7 +437,7 @@ class TuiApp:
         sorted and non-overlapping, indexed like :meth:`body_lines`.
 
         Empty on every view but the landing splash. The dashboard is an
-        instrument — its lines hold still — and an empty list is the signal the
+        instrument: its lines hold still, and an empty list is the signal the
         driver writes each line exactly as it did before animation existed.
         """
         if self.view != "landing":
@@ -695,7 +695,7 @@ def _colour_pairs(curses: Any) -> dict[int, int]:
     Colour is opt-in exactly the way the CLI's ``Palette`` makes it opt-in: off
     for ``NO_COLOR``, off for ``TERM=dumb``, off on a terminal that reports no
     support, and off if any colour call raises. Empty means the driver falls
-    back to bold and dim — never to a traceback, and never to different text.
+    back to bold and dim, never to a traceback, and never to different text.
     """
     if os.environ.get("NO_COLOR") is not None:
         return {}
@@ -713,15 +713,15 @@ def _colour_pairs(curses: Any) -> dict[int, int]:
         curses.start_color()
         curses.init_pair(_ACCENT_PAIR, curses.COLOR_CYAN, curses.COLOR_BLACK)
         curses.init_pair(_BRIGHT_PAIR, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        bold = getattr(curses, "A_BOLD", 0) or 0
+        dim = getattr(curses, "A_DIM", 0) or 0
+        return {
+            animate.ACCENT: curses.color_pair(_ACCENT_PAIR),
+            animate.BRIGHT: curses.color_pair(_BRIGHT_PAIR) | bold,
+            animate.DIM: curses.color_pair(_BRIGHT_PAIR) | dim,
+        }
     except Exception:
         return {}
-    bold = getattr(curses, "A_BOLD", 0) or 0
-    dim = getattr(curses, "A_DIM", 0) or 0
-    return {
-        animate.ACCENT: curses.color_pair(_ACCENT_PAIR),
-        animate.BRIGHT: curses.color_pair(_BRIGHT_PAIR) | bold,
-        animate.DIM: curses.color_pair(_BRIGHT_PAIR) | dim,
-    }
 
 
 def _emphasis_table(curses: Any) -> Callable[[int], int]:
@@ -754,8 +754,8 @@ def _runs(
     """Partition a line into ``(start, end, attr)`` runs covering every column.
 
     Neighbouring runs that resolve to the same attribute are merged, so a line
-    whose spans all carry one emphasis — or a terminal that cannot tell them
-    apart — is written as a single call. The text on screen is then identical
+    whose spans all carry one emphasis, or a terminal that cannot tell them
+    apart, is written as a single call. The text on screen is then identical
     to the pre-animation path, which is what keeps the drawn output readable
     by anything that records lines rather than attributes.
     """
@@ -803,7 +803,7 @@ def _driver(curses: Any, screen: Any, app: TuiApp, refresh_seconds: float) -> in
 
     Two clocks. On the landing screen the timeout is the animation interval, so
     the splash moves even with ``--refresh 0`` (the default, where the rest of
-    the dashboard blocks until a key arrives) — each tick advances the frame,
+    the dashboard blocks until a key arrives). Each tick advances the frame,
     and the run count is re-read on a throttle so the idle screen stays cheap.
     Everywhere else the timeout is exactly what it was: a refresh tick, or a
     blocking wait.
