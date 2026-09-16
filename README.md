@@ -196,7 +196,7 @@ Full walkthrough with code is in `docs/recovery_walkthrough.md` (`examples/recov
 | Framework adapters | Generic Python, OpenAI Agents SDK, LangGraph, and LangChain integrations |
 | Secure planning loop | Two-signal observation verification escalates high-risk branches to REQUIRES_REVIEW |
 | Periodic revalidation | Environment re-checked on a schedule, catching mid-run drift within one cycle |
-| Tamper-evident log | Hash-chained event log (36 event types) with integrity verification |
+| Tamper-evident log | Hash-chained event log (51 event types) with integrity verification |
 | Enforcing gate | Unclaimed side-effect calls are refused before they fire; deny messages teach the claim protocol |
 | Observation hooks | Every file a coding CLI writes becomes digest-verified evidence, outside model control |
 | Session briefing | Fresh sessions learn run state deterministically at start, including the last session's reasoning summary |
@@ -415,7 +415,7 @@ Schema v6. SQLite is primary, Postgres is CI verified. One log, many projections
 
 | Table | Purpose |
 |:--|:--|
-| `events` | Hash chained append only log (44 event types in v0.2) |
+| `events` | Hash chained append only log (51 event types) |
 | `runs` | Run metadata with `parent_run_id` for multi agent |
 | `versions` | SemanticState snapshots per checkpoint |
 | `checkpoints` | Sealed checkpoint records with `RECOVERY` anchors |
@@ -495,7 +495,7 @@ continuum tree <parent_run_id>                    # multi-agent hierarchy view
 
 Optional registries live beside your code and are data, not code: `.continuum/gate.json` (side-effect tools + stable-key templates), `.continuum/reconcilers.json` (probes that check external systems), `.continuum/gateway.json` (upstream routes).
 
-Every command accepts `--json`, and read-only commands never write, so they are safe against a live database while an agent is mid-run. Exit codes are a safety contract (only a verified-safe run exits 0). Full command list, exit-code table, and state-diff output in [references/cli.md](references/cli.md).
+Most commands accept global `--json` **before** the subcommand (e.g. `continuum --json resume RUN`). Read-only commands do not mutate run state; plain `resume` may still append webhook notification events when `.continuum/webhooks.json` is set (see [references/cli.md](references/cli.md)). Exit codes are a safety contract (only a verified-safe run exits 0). Full command list, exit-code table, and state-diff output in [references/cli.md](references/cli.md).
 
 ## Roadmap
 
@@ -521,6 +521,25 @@ Beyond the original plan: the MCP server, MCP authorization and caller-authentic
 | A workflow engine | A recovery layer, not an orchestrator |
 
 The core abstraction: `semantic state + environment validation + action reconciliation = safe recovery`.
+
+### The verdict is advisory, not enforced
+
+CONTINUUM tells you the truth about a run. It does not stop your process when the answer is unwelcome. `RecoveryDecision.permits()` reports what the contract allows; nothing in the library intervenes if a caller ignores a `False` and acts anyway. A worker that calls `CheckpointManager.restore` directly can continue past a `REQUEST_HUMAN` verdict, because it never asked the engine whether to.
+
+This is a deliberate contract for a library: forcing enforcement inside a call the caller made to inspect a verdict would surprise the callers who legitimately want to read it and then override it.
+
+Enforcement exists, but as separate seams you opt into. None is enabled by a plain `pip install continuum-agent`:
+
+| Seam | How to enable |
+|:--|:--|
+| Host gate | `continuum gate` |
+| HTTP gateway | `continuum gateway` |
+| Replay guard for framework calls | `continuum.replayguard` in-process |
+| Observation hooks | `continuum hooks install` |
+
+The one enforcement that ships enabled is the CLI exit code. `continuum resume` exits non-zero unless the run is verified safe (`RESUME`), so `continuum resume "$RUN" && ./start-agent.sh` cannot launch onto stale state. Every other mode maps to a distinct non-zero code, and a mode nobody has classified falls through to `UNSAFE` rather than `OK`.
+
+If you want the verdict enforced, wire a seam or gate your pipeline on the exit code. Do not assume the library is supervising the process.
 
 ## Related work
 
