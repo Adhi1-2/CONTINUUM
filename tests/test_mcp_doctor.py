@@ -200,3 +200,29 @@ def test_render_doctor_is_one_line_per_finding(monkeypatch: Any, tmp_path: Path)
     assert "[ok]   handshake:" in text  # module fallback still works
     assert "not healthy" in text
     assert "remedies:" in text
+
+
+def test_the_handshake_reads_frames_without_select_on_pipes(monkeypatch: Any) -> None:
+    """Windows ``select()`` accepts sockets only, so the read cannot use it.
+
+    Registering a child's stdout pipe with a selector raises ``WinError
+    10038`` on Windows, and every probe died before the first frame arrived
+    -- all six tests in this module failed there, on code that passed
+    everywhere else. This makes that failure deterministic on POSIX: if the
+    reader depends on a selector the handshake never completes, and the
+    healthy-install assertion below cannot hold.
+    """
+    import selectors
+
+    def _windows_like_selector() -> Any:
+        raise OSError(10038, "An operation was attempted on something that is not a socket")
+
+    monkeypatch.setattr(selectors, "DefaultSelector", _windows_like_selector)
+    monkeypatch.setenv("PATH", _with_scripts_dir_on_path())
+
+    report = run_doctor()
+
+    assert report["healthy"] is True
+    handshake = _by_name(report)["handshake"]
+    assert handshake["status"] == "pass"
+    assert "continuum_record_progress" in handshake["tools"]

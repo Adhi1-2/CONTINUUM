@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
+import queue
 import subprocess
 import sys
 import tempfile
@@ -179,31 +179,50 @@ class _ServerProbe:
         self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         self.proc.stdin.flush()
 
+    def _read_chunk(self, deadline: float) -> bytes | None:
+        """Read up to 64KiB, or ``None`` at the deadline / on EOF.
+
+        The read is blocking on a worker thread because Windows has no
+        ``select()`` for pipes: its ``select`` accepts sockets only, so
+        registering a child's stdout raises ``WinError 10038`` and every
+        probe would die before the first frame arrives. The thread is
+        abandoned on timeout, which is safe because the caller has already
+        given up and ``close()`` kills the process, closing the pipe and
+        unblocking the read.
+        """
+        chunk_box: queue.Queue[bytes | None] = queue.Queue()
+
+        def reader() -> None:
+            try:
+                chunk_box.put(os.read(self.proc.stdout.fileno(), 65536))  # type: ignore[union-attr]
+            except OSError:
+                # A closed pipe between the put and the read: treat as EOF.
+                chunk_box.put(None)
+
+        threading.Thread(target=reader, daemon=True).start()
+        try:
+            return chunk_box.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            return None  # deadline: "server never became ready"
+
     def _read_line(self) -> str | None:
         """Read one frame, or None on timeout/EOF, bounded by ``timeout``."""
-        selector = selectors.DefaultSelector()
-        selector.register(self.proc.stdout, selectors.EVENT_READ)  # type: ignore[arg-type]
-        try:
-            buffer = b""
-            deadline = time.monotonic() + self.timeout
-            while b"\n" not in buffer:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None  # timeout: "server never became ready"
-                if not selector.select(remaining):
-                    return None
-                # os.read, not a buffered read: a BufferedReader would block
-                # until its full count arrives or the pipe closes, and the
-                # deadline would never fire mid-frame.
-                chunk = os.read(self.proc.stdout.fileno(), 65536)  # type: ignore[union-attr]
-                if not chunk:
-                    return None  # EOF: the server closed the connection
-                buffer += chunk
-            line, _, _ = buffer.partition(b"\n")
-            self._observe_framing(line)
-            return line.decode("utf-8", errors="replace")
-        finally:
-            selector.close()
+        buffer = b""
+        deadline = time.monotonic() + self.timeout
+        while b"\n" not in buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None  # timeout: "server never became ready"
+            # os.read, not a buffered read: a BufferedReader would block
+            # until its full count arrives or the pipe closes, and the
+            # deadline would never fire mid-frame.
+            chunk = self._read_chunk(deadline)
+            if not chunk:
+                return None  # timeout or EOF: the server closed the connection
+            buffer += chunk
+        line, _, _ = buffer.partition(b"\n")
+        self._observe_framing(line)
+        return line.decode("utf-8", errors="replace")
 
     def _observe_framing(self, raw: bytes) -> None:
         ending = "CRLF (\\r\\n)" if raw.endswith(b"\r") else "LF (\\n)"
