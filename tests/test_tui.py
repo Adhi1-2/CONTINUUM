@@ -894,3 +894,28 @@ def test_a_refresh_keeps_the_selected_action_under_the_cursor(
 
     assert app.cursor == 2  # followed its key down a line
     assert app._selected_action().key == selected
+
+
+def test_a_legacy_child_blocks_the_recovery_verdict_like_a_recorded_one(
+    db: str, store: SQLiteStorage
+) -> None:
+    """The tree tab and the recovery verdict must resolve children the same
+    way. A legacy child, linked only in metadata, used to appear on the tree
+    while the roll-up missed it, so the verdict read RESUME over a family
+    holding an unreconciled side effect."""
+    run("--db", db, "start", "par", "--goal", "supervise")
+    run("--db", db, "start", "kid", "--goal", "work", "--parent", "par")
+    ActionLedger(SQLiteStorage(db), "kid").claim("send_invoice", {}, key="invoice:I-9")
+    store._connection.execute(
+        "UPDATE runs SET parent_run_id = NULL, metadata = ? WHERE run_id = ?",
+        ('{"parent_run_id": "par"}', "kid"),
+    )
+    store._connection.commit()
+
+    tree = "\n".join(tui_model.family_lines(store, "par"))
+    assert "kid" in tree  # the tree tab lists it
+
+    verdict = "\n".join(tui_model.recovery_lines(store, "par"))
+    # and the verdict accounts for it, rather than calling the family safe
+    assert "FAMILY BLOCKED" in verdict
+    assert "kid" in verdict

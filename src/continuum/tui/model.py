@@ -26,7 +26,7 @@ from continuum.checkpoint import CheckpointManager
 from continuum.events import EventType
 from continuum.models import ActionStatus, Origin, Run, RunStatus, StateStatus
 from continuum.recovery import RecoveryEngine
-from continuum.recovery.family import roll_up_children
+from continuum.recovery.family import children_of, roll_up_children
 from continuum.storage.base import Storage
 
 __all__ = [
@@ -138,15 +138,9 @@ def run_rows(storage: Storage) -> list[RunRow]:
 
 
 def _children(storage: Storage, run_id: str) -> list[Run]:
-    """Find child runs by the run row's parent_run_id field, falling back to
-    the older metadata-based convention so records written before the column
-    existed still show their children."""
-    children: list[Run] = []
-    for run in storage.list_runs(limit=None):
-        legacy_parent = dict(run.metadata).get("parent_run_id")
-        if run.parent_run_id == run_id or (run.parent_run_id is None and legacy_parent == run_id):
-            children.append(run)
-    return children
+    """Children resolved the way the recovery roll-up resolves them, so the
+    tree tab can never show a child the aggregate verdict ignored."""
+    return list(children_of(storage, run_id))
 
 
 def overview_lines(storage: Storage, run_id: str) -> list[str]:
