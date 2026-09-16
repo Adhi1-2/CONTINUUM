@@ -270,6 +270,54 @@ async def test_record_plan_upserts_units_and_rejects_bad_payloads(
 
 
 @pytest.mark.asyncio
+async def test_record_plan_and_progress_survive_compaction(
+    server_ctx: tuple[Any, Any],
+) -> None:
+    """A compacted run must still accept plan and progress updates (#1133).
+
+    ``compact`` archives the pre-anchor prefix, which is where ``RUN_STARTED``
+    lives. The write path read the live tail only, which failed two ways: the
+    pre-flight fold raised "has no goal" before the candidate was considered,
+    and ``ensure_run`` saw an empty prefix and backfilled a *second*
+    ``RUN_STARTED`` after the anchor, rewriting history. Compaction exists for
+    the long runs these records are for, and the plan/progress records exist so
+    those runs can resume with structure (#312).
+    """
+    server, ctx = server_ctx
+    await seed_run(server)
+    storage = ctx.storage
+    storage.compact_run("run_1")
+    # The live tail really has lost RUN_STARTED: this is what both folds saw.
+    assert not any(e.type is EventType.RUN_STARTED for e in storage.read_events("run_1"))
+    assert any(e.type is EventType.RUN_STARTED for e in storage.read_all_events("run_1"))
+
+    payload = await call(
+        server,
+        "continuum_record_plan",
+        run_id="run_1",
+        plan_id="plan-a",
+        units=[{"id": "u1", "title": "draft", "status": "pending", "depends_on": []}],
+    )
+    assert payload["units"] == 1
+    progress = await call(
+        server, "continuum_record_progress", run_id="run_1", completed=40, total=100
+    )
+    assert progress["run_id"] == "run_1"
+
+    events = storage.read_all_events("run_1")
+    # The run must not have been "restarted": a live-tail read in ensure_run
+    # saw an empty prefix and backfilled a second RUN_STARTED after the anchor,
+    # rewriting history instead of refusing.
+    starts = [e for e in events if e.type is EventType.RUN_STARTED]
+    assert len(starts) == 1, [e.sequence for e in starts]
+    assert any(e.type is EventType.PLAN_UPSERT for e in events)
+    assert any(e.type is EventType.TASK_UPDATED for e in events)
+    state = project("run_1", events)
+    assert [unit.step_id for unit in state.plan] == ["u1"]
+    assert state.progress.completed == 40
+
+
+@pytest.mark.asyncio
 async def test_over_total_progress_is_rejected_before_being_written(
     server_ctx: tuple[Any, Any],
 ) -> None:

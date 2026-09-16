@@ -203,6 +203,45 @@ def test_cli_round_trip(tmp_path: Path) -> None:
     assert len(data["plan"]) == 2
 
 
+def test_cli_record_plan_survives_compaction(tmp_path: Path) -> None:
+    """``record-plan`` still records on a compacted run (#1133).
+
+    ``RUN_STARTED`` lives in the archived prefix after compaction. The CLI's
+    pre-flight fold read the live tail only, so it refused a legal plan with
+    "has no goal" and the run could not record structure through any surface.
+    """
+    import io
+
+    from continuum.cli import main
+    from continuum.cli.exitcodes import ExitCode
+
+    db = str(tmp_path / "cli-compact.db")
+    storage = SQLiteStorage(db)
+    storage.create_run(Run(run_id="run_1", goal="g"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    storage.compact_run("run_1")
+    assert not any(e.type is EventType.RUN_STARTED for e in storage.read_events("run_1"))
+    storage.close()
+
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(
+        json.dumps([{"id": "u1", "title": "first", "status": "pending", "depends_on": []}]),
+        encoding="utf-8",
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["--db", db, "record-plan", "run_1", "--plan-id", "p1", "--file", str(plan_file)],
+        out=out,
+        err=err,
+    )
+    assert code == ExitCode.OK, err.getvalue()
+
+    storage = SQLiteStorage(db)
+    state = project("run_1", storage.read_all_events("run_1"))
+    assert [p.step_id for p in state.plan] == ["u1"]
+    storage.close()
+
+
 def test_property_random_ordering_deterministic(tmp_path: Path) -> None:
     storage = _run(tmp_path, "run_a")
     storage2 = _run(tmp_path, "run_b")
