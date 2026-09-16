@@ -26,7 +26,7 @@ from continuum.models import ActionStatus, RunStatus
 from continuum.storage import SQLiteStorage
 from continuum.tui import TuiApp, animate, run_tui
 from continuum.tui import model as tui_model
-from continuum.tui.app import _driver, _runs
+from continuum.tui.app import _LOGO_LINES, _driver, _runs
 
 
 def run(*argv: str) -> tuple[int, str, str]:
@@ -976,11 +976,19 @@ def test_frame_zero_already_holds_the_whole_logo(db: str) -> None:
     app = TuiApp(SQLiteStorage(db))
     app.width = 100
     settled = app._landing_lines()
+    # lines[0] is blank and the logo follows it. The slice is taken from the
+    # art itself rather than hardcoded, so a logo that grows or shrinks moves
+    # this bound with it — and a blank row landing in the range would make
+    # `line in body` vacuously true, which is how a six-row slice quietly
+    # asserted a spacer and nothing else.
+    logo = settled[1 : 1 + len(_LOGO_LINES)]
+    assert len(logo) == len(_LOGO_LINES)
+    assert all(logo)
 
     for frame in (0, 1, 3, 11, 40, 1000):
         app.frame = frame
         body = "\n".join(app.body_lines())
-        for line in settled[1:7]:  # the six logo lines, complete at every frame
+        for line in logo:  # every logo row, complete at every frame
             assert line in body
 
 
