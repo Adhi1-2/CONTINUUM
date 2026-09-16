@@ -33,6 +33,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Webhook dedup now survives a compaction inside the re-notify window
+  (#1186).** `_within_dedup_window` scanned only the live event tail for the
+  `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
+  but `compact_run` archives exactly those rows. A compaction inside an
+  endpoint's re-notify window (default 3600s) therefore made the next blocked
+  assessment deliver the same verdict again. This is the precise spam the dedup
+  exists to prevent, and in the failure direction that always means more
+  noise: an operator who was paged once and compacted the long blocked run to
+  shrink the log, as the docs suggest, gets paged again for the same standing
+  blockage, and once archived, on every subsequent assessment until the
+  window expires. The scan now reads `read_all_events`, the merged
+  archive-aware history every other durable-state consumer already uses
+  (`ledger._replay`, `gateway`, `provenance_for_run`, the reconcilers).
+  Archived rows keep their original timestamps, so the window computation
+  itself is unchanged and the expired-window path still rings again on time.
+
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
   types at the top level (`{"send_invoice": {...}}`) instead of nesting them
