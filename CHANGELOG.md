@@ -33,6 +33,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The TUI's Actions tab now folds the full log, so a compacted run still
+  lists the unresolved action that is blocking it (#1182).** `action_rows`
+  folded `read_events` (the live tail) only, while `event_rows` and
+  `budget_rows` beside it already read `read_all_events`. After compaction
+  moves an uncertain action's `ACTION_RECORDED`/`ACTION_FAILED` events into
+  the archive without settling the action, the live tail holds only the
+  anchor and the tab rendered empty, even though the run row above it still
+  reported the run as blocked and `continuum actions`, the dashboard HITL
+  buttons, and the recovery verdict all still listed the action. It now
+  folds `read_all_events`, matching the ledger's own `_replay`, so the key
+  the tab offers is the key that would settle the action. Read-only view, no
+  new writes and no change to any other tab.
+
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
   types at the top level (`{"send_invoice": {...}}`) instead of nesting them
