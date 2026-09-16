@@ -302,14 +302,20 @@ def test_project_scope_writes_the_shared_mcp_json(
 @pytest.mark.parametrize(
     ("entry", "ours"),
     [
-        # What install bakes: both forms, absolute db.
-        ({"command": "/venv/bin/continuum-mcp", "args": ["--db", "/proj/continuum.db"]}, True),
+        # What install bakes: both forms, absolute db. The POSIX spellings are
+        # only absolute on POSIX -- a drive-less path is not absolute on
+        # Windows, so the predicate rightly rejects them there and the
+        # expectation follows the platform the suite runs on.
+        (
+            {"command": "/venv/bin/continuum-mcp", "args": ["--db", "/proj/continuum.db"]},
+            sys.platform != "win32",
+        ),
         (
             {
                 "command": "/venv/bin/python",
                 "args": ["-u", "-m", "continuum.mcp", "--db", "/proj/continuum.db"],
             },
-            True,
+            sys.platform != "win32",
         ),
         # Windows spellings of the same two shapes; the drive-letter paths are
         # only absolute where they are real paths, so the expectation follows
@@ -318,6 +324,13 @@ def test_project_scope_writes_the_shared_mcp_json(
             {
                 "command": "C:\\venv\\Scripts\\continuum-mcp.exe",
                 "args": ["--db", "C:\\proj\\continuum.db"],
+            },
+            sys.platform == "win32",
+        ),
+        (
+            {
+                "command": "C:\\venv\\Scripts\\python.exe",
+                "args": ["-u", "-m", "continuum.mcp", "--db", "C:\\proj\\continuum.db"],
             },
             sys.platform == "win32",
         ),
