@@ -86,7 +86,7 @@ class TuiApp:
 
         Every read is guarded: a store that opens but cannot be read (deleted
         out of band, corrupted) must degrade to a message, never escape the
-        app as a traceback — a broken store is exactly when the operator
+        app as a traceback. A broken store is exactly when the operator
         reaches for the dashboard.
         """
         if self.storage is None:
