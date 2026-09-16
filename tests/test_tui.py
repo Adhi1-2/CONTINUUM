@@ -22,7 +22,7 @@ from continuum.actions import ActionLedger
 from continuum.actions.idempotency import idempotency_key
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
-from continuum.models import RunStatus
+from continuum.models import ActionStatus, RunStatus
 from continuum.storage import SQLiteStorage
 from continuum.tui import TuiApp, run_tui
 from continuum.tui import model as tui_model
@@ -835,3 +835,62 @@ def test_budget_rows_show_configured_types_with_no_attempts(
     assert rows["send_invoice"].attempts == 0
     assert rows["send_invoice"].max_attempts == 5
     assert rows["send_invoice"].remaining == 5
+
+
+def test_the_settle_key_tracks_the_drawn_row_not_a_fresh_read(
+    db: str, store: SQLiteStorage
+) -> None:
+    """A second action arriving after the render sorts ahead of the selected
+    one, so a fresh read at the same line number returns a different key: `y`
+    must settle the action the highlight marks, not the one that displaced it.
+    """
+    run("--db", db, "start", "r1", "--goal", "g")
+    ledger = ActionLedger(SQLiteStorage(db), "r1")
+    ledger.claim("send_invoice", {}, key="invoice:ZZZ")
+    drawn_key = str(idempotency_key("send_invoice", None, scope="r1", key="invoice:ZZZ"))
+
+    app = TuiApp(store)
+    app.handle_key("enter")  # landing -> runs
+    app.handle_key("enter")  # runs -> detail
+    app.handle_key("4")  # actions tab; one row drawn, cursor parked on it
+    assert app._selected_action() is not None
+    assert app._selected_action().key == drawn_key
+
+    # an action arriving out of band, sorting ahead of the drawn row
+    ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:AAA")
+    assert str(idempotency_key("send_invoice", None, scope="r1", key="invoice:AAA")) < drawn_key
+    # the store really has shifted: a fresh read no longer has the drawn key first
+    assert tui_model.action_rows(store, "r1")[0].key != drawn_key
+    # but no re-render happened, so the selection is still the drawn row
+    assert app._selected_action().key == drawn_key
+
+    app.handle_key("y")  # settle the action under the highlight
+    assert app.pending is not None
+    settled = app.pending[1]()
+    assert settled, "the reconcile must take effect"
+    folded = ActionLedger(SQLiteStorage(db), "r1").folded()
+    assert folded[drawn_key].status == ActionStatus.COMPLETED  # occurred=True
+    assert app._selected_action().key == drawn_key  # and the highlight holds
+
+
+def test_a_refresh_keeps_the_selected_action_under_the_cursor(
+    db: str, store: SQLiteStorage
+) -> None:
+    """A refresh re-sorts the actions tab; the cursor must follow the selected
+    key to its new line rather than stay put and mark a different action."""
+    run("--db", db, "start", "r1", "--goal", "g")
+    ledger = ActionLedger(SQLiteStorage(db), "r1")
+    ledger.claim("send_invoice", {}, key="invoice:ZZZ")
+    selected = str(idempotency_key("send_invoice", None, scope="r1", key="invoice:ZZZ"))
+
+    app = TuiApp(store)
+    app.handle_key("enter")
+    app.handle_key("enter")
+    app.handle_key("4")
+    assert app.cursor == 1 and app._selected_action().key == selected
+
+    ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:AAA")
+    app.handle_key("r")  # refresh: the new action sorts ahead of the selected one
+
+    assert app.cursor == 2  # followed its key down a line
+    assert app._selected_action().key == selected

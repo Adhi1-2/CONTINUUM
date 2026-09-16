@@ -68,6 +68,10 @@ class TuiApp:
         self._run_count: int | None = None
         self._read_error = ""  # set when a store that opened cannot be read
         self.lines: list[str] = []
+        # the actions tab as last drawn, indexed like the lines below the
+        # header; _selected_action reads this rather than the store, so a row
+        # inserted after the render cannot move the key a keypress settles
+        self._action_rows: list[model.ActionRow] = []
         self.pending: tuple[str, Callable[[], str]] | None = None
         self.message = ""
         self.show_help = False
@@ -145,11 +149,20 @@ class TuiApp:
         # Preserve the selected row across a refresh: an auto-refresh tick
         # must not silently move the cursor while the operator reads the
         # footer, or a keypress settles a different action than parked on.
-        # Table tabs only — a text tab owns the scroll, not a selection, so
+        # The actions tab is sorted by key, so a row inserted since the last
+        # render shifts the list and a numeric restore would park the
+        # highlight on a different key; that tab is restored by key. Table
+        # tabs only otherwise: a text tab owns the scroll, not a selection, so
         # restoring a table tab's cursor onto it would light a phantom
         # highlight and flip navigation into cursor mode.
         preserved = self.cursor
+        preserved_key = (
+            self._action_rows[preserved - 1].key
+            if tab == "actions" and 1 <= preserved <= len(self._action_rows)
+            else None
+        )
         self.cursor = -1
+        self._action_rows = []
         try:
             self._render_detail_tab(storage, run_id, tab)
         except Exception as exc:
@@ -163,7 +176,18 @@ class TuiApp:
                 "r to retry, or run `continuum verify` outside the dashboard for detail.",
             ]
         else:
-            if tab in self._TABLE_TABS and 1 <= preserved < len(self.lines):
+            if tab == "actions" and preserved_key is not None:
+                # the parked key, wherever it has moved to; -1 if it has gone,
+                # which is how a settled action retires its own highlight
+                self.cursor = next(
+                    (
+                        index
+                        for index, row in enumerate(self._action_rows, start=1)
+                        if row.key == preserved_key
+                    ),
+                    -1,
+                )
+            elif tab in self._TABLE_TABS and 1 <= preserved < len(self.lines):
                 self.cursor = preserved
         if self.scroll > max(0, len(self.lines) - 1):
             self.scroll = 0
@@ -185,14 +209,14 @@ class TuiApp:
             ] or ["No checkpoints recorded. Press c to force one."]
             self.cursor = 1 if len(self.lines) > 1 else -1
         elif tab == "actions":
-            rows = model.action_rows(storage, run_id)
+            self._action_rows = model.action_rows(storage, run_id)
             self.lines = [f"{'STATUS':<16} {'TYPE':<24} {'EXTERNAL ID':<20} KEY"]
             self.lines += [
                 (
                     f"{'(!)' if r.uncertain else '   '} {r.status:<12} {r.action_type:<24} "
                     f"{r.external_id[:18]:<20} {r.key[:24]}"
                 )
-                for r in rows
+                for r in self._action_rows
             ] or ["No actions recorded."]
             self.cursor = 1 if len(self.lines) > 1 else -1
         elif tab == "events":
@@ -216,26 +240,19 @@ class TuiApp:
     def _selected_action(self) -> model.ActionRow | None:
         """The action row under the cursor, on the actions tab only.
 
-        The read is guarded like every other: a run deleted or compacted out
-        of band while the dashboard sits on the actions tab must degrade to
-        "nothing selected", not raise out of handle_key past run_tui.
+        Read from the snapshot the tab drew, never from the store: the actions
+        tab is sorted by key, so an action arriving between the render and the
+        keypress would shift the list and make `y` settle the row one line
+        away from the one the highlight marks. The snapshot is what is on
+        screen, so the key reconciled is the key parked on.
         """
-        storage = self.storage
         if (
-            storage is None
-            or self.view != "detail"
+            self.view != "detail"
             or self.TABS[self.tab] != "actions"
-            or self.cursor < 1
+            or not 1 <= self.cursor <= len(self._action_rows)
         ):
             return None
-        try:
-            rows = model.action_rows(storage, self._run_id() or "")
-        except Exception:
-            return None
-        offset = self.cursor - 1
-        if 0 <= offset < len(rows):
-            return rows[offset]
-        return None
+        return self._action_rows[self.cursor - 1]
 
     # ------------------------------------------------------------------ #
     # rendering
