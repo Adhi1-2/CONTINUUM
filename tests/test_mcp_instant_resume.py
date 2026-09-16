@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
+import os
 import time
 from pathlib import Path
+
+import pytest
 
 from continuum.checkpoint import CheckpointManager
 from continuum.events import EventType
@@ -309,5 +314,132 @@ def test_default_flows_unchanged_when_features_unused(tmp_path: Path) -> None:
         assert evs
         assert set(evs[-1].payload.get("components", [])) == {"goal", "progress"}
         s2.close()
+    finally:
+        os.chdir(orig_cwd)
+
+
+def _briefing_args(**overrides: object) -> argparse.Namespace:
+    """A briefing args namespace as the dispatcher builds one.
+
+    ``cmd_briefing`` is reached through the CLI dispatcher, which answers the
+    no-resume.json case itself, so the function's own guard is exercised
+    directly here.
+    """
+    base: dict[str, object] = {
+        "run_id": None,
+        "hook_event_name": "SessionStart",
+        "json": False,
+        "raw_summary": False,
+        "_palette": None,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_briefing_guard_is_silent_with_no_resume_file(tmp_path: Path) -> None:
+    """cmd_briefing's own guard stays silent when nothing is interrupted.
+
+    The dispatcher's fast path answers this case first, so the guard is
+    defence-in-depth for a caller that reaches the function directly: it must
+    not open the database just to report nothing. An active run exists in the
+    store, so any output at all would mean the guard did not fire.
+    """
+    from continuum.cli.main import cmd_briefing
+
+    orig_cwd = Path.cwd()
+    db = tmp_path / "continuum.db"
+    try:
+        os.chdir(tmp_path)
+        storage = SQLiteStorage(str(db))
+        storage.create_run(Run(run_id="r1", goal="do X"))
+        storage.append_event(
+            "r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT
+        )
+        out, err = io.StringIO(), io.StringIO()
+        code = cmd_briefing(_briefing_args(), storage, out, err)
+        assert code == 0
+        assert out.getvalue() == "", "nothing is interrupted, so nothing is printed"
+        storage.close()
+    finally:
+        os.chdir(orig_cwd)
+
+
+def test_briefing_proceeds_without_a_resume_file_for_other_hooks(tmp_path: Path) -> None:
+    """The silence is SessionStart-only: every other caller still gets briefed.
+
+    A SessionEnd hook or a manual invocation has nothing to be silent about,
+    so the missing file is not special there and the briefing reports the
+    active run as usual.
+    """
+    from continuum.cli.main import cmd_briefing
+
+    orig_cwd = Path.cwd()
+    db = tmp_path / "continuum.db"
+    try:
+        os.chdir(tmp_path)
+        storage = SQLiteStorage(str(db))
+        storage.create_run(Run(run_id="r1", goal="do X"))
+        storage.append_event(
+            "r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT
+        )
+        out, err = io.StringIO(), io.StringIO()
+        code = cmd_briefing(_briefing_args(hook_event_name="SessionEnd"), storage, out, err)
+        assert code == 0
+        assert "CONTINUUM active run: r1" in out.getvalue()
+        storage.close()
+    finally:
+        os.chdir(orig_cwd)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Unreadable bytes: the file is corrupt, not a signal to fail.
+        b"{{not json at all",
+        # Valid JSON that is not an object.
+        '["not-a-dict"]',
+        # An object whose run_id has the wrong shape.
+        '{"run_id": 123}',
+        # An object whose run_id is present but empty.
+        '{"run_id": ""}',
+        # An object that names no run at all.
+        "{}",
+    ],
+    ids=["corrupt", "non-object", "non-string-id", "empty-id", "no-id"],
+)
+def test_briefing_falls_through_an_unusable_resume_file(
+    tmp_path: Path, payload: bytes | str
+) -> None:
+    """A resume.json that cannot name a run does not advertise one (#1063).
+
+    Each payload fails validation for a different reason — unreadable, not an
+    object, a run_id of the wrong type, an empty run_id, a missing run_id — but
+    all must degrade the same way: the briefing falls back to the live active
+    run and prints no resume command, because a command for a run that cannot
+    be validated could only fail.
+    """
+    from continuum.cli.main import main as cli_main
+
+    orig_cwd = Path.cwd()
+    db = tmp_path / "continuum.db"
+    try:
+        os.chdir(tmp_path)
+        Path(".continuum").mkdir(parents=True, exist_ok=True)
+        data = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+        Path(".continuum/resume.json").write_bytes(data)
+        storage = SQLiteStorage(str(db))
+        storage.create_run(Run(run_id="live", goal="the real run"))
+        storage.append_event(
+            "live", EventType.RUN_STARTED, {"goal": "the real run"}, source=Origin.EXTERNAL_AGENT
+        )
+        storage.close()
+
+        out, err = io.StringIO(), io.StringIO()
+        code = cli_main(["--db", str(db), "briefing"], out=out, err=err)
+        assert code == 0, err.getvalue()
+        output = out.getvalue()
+        assert "CONTINUUM active run: live" in output
+        assert "resume pending" not in output
+        assert "no longer in the database" not in output
     finally:
         os.chdir(orig_cwd)
