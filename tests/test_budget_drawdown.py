@@ -239,6 +239,106 @@ def test_noise_padding_tolerated_when_key_is_not_held_fixed(
     assert all(entry["counter"] == 1 for entry in entries.values())
 
 
+def test_changing_the_volatile_declaration_cannot_move_the_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry that flips its ``volatile`` declaration stays in one bucket.
+
+    Token derivation reads the caller's ``volatile`` sequence to decide which
+    arguments to drop, so re-deriving the bucket per attempt would let a retry
+    rename its noise fields and start its count over. The claim pins the
+    resolved id onto the record and every later attempt reads it back.
+    """
+    budgets_path = _budgets_path()
+    budgets_path.parent.mkdir(parents=True, exist_ok=True)
+    budgets_path.write_text(
+        json.dumps(
+            {"default_max_attempts": 2, "action_types": {"send_invoice": {"max_attempts": 2}}}
+        )
+    )
+
+    storage = SQLiteStorage(":memory:")
+    storage.create_run(Run(run_id="run_1", goal="g"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(storage, "run_1")
+
+    # First attempt declares the noise field volatile; the second does not.
+    first = ledger.claim(
+        "send_invoice",
+        {"invoice": "INV-001", "trace_id": "trace-0"},
+        key="invoice:INV-001",
+        volatile=["trace_id"],
+    )
+    assert first.fresh
+    assert first.action.budget_authorization_id is not None
+    ledger.fail(first.key, "boom", certain=True)
+
+    second = ledger.claim(
+        "send_invoice",
+        {"invoice": "INV-001", "trace_id": "trace-1"},
+        key="invoice:INV-001",
+        volatile=[],
+    )
+    assert second.fresh
+    assert second.action.budget_authorization_id == first.action.budget_authorization_id
+    ledger.fail(second.key, "boom", certain=True)
+
+    # The third attempt flips back to the first declaration but the cap is
+    # already spent: the bucket never moved.
+    with pytest.raises(Exception, match="budget exhausted"):
+        ledger.claim(
+            "send_invoice",
+            {"invoice": "INV-001", "trace_id": "trace-2"},
+            key="invoice:INV-001",
+            volatile=["trace_id"],
+        )
+
+    raw = load_budgets(budgets_path)
+    entries = raw.get("authorization_bound", {}).get("send_invoice", {})
+    assert len(entries) == 1
+
+
+def test_settlement_uses_the_bucket_the_claim_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``complete`` settles against the bucket the claim drew from.
+
+    A claim may declare ``volatile`` fields while the settlement paths always
+    derive with none, so re-deriving put the confirmation in a different bucket
+    from the attempt it settled. The record carries the id, so both draw from it.
+    """
+    budgets_path = _budgets_path()
+    budgets_path.parent.mkdir(parents=True, exist_ok=True)
+    budgets_path.write_text(
+        json.dumps({"default_max_attempts": 5, "action_types": {"deploy": {"max_attempts": 5}}})
+    )
+
+    storage = SQLiteStorage(":memory:")
+    storage.create_run(Run(run_id="run_1", goal="g"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(storage, "run_1")
+
+    outcome = ledger.claim(
+        "deploy",
+        {"target": "prod-1", "trace_id": "trace-0"},
+        key="deploy-k1",
+        volatile=["trace_id"],
+    )
+    claim_id = outcome.action.budget_authorization_id
+    assert claim_id is not None
+    # The claim declared trace_id volatile, so the bucket excludes it; a
+    # settlement derived with no declaration would name a different one.
+    assert claim_id == resolve_authorization_id("deploy", None, {"target": "prod-1"})
+
+    ledger.complete(outcome.key, external_id="ext-1")
+
+    raw = load_budgets(budgets_path)
+    entries = raw.get("authorization_bound", {}).get("deploy", {})
+    assert list(entries) == [claim_id]
+    # One claim plus one settlement against the same bucket.
+    assert get_remaining(raw, "deploy", claim_id) == 3
+
+
 def test_budget_file_absent_is_unbound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No registry file means no authorization-bound budget (byte-identical)."""
     budgets_path = _budgets_path()

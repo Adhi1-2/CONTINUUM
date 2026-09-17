@@ -465,6 +465,19 @@ class ActionLedger:
         except Exception:
             return None
 
+    def _settlement_authorization_id(self, action: Action) -> str | None:
+        """The bucket a settlement of ``action`` draws from.
+
+        The claim that opened the slot pinned its bucket onto the record
+        (issue #1052), so the settlement reads it back and the two share one
+        counter whatever the caller sends between them. A record written before
+        the field existed carries ``None`` and is re-derived from its stored
+        arguments with no volatile declaration, which is the pre-#1052 rule.
+        """
+        if action.budget_authorization_id is not None:
+            return action.budget_authorization_id
+        return self._budget_authorization_id(action.action_type, None, dict(action.arguments), ())
+
     def _budget_consume_claim(
         self,
         action_type: str,
@@ -992,17 +1005,28 @@ class ActionLedger:
         # claim *is* (issue #1052). When this attempt defers to an existing
         # record -- the caller held the idempotency key fixed, or the token
         # fallback recognised a prior attempt -- the operation's identity is
-        # what was recorded at first claim, and the bucket is derived from
-        # that record's arguments. Deriving it from the incoming arguments
-        # instead would make the bucket follow caller-controlled noise: one
-        # throwaway ``trace_id`` moved every retry into a fresh bucket at its
-        # full allowance, and the cap never bound. The stored arguments are
-        # also what the settlement paths below derive from, so a retry and its
-        # confirmation now draw from one bucket by construction.
+        # what was recorded at first claim, so the bucket is derived from
+        # that record's arguments rather than the incoming ones. Deriving it
+        # from the incoming arguments instead would make the bucket follow
+        # caller-controlled noise: one throwaway ``trace_id`` moved every
+        # retry into a fresh bucket at its full allowance, and the cap never
+        # bound.
+        #
+        # The resolved id is then *persisted* on the record rather than
+        # re-derived, because token derivation also reads the caller's
+        # ``volatile`` declaration, and a retry that changes either the
+        # arguments or that declaration would compute a different bucket from
+        # the same stored record. Pinning it once means a retry, its
+        # confirmation and its reconciliation all draw from one counter by
+        # construction, whatever the caller sends later. Records written
+        # before the field existed carry None and are re-derived here, which
+        # pins them at the first claim that sees them.
         budget_arguments = existing.arguments if existing is not None else arguments
-        budget_auth_id = self._budget_authorization_id(
-            action_type, None, budget_arguments, volatile
-        )
+        budget_auth_id = existing.budget_authorization_id if existing is not None else None
+        if budget_auth_id is None:
+            budget_auth_id = self._budget_authorization_id(
+                action_type, None, budget_arguments, volatile
+            )
 
         if existing is None:
             if budget_auth_id is not None:
@@ -1026,6 +1050,7 @@ class ActionLedger:
                 status=ActionStatus.STARTED,
                 started_at=utcnow(),
                 origin_digest=origin_digest,
+                budget_authorization_id=budget_auth_id,
             )
             self._record(
                 key,
@@ -1052,6 +1077,7 @@ class ActionLedger:
                     "result": None,
                     "result_hash": None,
                     "external_id": None,
+                    "budget_authorization_id": budget_auth_id,
                 }
             )
             self._record(key, action)
@@ -1062,7 +1088,11 @@ class ActionLedger:
             if budget_auth_id is not None:
                 self._budget_consume_claim(action_type, budget_auth_id)
             action = existing.model_copy(
-                update={"status": ActionStatus.STARTED, "started_at": utcnow()}
+                update={
+                    "status": ActionStatus.STARTED,
+                    "started_at": utcnow(),
+                    "budget_authorization_id": budget_auth_id,
+                }
             )
             self._record(key, action)
             self._count_claim()
@@ -1158,11 +1188,15 @@ class ActionLedger:
         )
         recorded = self._record(key, action)
         self._count_complete()
-        # Settlement drawdown (issue #413): same per-authorization bucket as claims.
+        # Settlement drawdown (issue #413): same per-authorization bucket as the
+        # claim that opened this slot. The claim pinned the id onto the record
+        # (issue #1052), so read it back rather than re-deriving: token
+        # derivation reads the caller's ``volatile`` declaration, and a claim
+        # that declared one while this method always derives with none would put
+        # the confirmation in a different bucket from the attempt it settles.
+        # Records written before the field existed are re-derived as before.
         if existing.status is ActionStatus.STARTED:
-            auth_settle = self._budget_authorization_id(
-                existing.action_type, None, dict(existing.arguments), ()
-            )
+            auth_settle = self._settlement_authorization_id(existing)
             if auth_settle is not None:
                 self._budget_consume_settlement(existing.action_type, auth_settle)
         return recorded
@@ -1281,10 +1315,9 @@ class ActionLedger:
                 }
             )
         recorded = self._record(key, action, EventType.ACTION_RECONCILED)
-        # Settlement drawdown (issue #413): same bucket as claims.
-        auth_settle = self._budget_authorization_id(
-            existing.action_type, None, dict(existing.arguments), ()
-        )
+        # Settlement drawdown (issue #413): the claim pinned the bucket onto
+        # this record, so settle against the same one (issue #1052).
+        auth_settle = self._settlement_authorization_id(existing)
         if auth_settle is not None:
             self._budget_consume_settlement(existing.action_type, auth_settle)
         return recorded
