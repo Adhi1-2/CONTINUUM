@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
+from pathlib import Path
+from types import ModuleType
 
 import continuum.actions.ledger as action_ledger
 import continuum.adapters.actions as adapters_actions
@@ -34,6 +37,38 @@ import continuum.security.provenance as security_provenance
 import continuum.security.revalidation as security_revalidation
 import continuum.storage.postgres as storage_postgres
 import continuum.testing.fixtures as testing_fixtures
+
+
+def _locally_defined_public_names(mod: ModuleType) -> set[str]:
+    """Public, underscore-free names a module defines itself.
+
+    Imported names are excluded (they belong to the module that defines them)
+    and so are TypeVars, mirroring `state/diff.py` keeping `T` out of its list.
+    """
+    tree = ast.parse(Path(mod.__file__ or "").read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            if not node.name.startswith("_"):
+                names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            is_typevar = isinstance(node.value, ast.Call) and getattr(
+                node.value.func, "id", ""
+            ) in {"TypeVar", "ParamSpec", "TypeVarTuple"}
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and not target.id.startswith("_")
+                    and not is_typevar
+                ):
+                    names.add(target.id)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and not node.target.id.startswith("_")
+        ):
+            names.add(node.target.id)
+    return names
 
 
 def test_action_ledger_exports_fold_action_events() -> None:
@@ -98,6 +133,11 @@ def test_all_symbols_exist_on_modules() -> None:
             assert hasattr(mod, name), (
                 f"{mod.__name__} missing attribute {name!r} listed in __all__"
             )
+        # Dropping a name from __all__ would silently shrink the loop above, so
+        # pin __all__ against the module's own definitions rather than itself.
+        assert set(mod.__all__) == _locally_defined_public_names(mod), (
+            f"{mod.__name__}.__all__ does not match the public names it defines"
+        )
 
 
 def test_star_import_execution() -> None:
