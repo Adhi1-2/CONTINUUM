@@ -5,14 +5,18 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from continuum.analysis.trajectory_report import (
     build_trajectory_report,
     health_maybe_generate_trajectory_report,
+    is_quiet_window,
     maybe_generate_trajectory_report,
     record_trajectory_report,
+    render_trajectory_report,
 )
 from continuum.checkpoint import CheckpointManager
-from continuum.events import EventType
+from continuum.events import Event, EventType
 from continuum.models import Origin, Run, TrajectoryReport
 from continuum.state.semantic import project
 from continuum.storage import SQLiteStorage
@@ -362,5 +366,211 @@ def test_health_idle_trigger_generates_for_quiet_and_not_for_busy() -> None:
         assert via_health is None
         direct = maybe_generate_trajectory_report(storage, run_id)
         assert direct is None
+    finally:
+        storage.close()
+
+
+# --- is_quiet_window: the trigger that decides a report is built at all (#1235) ---
+
+
+def _evt(
+    event_type: EventType,
+    payload: dict[str, object] | None = None,
+    sequence: int = 1,
+) -> Event:
+    """Build a bare event for the pure window checks, no storage needed."""
+    return Event(run_id="run_1", sequence=sequence, type=event_type, payload=payload or {})
+
+
+def test_is_quiet_window_empty_window_is_quiet() -> None:
+    """The 'quiet never occurs' case: an empty window makes no progress claim."""
+    assert is_quiet_window([]) is True
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.RUN_STARTED,
+        EventType.TOOL_FAILED,
+        EventType.STATE_CHECKPOINTED,
+        EventType.LIVENESS_SILENCE_DETECTED,
+        EventType.ACTION_RECORDED,
+        EventType.TRAJECTORY_REPORT,
+    ],
+)
+def test_is_quiet_window_without_progress_events_is_quiet(event_type: EventType) -> None:
+    """A window holding only non-progress events still counts as quiet."""
+    assert is_quiet_window([_evt(event_type, {"any": "payload"})]) is True
+
+
+def test_is_quiet_window_checks_every_event_not_just_the_last() -> None:
+    """A progress event anywhere in the window breaks quiet, not only the tail."""
+    window = [
+        _evt(EventType.TOOL_FAILED, {}, sequence=1),
+        _evt(EventType.WORK_COMPLETED, {"count": 1}, sequence=2),
+        _evt(EventType.RUN_STARTED, {}, sequence=3),
+    ]
+    assert is_quiet_window(window) is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"count": 1}, False),
+        ({"count": 5}, False),
+        # Zero completed work makes no progress claim.
+        ({"count": 0}, True),
+        # Failed work is not progress.
+        ({"count": 1, "failed": True}, True),
+        # An unreadable count is treated as progress rather than silently ignored.
+        ({"count": "not-a-number"}, False),
+        # A missing count defaults to one unit of completed work.
+        ({}, False),
+    ],
+)
+def test_is_quiet_window_work_completed_edge_cases(
+    payload: dict[str, object], expected: bool
+) -> None:
+    assert is_quiet_window([_evt(EventType.WORK_COMPLETED, payload)]) is expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"completed": 3}, False),
+        ({"completed": 0}, True),
+        # No completed field means the event makes no progress claim.
+        ({}, True),
+        # An unreadable completed count is treated as progress.
+        ({"completed": "not-a-number"}, False),
+    ],
+)
+def test_is_quiet_window_task_updated_edge_cases(
+    payload: dict[str, object], expected: bool
+) -> None:
+    assert is_quiet_window([_evt(EventType.TASK_UPDATED, payload)]) is expected
+
+
+def test_is_quiet_window_decision_created_breaks_quiet_regardless_of_payload() -> None:
+    assert is_quiet_window([_evt(EventType.DECISION_CREATED, {})]) is False
+    assert is_quiet_window([_evt(EventType.DECISION_CREATED, {"deferred": True})]) is False
+
+
+def test_quiet_window_bounds_exclude_start_and_include_end() -> None:
+    """The window is half-open, (start, end]: the boundary decides what a report sees."""
+    storage = _make_storage()
+    try:
+        run_id = "run_1"
+        storage.append_event(
+            run_id, EventType.WORK_COMPLETED, {"count": 1}, source=Origin.DETERMINISTIC
+        )
+        progress_seq = storage.last_sequence(run_id)
+        _add_quiet_window_events(storage, run_id, count=2)
+        end = storage.last_sequence(run_id)
+
+        # Starting the window *at* the progress sequence excludes it, so the
+        # window holds only the stalled actions and a report is built.
+        report = maybe_generate_trajectory_report(
+            storage, run_id, window_start=progress_seq, window_end=end
+        )
+        assert report is not None
+        assert (report.window_start, report.window_end) == (progress_seq, end)
+
+        # Ending the window at the progress sequence includes it, so quiet fails
+        # and nothing is recorded.
+        assert (
+            maybe_generate_trajectory_report(
+                storage, run_id, window_start=1, window_end=progress_seq
+            )
+            is None
+        )
+    finally:
+        storage.close()
+
+
+# --- render_trajectory_report: the human-facing end of the feature (#1235) ---
+
+
+def _example_report(**overrides: object) -> TrajectoryReport:
+    base: dict[str, object] = {
+        "report_id": "rep_abc123",
+        "window_start": 2,
+        "window_end": 9,
+        "compaction_seq": 9,
+        "attempts": 3,
+        "scar_rate": 0.25,
+        "stall_sites": ["ingest.api", "db.migrate"],
+        "top_failure_action_types": ["ingest.api"],
+        "derived_origin": Origin.EXTERNAL_AGENT.value,
+    }
+    base.update(overrides)
+    return TrajectoryReport(**base)  # type: ignore[arg-type]
+
+
+def test_render_names_the_report_window_and_recorded_metrics() -> None:
+    report = _example_report()
+    lines = render_trajectory_report(report)
+    text = "\n".join(lines)
+
+    assert lines, "a report must render something"
+    assert report.report_id in text
+    assert "2->9" in text
+    # scar_rate renders to two decimals, whatever the report recorded.
+    assert f"scar_rate {report.scar_rate:.2f}" in text
+    assert f"attempts {report.attempts}" in text
+    # every recorded stall site and failure type is named
+    for site in report.stall_sites:
+        assert site in text
+    for action_type in report.top_failure_action_types:
+        assert action_type in text
+
+
+def test_render_without_lessons_still_reports_honestly() -> None:
+    """No stalls and no failures render the header and metrics, not an empty list."""
+    report = _example_report(stall_sites=[], top_failure_action_types=[])
+    lines = render_trajectory_report(report)
+    text = "\n".join(lines)
+
+    assert lines
+    assert report.report_id in lines[0]
+    assert f"scar_rate {report.scar_rate:.2f}" in text
+    assert "stall_sites:" not in text
+    assert "top failures:" not in text
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        (Origin.EXTERNAL_AGENT.value, "unverified (derived)"),
+        (Origin.LLM.value, "unverified (derived)"),
+        (Origin.DETERMINISTIC.value, "derived from deterministic"),
+        (Origin.HUMAN.value, "derived from human"),
+    ],
+)
+def test_render_labels_the_derived_origin(origin: str, expected: str) -> None:
+    report = _example_report(derived_origin=origin)
+    text = "\n".join(render_trajectory_report(report))
+    assert expected in text
+
+
+def test_render_of_a_report_built_from_storage_names_what_it_recorded() -> None:
+    """The renderer echoes the metrics build_trajectory_report actually computed."""
+    storage = _make_storage()
+    try:
+        run_id = "run_1"
+        for i in range(3):
+            _add_failed_action(storage, run_id, "test.stall", f"k{i}")
+        # A claimed-but-never-settled action is the scar the scar_rate counts.
+        from continuum.actions import ActionLedger
+
+        ActionLedger(storage, run_id).claim("test.scar", {"y": 1}, key="scar_0")
+        end = storage.last_sequence(run_id)
+
+        report = build_trajectory_report(storage, run_id, 0, end)
+        text = "\n".join(render_trajectory_report(report))
+
+        assert report.report_id in text
+        assert "test.stall" in text
+        assert f"scar_rate {report.scar_rate:.2f}" in text
     finally:
         storage.close()
