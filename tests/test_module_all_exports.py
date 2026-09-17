@@ -137,6 +137,11 @@ assert callable(render_contract)
 assert issubclass(GateConfigError, Exception)
 assert callable(latest_pinning)
 assert callable(stamp_lineage)
+assert callable(get_adapter)
+assert callable(baseline_by_name)
+assert issubclass(RecoveryTimeoutError, Exception)
+assert callable(run_revalidation)
+assert callable(make_auto_checkpoint_hook)
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, (
