@@ -444,6 +444,19 @@ class ActionLedger:
         (#413), so the helper ignores an explicit key and derives from
         resource tokens alone. Ledger anchoring is not used here so a
         prior failed attempt does not make a retry look unbound.
+
+        ``arguments`` are caller-supplied, which is the other half of the same
+        problem: a token derived from every argument follows the noise as much
+        as the resource, so padding one throwaway field (a ``trace_id``, a
+        request id) moved each retry into a fresh bucket at its full allowance
+        and the cap never bound (issue #1052). The caller therefore passes the
+        arguments of the record the claim defers to when there is one: those
+        name the operation the ledger has already decided this attempt *is*, and
+        they are what the settlement paths derive from too. Minting a fresh key
+        alongside fresh noise presents no identity the ledger can see and stays
+        on the incoming-argument fallback, which is the documented residual
+        rather than something a ``volatile`` declaration could close -- a caller
+        that wants around the cap simply forgets to declare the field.
         """
         try:
             return resolve_authorization_id(
@@ -974,7 +987,22 @@ class ActionLedger:
         # ledger-anchored, so distinct fresh idempotency keys for the same
         # resource (same invoice id) share the same counter and cannot
         # bypass the cap by minting new keys (the #390 amplification fix).
-        budget_auth_id = self._budget_authorization_id(action_type, None, arguments, volatile)
+        #
+        # The bucket follows the identity the ledger has already decided this
+        # claim *is* (issue #1052). When this attempt defers to an existing
+        # record -- the caller held the idempotency key fixed, or the token
+        # fallback recognised a prior attempt -- the operation's identity is
+        # what was recorded at first claim, and the bucket is derived from
+        # that record's arguments. Deriving it from the incoming arguments
+        # instead would make the bucket follow caller-controlled noise: one
+        # throwaway ``trace_id`` moved every retry into a fresh bucket at its
+        # full allowance, and the cap never bound. The stored arguments are
+        # also what the settlement paths below derive from, so a retry and its
+        # confirmation now draw from one bucket by construction.
+        budget_arguments = existing.arguments if existing is not None else arguments
+        budget_auth_id = self._budget_authorization_id(
+            action_type, None, budget_arguments, volatile
+        )
 
         if existing is None:
             if budget_auth_id is not None:

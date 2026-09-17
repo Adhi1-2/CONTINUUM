@@ -158,6 +158,87 @@ def test_weak_tokens_leave_no_budget_entry(tmp_path: Path, monkeypatch: pytest.M
     assert "authorization_bound" not in raw or not raw["authorization_bound"]
 
 
+def test_noise_padding_cannot_move_the_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One throwaway argument token must not reset the cap (issue #1052).
+
+    The authorization bucket derives from argument tokens, and the arguments are
+    caller-controlled noise plus the real resource. Padding a ``trace_id`` per
+    retry therefore moved every retry into a fresh bucket at its full allowance,
+    so an operator-set cap of 2 refused a third identical attempt but stayed open
+    indefinitely while each retry carried a new token. The bucket must follow the
+    identity the ledger has already decided the claim *is*: when the claim defers
+    to an existing record, that record's arguments name the operation.
+    """
+    budgets_path = _budgets_path()
+    budgets_path.parent.mkdir(parents=True, exist_ok=True)
+    budgets_path.write_text(
+        json.dumps(
+            {"default_max_attempts": 2, "action_types": {"send_invoice": {"max_attempts": 2}}}
+        )
+    )
+
+    storage = SQLiteStorage(":memory:")
+    storage.create_run(Run(run_id="run_1", goal="g"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(storage, "run_1")
+
+    # Fixed idempotency key, one throwaway argument token varied per attempt.
+    for i in range(2):
+        outcome = ledger.claim(
+            "send_invoice", {"invoice": "INV-001", "trace_id": f"trace-{i}"}, key="invoice:INV-001"
+        )
+        assert outcome.fresh
+        ledger.fail(outcome.key, "upstream 503", certain=True)
+
+    # The third padded attempt must be refused like an identical one is.
+    with pytest.raises(Exception, match="budget exhausted"):
+        ledger.claim(
+            "send_invoice", {"invoice": "INV-001", "trace_id": "trace-2"}, key="invoice:INV-001"
+        )
+
+    # Every retry drew from one bucket rather than minting a fresh one each time.
+    raw = load_budgets(budgets_path)
+    entries = raw.get("authorization_bound", {}).get("send_invoice", {})
+    assert len(entries) == 1
+    assert get_remaining(raw, "send_invoice", list(entries)[0]) == 0
+
+
+def test_noise_padding_tolerated_when_key_is_not_held_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh keys plus fresh noise is the documented unbound case.
+
+    With no fixed identity and no ledger record to defer to, nothing in the
+    arguments distinguishes the resource from the noise, so this stays on the
+    token fallback as before. Documented rather than silently changed: the
+    operator's cap binds the identities the ledger can see.
+    """
+    budgets_path = _budgets_path()
+    budgets_path.parent.mkdir(parents=True, exist_ok=True)
+    budgets_path.write_text(json.dumps({"default_max_attempts": 2}))
+
+    storage = SQLiteStorage(":memory:")
+    storage.create_run(Run(run_id="run_1", goal="g"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(storage, "run_1")
+
+    for i in range(3):
+        outcome = ledger.claim(
+            "send_invoice", {"invoice": "INV-001", "trace_id": f"trace-{i}"}, key=f"k{i}"
+        )
+        assert outcome.fresh
+        ledger.fail(outcome.key, "boom", certain=True)
+
+    # Each attempt minted both a fresh key and a fresh token, so each landed in
+    # its own bucket; the cap does not bind. This is the accepted residual.
+    raw = load_budgets(budgets_path)
+    entries = raw.get("authorization_bound", {}).get("send_invoice", {})
+    assert len(entries) == 3
+    assert all(entry["counter"] == 1 for entry in entries.values())
+
+
 def test_budget_file_absent_is_unbound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No registry file means no authorization-bound budget (byte-identical)."""
     budgets_path = _budgets_path()
