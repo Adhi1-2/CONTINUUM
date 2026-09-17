@@ -52,6 +52,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The action index fold is ordered by wall-clock time across the archive
+  boundary, so a run's archived claim keeps outranking another run's later live
+  write of the same key (#1054).** Both engines folded the archive and the live
+  tail in one stream numbered per table, so an archived action claimed long ago
+  could outrank -- or be outranked by -- a newer live write of the same key
+  depending on which table's sequence happened to sort first, and
+  last-write-per-key was only true by accident. The fold now reads the archive
+  and the live tail as two ordered halves, archive first, with archived rows
+  given positions below every possible live value, so the ordering the fold
+  assumes is the ordering it gets on both backends.
+
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
