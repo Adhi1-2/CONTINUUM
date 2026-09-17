@@ -752,7 +752,13 @@ class PostgresStorage(Storage):
         offset = len(archived)
         archived_seen = 0
         for _ts, _run_id, _seq, live_idx, event_type, payload in timeline:
-            parsed = payload if isinstance(payload, dict) else json.loads(payload)
+            # A row whose payload is not parseable is skipped, not fatal: the
+            # fold reads raw rows, and one corrupt entry must not abort the
+            # repair path for every key in the store.
+            try:
+                parsed = payload if isinstance(payload, dict) else json.loads(payload)
+            except json.JSONDecodeError:
+                continue
             entry = index_entry_from_payload(EventType(event_type), parsed)
             if entry is None:
                 continue

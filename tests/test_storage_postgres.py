@@ -311,3 +311,31 @@ def test_pg_rebuild_keeps_an_archived_completion_above_an_earlier_live_failure(
     )
     assert replayed.fresh is False
     assert replayed.action.external_id == "ext-1"
+
+
+def test_pg_rebuild_skips_an_unparsable_payload(storage: PostgresStorage) -> None:
+    """A payload that is not JSON must skip the fold, not abort it.
+
+    The rebuild fold reads raw rows with no chain check first, and the whole
+    store's keys are repaired in one pass, so one corrupt entry has to degrade
+    to a skipped row rather than raise.
+    """
+    make_run(storage, "pg_bad", "corrupt payload")
+    ledger = ActionLedger(storage, "pg_bad")
+    done = ledger.claim("send_invoice", {}, key="invoice:pg-bad")
+    ledger.complete(done.key, external_id="INV-pg-bad")
+
+    storage._connection.execute(
+        "UPDATE events SET payload = 'not-json' WHERE run_id = 'pg_bad' AND type LIKE 'ACTION%'"
+    )
+    storage._connection.execute(
+        "UPDATE events_archive SET payload = 'not-json'"
+        " WHERE run_id = 'pg_bad' AND type LIKE 'ACTION%'"
+    )
+
+    assert done.key not in storage._canonical_index_rows()
+    # The rebuild drops the stale row rather than crashing on it, and the
+    # store is then consistent with its (reduced) truth.
+    storage.rebuild_action_index()
+    assert storage.action_index_drift() == 0
+    assert storage.foreign_action(done.key, exclude_run="nobody") is None
