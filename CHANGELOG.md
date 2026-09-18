@@ -168,6 +168,8 @@ All notable changes to this project are documented here. The format follows
   but it was wrong in the direction of hiding drift, which is the opposite of
   what a drift report is for. `latest_pinning` now folds `read_all_events`, the
   same history the assess (#1050) and watch (#1072) folds already read.
+- **The translated docs no longer tell users to pass `--json` after the subcommand, where argparse rejects it (#1144).**
+  `--json` is a global flag on the top-level parser, so `continuum resume RUN --json` exits 2 with "unrecognized arguments" — the trailing position is not a valid invocation anywhere. Five translated READMEs still claimed every command accepts it there, and `docs/guides/memory_governance.md` built two shell pipelines on the failing form, so the whole tenant-enumeration section it belongs to produced nothing: the command never ran and `python -m json.tool` read an empty pipe. The guides now state the placement and the failure, matching `docs/api/cli.md`, which already documented the rule correctly. The translated READMEs also picked up the webhook caveat the English README gained when read-only-ness was qualified, so they describe the same CLI the canonical docs do rather than a stale version of it.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
