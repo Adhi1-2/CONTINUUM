@@ -52,6 +52,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`resume --pinning` compares against the archived pinning, so a compacted
+  run stops reporting every key as newly pinned (#1126).** The drift display
+  folded the live event tail alone, and compaction moves the pinning-carrying
+  `ACTION_RECORDED` into `events_archive` while the anchor marker that replaces
+  it carries no pinning at all. The fold therefore read `{}` as the run's
+  recorded identity and `pinning_drift({}, current)` called every key newly
+  pinned -- including on a run whose recorded pinning was byte-identical to the
+  one passed at resume. The wrong directions were exactly the ones an operator
+  would act on: a genuinely *changed* hash
+  rendered as "newly pinned" instead of "changed", hiding the previous value,
+  and a key that had been unpinned never rendered at all, because the
+  `unpinned (was ...)` line needs the old value the empty record could not
+  supply. The display is informational and never gated recovery (issue #241),
+  but it was wrong in the direction of hiding drift, which is the opposite of
+  what a drift report is for. `latest_pinning` now folds `read_all_events`, the
+  same history the assess (#1050) and watch (#1072) folds already read.
+
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
