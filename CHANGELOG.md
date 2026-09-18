@@ -52,6 +52,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The OpenAI adapter test double works against `openai-agents` 0.22.3, so the
+  CI test matrix is green again.** The suite installs the adapter extra with
+  plain `pip install -e ".[dev]"`, which resolves `openai-agents>=0.2` to the
+  newest release rather than the `uv.lock` pin, and 0.22.3 made
+  `_on_invoke_tool_impl` read `ctx._function_tool_arguments` — an attribute
+  `ToolContext.__init__` sets but the hand-built `FakeTC` double in
+  `tests/test_adapters_openai.py` never did, having overridden `__init__`
+  without calling `super().__init__()`. The tool then returned the SDK's own
+  error string instead of its result, and every `Test` job in the matrix went
+  red on a commit that touched nothing near the adapter. The double now sets
+  the attribute to `None`, exactly what the SDK's own constructor does; the
+  attribute is unused in older releases, so the fix is inert there. Only the
+  test double needed changing — the adapter itself uses only the public
+  `ToolContext` API (`tool_name`, `tool_input`, the `ToolContext` type), no
+  internals.
+
 - **The docs-count guard now reads `references/` and the translated READMEs,
   and the stale counts they held are re-synced (#1109, #1071).** The guard in
   `tests/test_docs_counts.py` watched only three files, so `references/testing.md`

@@ -592,6 +592,11 @@ def test_wrap_function_tool_invocation_binds_args_and_intercepts(
             self.tool_name = "api_call"
             self.context = ContinuumContext(continuum_run_id=run_id, goal="g")
             self.tool_input = {"continuum_run_id": run_id}
+            # openai-agents >= 0.22.3 reads this in _on_invoke_tool_impl before
+            # it re-parses the payload. ToolContext.__init__ sets it, but this
+            # double builds the attributes by hand, so it has to set it too;
+            # the attribute is unused in older SDKs, so this is inert there.
+            self._function_tool_arguments = None
 
     payload = '{"endpoint": "https://x", "method": "POST"}'
     first = asyncio.run(api_call.on_invoke_tool(FakeTC(), payload))
