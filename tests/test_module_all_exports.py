@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import ast
+import os
+import pathlib
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
 
+import continuum
 import continuum.actions.ledger as action_ledger
 import continuum.adapters.actions as adapters_actions
 import continuum.adapters.browser as adapters_browser
@@ -183,7 +186,15 @@ assert issubclass(RecoveryTimeoutError, Exception)
 assert callable(run_revalidation)
 assert callable(make_auto_checkpoint_hook)
 """
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    # A bare subprocess resolves ``continuum`` on its own default path, which
+    # can pick up a stale site-packages copy instead of the tree under test.
+    # Pin the interpreter to the package the test session itself imported.
+    package_root = pathlib.Path(continuum.__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(package_root), env.get("PYTHONPATH")) if part
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert result.returncode == 0, (
         f"Star import failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
     )

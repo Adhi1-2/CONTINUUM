@@ -36,6 +36,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
+- **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
+  `DuplicateAction` (`continuum.actions.ledger`) and `LeaseError`
+  (`continuum.concurrency.lease`) were exported exceptions that no code path
+  could raise: duplicate attempts are handled via `fresh=False` outcomes,
+  `UnknownSideEffect`, or `GrantDenied`, while lease contention is signaled by
+  `acquire() -> False`. Dead exception definitions and exports removed.
 - **Dead `observations_evidence_lines` helper (#867).** The function in
   `src/continuum/recovery/observations.py` was defined once and called
   nowhere: leftover scaffolding from #208 whose engine-side rendering at
@@ -96,6 +102,37 @@ All notable changes to this project are documented here. The format follows
   most needs on this path, and it was the signal both resolvers converted into
   noise. A genuine lookup miss still falls through to the version and
   source-sequence strategies exactly as before.
+
+- **`continuum attest-keygen` writes the private key owner-only (#1056).** The
+  command wrote an unencrypted PKCS8 Ed25519 private key with
+  `Path.write_text`, which creates the file at 0666 masked by the ambient umask
+  (0644 out of the box, readable by every local user on the host) while its
+  own output told the operator to keep it secret. Anyone with read access to the
+  file or a backup copy could produce validly-signed attestations for a tampered
+  event chain. The key is now created through `os.open` with an explicit 0600
+  mode, so it is owner-only from the moment it appears with no window at 0644,
+  and a pre-existing wider-mode file being overwritten is narrowed too, since
+  `open(2)` ignores the mode argument for a file that already exists. The public
+  key stays world-readable, as intended. The command now reports the mode it
+  applied next to the existing "keep the private key secret" line, so an operator
+  on a surprising filesystem can see what they actually got. Two tests pin the
+  property on POSIX (created mode, narrowing of a pre-existing 0644 key,
+  reported mode in output); Windows has no POSIX permission bits and is
+  skipped, matching the `tests/test_retry_budgets.py` precedent. A third test
+  covers the file-descriptor leak guard in the write helper on every platform.
+- **Every run-completion path now clears the instant-resume pointer (#394).**
+  `.continuum/resume.json` is written on every checkpoint so a `SessionStart`
+  hook can banner the interrupted run without opening the database. A run
+  closed as completed is no longer interrupted, but only `continuum complete`
+  removed the pointer; the TUI's and the dashboard HITL button's `complete_run`
+  claimed to mirror that command and did not, so completing a run from either
+  left the next session banner surfacing finished work as the active run. The
+  cleanup is now a single helper (`continuum.checkpoint.clear_resume_pointer`)
+  all three paths route through. A pointer naming any other run is left in
+  place, and an unreadable or undeletable file, or one holding valid JSON that
+  is not an object, is tolerated rather than failing the completion.
+  `tests/test_resume_pointer.py` pins the helper and each of the three
+  completion paths, and was verified to fail without the fix.
 
 - **The horizon `abort_condition_year` scenario now reaches abort (#1028).**
   The scenario was labelled `correct_mode="abort"` but drove the abort through
@@ -885,7 +922,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,313 collected, ~2,253 passed, ~25 skipped on a minimal env).
+  (~2,347 collected, ~2,320 passed, ~27 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
