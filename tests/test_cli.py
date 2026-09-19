@@ -387,6 +387,21 @@ def test_validate_with_dashboard_renders_the_phase_14_dashboard(db: str) -> None
     assert "safe to resume:" in out
 
 
+def test_validate_with_dashboard_feeds_metrics_collector(db: str) -> None:
+    from continuum.observability import VALIDATIONS_RUN, get_metrics, reset_metrics
+
+    reset_metrics()
+    try:
+        code, out, _ = run("--db", db, "validate", "run_1", "--env", "dataset=v3", "--dashboard")
+        assert code == ExitCode.OK
+        assert "CONTINUUM RECOVERY DASHBOARD" in out
+        snap = get_metrics().snapshot()
+        assert snap["counters"].get(VALIDATIONS_RUN, 0) == 1
+        assert snap["gauges"].get("validation.components", 0) >= 1
+    finally:
+        reset_metrics()
+
+
 def test_validate_without_dashboard_stays_machine_friendly(db: str) -> None:
     code, out, _ = run("--db", db, "validate", "run_1", "--env", "dataset=v3")
     assert code == ExitCode.OK
