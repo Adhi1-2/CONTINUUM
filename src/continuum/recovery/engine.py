@@ -38,7 +38,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from continuum.actions.ledger import UNCERTAIN_STATUSES, ActionLedger
+from continuum.actions.ledger import ActionLedger
 from continuum.analysis.depends import DependencyGraph as SourceDependencyGraph
 from continuum.checkpoint.manager import CheckpointManager, RestoredRun
 from continuum.environment.diff import EnvironmentDiff
@@ -311,7 +311,12 @@ class RecoveryEngine:
         )
 
         ledger = ActionLedger(self.storage, run_id)
-        all_uncertain = tuple(a for a in ledger.all() if a.status in UNCERTAIN_STATUSES)
+        all_uncertain = tuple(
+            a
+            for a in ledger.all()
+            if a.status
+            in (ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW)
+        )
         # An action tagged to a dependency outside the repair scope cannot have
         # invalidated the part being resumed, so it does not block here. An
         # untagged action could have touched anything and stays blocking.
