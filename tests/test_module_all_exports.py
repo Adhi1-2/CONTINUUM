@@ -12,6 +12,7 @@ from types import ModuleType
 
 import continuum
 import continuum.actions.ledger as action_ledger
+import continuum.actions.reconciliation as actions_reconciliation
 import continuum.adapters.actions as adapters_actions
 import continuum.adapters.browser as adapters_browser
 import continuum.adapters.container as adapters_container
@@ -25,9 +26,12 @@ import continuum.benchmark.controlled_failures as benchmark_controlled_failures
 import continuum.benchmark.phase6.harness as phase6_harness
 import continuum.benchmark.phase6.metrics as phase6_metrics
 import continuum.benchmark.phase6.scenarios as phase6_scenarios
+import continuum.checkpoint.policy as checkpoint_policy
 import continuum.dashboard.app as dashboard_app
+import continuum.environment.snapshot as environment_snapshot
 import continuum.gate as gate
 import continuum.hooks as hooks
+import continuum.models as continuum_models
 import continuum.pinning as pinning
 import continuum.plugins.registry as plugins_registry
 import continuum.recovery.cleanup as recovery_cleanup
@@ -106,6 +110,7 @@ def test_all_symbols_exist_on_modules() -> None:
         gate,
         pinning,
         recovery_gate,
+        actions_reconciliation,
         adapters_actions,
         adapters_browser,
         adapters_container,
@@ -119,7 +124,9 @@ def test_all_symbols_exist_on_modules() -> None:
         phase6_harness,
         phase6_metrics,
         phase6_scenarios,
+        checkpoint_policy,
         dashboard_app,
+        environment_snapshot,
         hooks,
         plugins_registry,
         recovery_cleanup,
@@ -130,6 +137,7 @@ def test_all_symbols_exist_on_modules() -> None:
         security_revalidation,
         storage_postgres,
         testing_fixtures,
+        continuum_models,
     ]
     for mod in modules:
         for name in mod.__all__:
@@ -146,6 +154,7 @@ def test_all_symbols_exist_on_modules() -> None:
 def test_star_import_execution() -> None:
     code = """
 from continuum.actions.ledger import *
+from continuum.actions.reconciliation import *
 from continuum.recovery.contract import *
 from continuum.gate import *
 from continuum.pinning import *
@@ -163,7 +172,9 @@ from continuum.benchmark.controlled_failures import *
 from continuum.benchmark.phase6.harness import *
 from continuum.benchmark.phase6.metrics import *
 from continuum.benchmark.phase6.scenarios import *
+from continuum.checkpoint.policy import *
 from continuum.dashboard.app import *
+from continuum.environment.snapshot import *
 from continuum.hooks import *
 from continuum.plugins.registry import *
 from continuum.recovery.cleanup import *
@@ -174,6 +185,7 @@ from continuum.security.provenance import *
 from continuum.security.revalidation import *
 from continuum.storage.postgres import *
 from continuum.testing.fixtures import *
+from continuum.models import *
 
 assert callable(fold_action_events)
 assert callable(render_contract)
@@ -185,6 +197,15 @@ assert callable(baseline_by_name)
 assert issubclass(RecoveryTimeoutError, Exception)
 assert callable(run_revalidation)
 assert callable(make_auto_checkpoint_hook)
+assert callable(unresolved_actions)
+assert callable(process_fingerprint)
+assert isinstance(PolicyContext, type)
+assert issubclass(ContextPressurePolicy, CheckpointPolicy)
+assert isinstance(Origin, type)
+assert isinstance(Provenance, type)
+assert callable(validate_caused_by)
+assert isinstance(Frozen, dict)
+assert isinstance(PROJECTION_BOOKKEEPING, set)
 """
     # A bare subprocess resolves ``continuum`` on its own default path, which
     # can pick up a stale site-packages copy instead of the tree under test.
@@ -223,3 +244,35 @@ def test_security_revalidation_exports_run_revalidation() -> None:
 def test_hooks_exports_make_auto_checkpoint_hook() -> None:
     assert "make_auto_checkpoint_hook" in hooks.__all__
     assert callable(hooks.make_auto_checkpoint_hook)
+
+
+def test_reconciliation_exports_unresolved_actions() -> None:
+    # Re-exported by actions/__init__.py and the top-level continuum package,
+    # so the module that defines it owes it an __all__ entry.
+    assert "unresolved_actions" in actions_reconciliation.__all__
+    assert callable(actions_reconciliation.unresolved_actions)
+
+
+def test_environment_snapshot_exports_process_fingerprint() -> None:
+    assert "process_fingerprint" in environment_snapshot.__all__
+    assert callable(environment_snapshot.process_fingerprint)
+
+
+def test_checkpoint_policy_exports_context_types() -> None:
+    assert "PolicyContext" in checkpoint_policy.__all__
+    assert "ContextPressurePolicy" in checkpoint_policy.__all__
+    assert isinstance(checkpoint_policy.PolicyContext, type)
+    assert issubclass(checkpoint_policy.ContextPressurePolicy, checkpoint_policy.CheckpointPolicy)
+
+
+def test_models_exports_the_names_the_package_re_exports() -> None:
+    for name in (
+        "Frozen",
+        "Origin",
+        "Provenance",
+        "TrajectoryReport",
+        "validate_caused_by",
+        "PROJECTION_BOOKKEEPING",
+    ):
+        assert name in continuum_models.__all__, f"continuum.models omits {name!r}"
+        assert hasattr(continuum_models, name)

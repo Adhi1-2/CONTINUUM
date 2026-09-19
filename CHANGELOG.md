@@ -71,6 +71,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Webhook dedup now survives a compaction inside the re-notify window
+  (#1186).** `_within_dedup_window` scanned only the live event tail for the
+  `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
+  but `compact_run` archives exactly those rows. A compaction inside an
+  endpoint's re-notify window (default 3600s) therefore made the next blocked
+  assessment deliver the same verdict again. This is the precise spam the dedup
+  exists to prevent, and in the failure direction that always means more
+  noise: an operator who was paged once and compacted the long blocked run to
+  shrink the log, as the docs suggest, gets paged again for the same standing
+  blockage, and once archived, on every subsequent assessment until the
+  window expires. The scan now reads `read_all_events`, the merged
+  archive-aware history every other durable-state consumer already uses
+  (`ledger._replay`, `gateway`, `provenance_for_run`, the reconcilers).
+  Archived rows keep their original timestamps, so the window computation
+  itself is unchanged and the expired-window path still rings again on time.
 - **The docs-count guard now reads `references/` and the translated READMEs,
   and the stale counts they held are re-synced (#1109, #1071).** The guard in
   `tests/test_docs_counts.py` watched only three files, so `references/testing.md`
@@ -941,7 +956,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,397 collected, ~2,356 passed, ~41 skipped on a minimal env).
+  (~2,402 collected, ~2,361 passed, ~41 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
