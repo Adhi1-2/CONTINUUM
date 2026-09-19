@@ -2420,13 +2420,10 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
 
     # Diagnostic path (issue #742): the raw agent summary stays reachable,
     # verbatim, for an operator debugging the curation. Explicit opt-in, so
-    # the default briefing is the curated one. Full history for the same
-    # reason as the curation: a compacted run keeps its summary in the
-    # archive, and a diagnostic that cannot see it is useless for the case
-    # it exists to debug (issue #1128).
+    # the default briefing is the curated one.
     if getattr(args, "raw_summary", False):
         summaries = [
-            e for e in storage.read_all_events(run_id) if e.type is EventType.REASONING_SUMMARY
+            e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY
         ]
         if not summaries:
             print(f"No reasoning summary recorded for {run_id}.", file=out)
