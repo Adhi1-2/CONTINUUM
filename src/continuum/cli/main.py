@@ -4457,6 +4457,13 @@ def main(
 
     try:
         return int(args.func(args, storage, out, err))
+    except FileNotFoundError as exc:
+        # An operator-supplied input file that does not exist is an ordinary
+        # operator mistake (--attest, --key, --payload-file typed from memory),
+        # not an internal failure. Naming the path is what the traceback would
+        # have made the reader dig for. See issue #1143.
+        print(f"error: file not found: {exc.filename or exc}", file=err)
+        return ExitCode.ERROR
     except (RunNotFound, CheckpointNotFound) as exc:
         print(f"error: {exc}", file=err)
         return ExitCode.NOT_FOUND
