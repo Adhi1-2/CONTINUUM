@@ -52,20 +52,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **A compacted run can record plan and progress updates again (#1133).**
-  Every structured write gated on a pre-flight fold that projected the live
-  tail only. After `compact` moved the pre-anchor prefix into the archive,
-  `RUN_STARTED` lived there, so the CLI's `record-plan` pre-flight refused a
-  legal plan with "the log never recorded RUN_STARTED" and the MCP
-  `_project_candidate` refused `record_plan` and `record_progress` outright.
-  The MCP path also carried a second, quieter failure: `ensure_run` read the
-  live tail's first event, found it empty after compaction, and backfilled a
-  *second* `RUN_STARTED` after the anchor, rewriting the run's history to make
-  the write succeed. Both pre-flight folds and the first-event check now read
-  the full merged history through `read_all_events`, so `head` stays the true
-  tip and `expected_sequence` still guards the concurrent-write race.
-  Compaction and the plan records exist for the same long runs, so the write
-  path met the read path's archive-blindness exactly where both mattered.
 - **The docs-count guard now reads `references/` and the translated READMEs,
   and the stale counts they held are re-synced (#1109, #1071).** The guard in
   `tests/test_docs_counts.py` watched only three files, so `references/testing.md`

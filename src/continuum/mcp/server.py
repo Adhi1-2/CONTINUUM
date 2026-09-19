@@ -284,12 +284,7 @@ def _project_candidate(
     ``total``). One run has one owner by design, but the failure being guarded
     here is unrecoverable, so it is worth not relying on that.
     """
-    # Full history, not the live tail: after ``compact`` the archived prefix
-    # holds ``RUN_STARTED`` and the earlier plan units, and a candidate is
-    # legal or not relative to the whole log. The live tail would refuse every
-    # write on a compacted run for invariants the archive satisfies (issue
-    # #1133). ``head`` is still the true tip: the merge is sequence-ordered.
-    history = list(ctx.storage.read_all_events(run_id))
+    history = list(ctx.storage.read_events(run_id))
     head = history[-1].sequence if history else 0
     candidate = Event(
         run_id=run_id,
@@ -500,23 +495,18 @@ class ContinuumMCP:
                 raise
             run = self.storage.create_run(Run(run_id=run_id, goal=goal))
 
-        # Full history: after compaction RUN_STARTED is archived and the live
-        # tail starts at the anchor, so a live-tail read would conclude the run
-        # never started and backfill a *second* RUN_STARTED after the anchor,
-        # rewriting history the operator cannot un-see (issue #1133). The merge
-        # is sequence-sorted, so the first element is the run's true first event.
-        first = next(iter(self.storage.read_all_events(run_id)), None)
-        if first is None:
+        first = self.storage.read_events(run_id, upto=1)
+        if not first:
             self.storage.append_event(
                 run_id,
                 EventType.RUN_STARTED,
                 {"goal": goal or run.goal},
                 source=AGENT_SOURCE,
             )
-        elif first.type is not EventType.RUN_STARTED:
+        elif first[0].type is not EventType.RUN_STARTED:
             raise MalformedRunLog(
                 f"run {run_id!r} does not begin with RUN_STARTED "
-                f"(first event is {first.type.value}). CONTINUUM cannot backfill it "
+                f"(first event is {first[0].type.value}). CONTINUUM cannot backfill it "
                 f"after the fact without misordering the run's history; recreate the "
                 f"run, or record RUN_STARTED before any other event."
             )

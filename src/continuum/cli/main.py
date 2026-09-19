@@ -455,10 +455,7 @@ def cmd_record_plan(args: argparse.Namespace, storage: Storage, out: Any, err: A
         print(f"error: {exc}", file=err)
         return ExitCode.NOT_FOUND
     payload = {"plan_id": plan_id, "units": sorted_units}
-    # Full history: after compaction the live tail starts at the anchor and
-    # ``RUN_STARTED`` is archived, so a live-tail fold would refuse a legal
-    # plan for an invariant the archive satisfies (issue #1133).
-    history = list(storage.read_all_events(args.run_id))
+    history = list(storage.read_events(args.run_id))
     head = history[-1].sequence if history else 0
     candidate = Event(
         run_id=args.run_id,
@@ -473,7 +470,7 @@ def cmd_record_plan(args: argparse.Namespace, storage: Storage, out: Any, err: A
         print(f"error: plan would leave run unprojectable and was not recorded: {exc}", file=err)
         return ExitCode.ERROR
     event = storage.append_event(args.run_id, EventType.PLAN_UPSERT, payload, source=Origin.HUMAN)
-    state = project(args.run_id, storage.read_all_events(args.run_id))
+    state = project(args.run_id, storage.read_events(args.run_id))
     _emit(
         {
             "run_id": args.run_id,
