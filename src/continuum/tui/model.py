@@ -311,7 +311,6 @@ def event_rows(storage: Storage, run_id: str) -> list[EventRow]:
 
 def family_lines(storage: Storage, run_id: str) -> list[str]:
     """The `tree` view: the parent verdict and every child's, read-only."""
-    storage.get_run(run_id)
     run = storage.get_run(run_id)
     lines = [f"{run_id}  [{run.status.value}]  {run.goal[:60]}"]
     children = _children(storage, run_id)
