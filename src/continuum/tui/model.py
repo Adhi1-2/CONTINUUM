@@ -22,7 +22,7 @@ from continuum.budgets import (
     evaluate_budget,
     load_budgets,
 )
-from continuum.checkpoint import CheckpointManager
+from continuum.checkpoint import CheckpointManager, clear_resume_pointer
 from continuum.events import EventType
 from continuum.models import ActionStatus, Origin, Run, RunStatus, StateStatus
 from continuum.recovery import RecoveryEngine
@@ -311,7 +311,6 @@ def event_rows(storage: Storage, run_id: str) -> list[EventRow]:
 
 def family_lines(storage: Storage, run_id: str) -> list[str]:
     """The `tree` view: the parent verdict and every child's, read-only."""
-    storage.get_run(run_id)
     run = storage.get_run(run_id)
     lines = [f"{run_id}  [{run.status.value}]  {run.goal[:60]}"]
     children = _children(storage, run_id)
@@ -430,4 +429,7 @@ def complete_run(storage: Storage, run_id: str) -> str:
         source=Origin.HUMAN,
     )
     storage.update_run(run.touch(status=RunStatus.COMPLETED))
+    # Same cleanup the CLI performs: a closed run is no longer interrupted, so
+    # the resume banner must not keep naming it as the active run.
+    clear_resume_pointer(run_id)
     return f"run {run_id} completed"

@@ -394,6 +394,23 @@ class TuiApp:
     def _landing_lines(self) -> list[str]:
         """The splash page: logo, version, how many runs the store holds."""
         return self._landing_render()[0]
+        status: list[str] = []
+        if self.database_error:
+            status = [
+                center(line)
+                for line in textwrap.wrap(
+                    f"database unavailable: {self.database_error}",
+                    width=max(1, self.width),
+                )
+            ]
+        return (
+            [""]
+            + [center(line) for line in art]
+            + ["", ""]
+            + [center(_LANDING_TAGLINE), center(f"v{__version__}   {runs_line}")]
+            + status
+            + ["", "", center("press any key to open the dashboard")]
+        )
 
     def body_lines(self) -> list[str]:
         """The body: the help overlay when asked for, the view otherwise."""
