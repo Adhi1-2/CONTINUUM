@@ -778,7 +778,7 @@ def test_attest_keygen_writes_the_private_key_owner_only(tmp_path: Path) -> None
     assert code == ExitCode.OK
     assert stat.S_IMODE(priv.stat().st_mode) == 0o600
     # The public key is meant to be shareable, so it keeps the ambient mode a
-    # plain write_text would give it — compared against a reference rather than
+    # plain write_text would give it, compared against a reference rather than
     # a literal 0o644, which would break under a stricter umask.
     reference = tmp_path / "reference.txt"
     reference.write_text("public", encoding="utf-8")
