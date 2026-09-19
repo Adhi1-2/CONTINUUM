@@ -922,7 +922,6 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,333 collected, ~2,280 passed, ~25 skipped on a minimal env).
   (~2,347 collected, ~2,320 passed, ~27 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
