@@ -154,34 +154,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **The terminal launcher now animates (#782).** `continuum tui` (and a bare
-  interactive `continuum`) open on a landing splash that was previously
-  static: a fixed logo, a tagline, a version line, and a run count, with
-  `getch()` blocking and no frame clock at all. The splash is the product's
-  front door and the one place motion belongs, so it now carries a typed
-  tagline, a sheen band that sweeps the logo, and a prompt that breathes,
-  while every dashboard view stays perfectly still, an operator instrument
-  where motion would be noise.
-
-  The animation is strictly additive: frame 0 already holds the whole logo
-  and the complete tagline prefix only grows toward it, so any single frame,
-  snapshot, or screen scrape shows a finished splash rather than a partial
-  one, and the emphasis is carried in a separate attribute channel that is
-  empty off the landing view. The pure frame math lives in a new terminal-free
-  module (`continuum/tui/animate.py`) so it is unit-testable directly, and the
-  app gains a frame clock whose `tick()` touches no storage at all, on
-  purpose: the splash redraws roughly eleven times a second, so a tick that
-  also read the store would price the idle screen at eleven store scans a
-  second. The run count is re-read on a separate throttle instead.
-
-  Colour is probed and degrades gracefully (curses `has_colors` /
-  `init_pair`, wrapped so `NO_COLOR`, `TERM=dumb`, and a colour-less terminal
-  fall back to dim/bold and then to plain), matching the rule the CLI's
-  palette already follows that presentation never changes what the text says.
-  `CONTINUUM_NO_ANIMATION` pins the settled frame for motion sensitivity and
-  is documented in `tui --help`, since one env switch serves both the bare
-  launcher and `continuum tui` where a CLI flag could not.
-
 - **Curated briefing by provenance (#742).** `continuum briefing` no longer
   rehydrates the newest agent-authored reasoning summary verbatim. A pure,
   deterministic curation layer (`continuum.recovery.briefing_curation`) builds
@@ -950,7 +922,6 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,278 collected, ~2,252 passed, ~25 skipped on a minimal env).
   (~2,347 collected, ~2,320 passed, ~27 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 

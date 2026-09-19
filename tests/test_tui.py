@@ -24,9 +24,9 @@ from continuum.cli import ExitCode, main
 from continuum.events import EventType
 from continuum.models import ActionStatus, RunStatus
 from continuum.storage import SQLiteStorage
-from continuum.tui import TuiApp, animate, run_tui
+from continuum.tui import TuiApp, run_tui
 from continuum.tui import model as tui_model
-from continuum.tui.app import _LOGO_LINES, _colour_pairs, _driver, _runs
+from continuum.tui.app import _driver
 
 
 def run(*argv: str) -> tuple[int, str, str]:
@@ -232,7 +232,7 @@ def test_the_app_opens_on_a_landing_screen_with_the_logo(db: str) -> None:
     assert app.view == "landing"
     app.width = 100  # wide enough for the ASCII logo
     body = "\n".join(app.body_lines())
-    assert "▀▄▄▄▀" in body  # the logo, not just the word
+    assert "██╔═══██╗" in body  # the logo, not just the word
     assert "run(s) recorded" in body
     assert "press any key to open the dashboard" in app.footer()
 
@@ -443,13 +443,12 @@ class _FakeScreen:
     def __init__(self, keys: list[int]) -> None:
         self._keys = list(keys)
         self.lines: list[tuple[int, str]] = []
-        self.timeouts: list[int] = []  # the clock the driver asked for per draw
 
     def keypad(self, on: bool) -> None:
         return None
 
     def timeout(self, ms: int) -> None:
-        self.timeouts.append(ms)
+        return None
 
     def erase(self) -> None:
         self.lines = []
@@ -485,7 +484,7 @@ def test_the_driver_draws_the_splash_first(db: str) -> None:
     _driver(_FakeCurses(), screen, TuiApp(SQLiteStorage(db)), 0.0)
 
     drawn = "\n".join(text for _, text in screen.lines)
-    assert "▀▄▄▄▀" in drawn  # the logo, which the 80-column screen has room for
+    assert "██╔═══██╗" in drawn  # the logo: 80 columns is just wide enough
     assert "press any key" in drawn
 
 
@@ -502,7 +501,6 @@ def test_the_incompatible_database_splash_still_draws_the_logo() -> None:
 
     drawn = "\n".join(text for _, text in screen.lines)
     assert code == ExitCode.OK
-    assert "▀▄▄▄▀" in drawn
     assert "██╔═══██╗" in drawn
     assert "database unavailable" in drawn
 
@@ -930,284 +928,3 @@ def test_a_legacy_child_blocks_the_recovery_verdict_like_a_recorded_one(
     # and the verdict accounts for it, rather than calling the family safe
     assert "FAMILY BLOCKED" in verdict
     assert "kid" in verdict
-
-
-# --------------------------------------------------------------------------- #
-# the landing splash animation
-#
-# Animation is presentation only: the text a line carries is complete at every
-# frame, emphasis travels in body_attrs alongside it, and the whole thing pins
-# to a static frame when CONTINUUM_NO_ANIMATION is set.
-# --------------------------------------------------------------------------- #
-
-
-def test_the_splash_starts_at_frame_zero_and_advances(db: str) -> None:
-    """Animation begins immediately: frame 0 is the unstarted clock."""
-    app = TuiApp(SQLiteStorage(db))
-    assert app.frame == 0
-
-    app.tick()
-    app.tick()
-    assert app.frame == 2
-
-
-def test_the_clock_ticks_without_reading_storage(
-    store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A tick redraws the splash ~11 times a second; it must not read the store,
-    or the idle screen would cost eleven scans a second."""
-
-    def boom() -> list[Any]:
-        raise RuntimeError("store is gone")
-
-    monkeypatch.setattr(store, "list_runs", boom)
-    app = TuiApp(store)  # construction reads (and degrades), the clock never does
-
-    for _ in range(5):
-        app.tick()
-    assert app.frame == 5  # survived a store that cannot be read
-
-
-def test_no_animation_pins_a_settled_splash(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONTINUUM_NO_ANIMATION holds the splash on its static frame."""
-    monkeypatch.setenv("CONTINUUM_NO_ANIMATION", "1")
-    app = TuiApp(SQLiteStorage(db))
-
-    assert app.frame == animate.SETTLED
-    app.tick()  # a settled clock never starts
-    assert app.frame == animate.SETTLED
-    body = "\n".join(app.body_lines())
-    assert "durable recovery for long-running agents" in body  # typed in full
-    assert "press any key to open the dashboard" in app.footer()
-
-
-def test_frame_zero_already_holds_the_whole_logo(db: str) -> None:
-    """The animation never hides a glyph: any single frame is the whole splash,
-    which is also what a snapshot or a scrape of the screen must show."""
-    app = TuiApp(SQLiteStorage(db))
-    app.width = 100
-    settled = app._landing_lines()
-    # lines[0] is blank and the logo follows it. The slice is taken from the
-    # art itself rather than hardcoded, so a logo that grows or shrinks moves
-    # this bound with it, and a blank row landing in the range would make
-    # `line in body` vacuously true, which is how a six-row slice quietly
-    # asserted a spacer and nothing else.
-    logo = settled[1 : 1 + len(_LOGO_LINES)]
-    assert len(logo) == len(_LOGO_LINES)
-    assert all(logo)
-
-    for frame in (0, 1, 3, 11, 40, 1000):
-        app.frame = frame
-        body = "\n".join(app.body_lines())
-        for line in logo:  # every logo row, complete at every frame
-            assert line in body
-
-
-def test_the_typewriter_types_in_and_settles() -> None:
-    text = "durable recovery for long-running agents"
-    assert animate.typewriter(text, 0) == ""  # types in from nothing
-    typed = [animate.typewriter(text, f) for f in range(1, 40)]
-    assert all(len(a) <= len(b) for a, b in zip(typed, typed[1:], strict=False))  # never shrinks
-    assert animate.typewriter(text, 10_000) == text  # settles on the whole line
-    assert animate.typewriter(text, animate.SETTLED) == text
-
-
-def test_the_shimmer_band_stays_inside_the_art() -> None:
-    """The sheen recolours the logo; it is never a glyph of its own."""
-    assert animate.shimmer_span(animate.SETTLED, art_width=78) is None
-    seen: set[tuple[int, int]] = set()
-    for frame in range(80):
-        band = animate.shimmer_span(frame, art_width=78)
-        if band is None:
-            continue
-        start, end = band
-        assert 0 <= start < end <= 78
-        seen.add(band)
-    assert len(seen) > 1  # it actually moves
-    # a band wider than the art has nowhere to sweep
-    assert animate.shimmer_span(5, art_width=4, band=8) is None
-
-
-def test_pulse_settles_plain_and_only_uses_emphasis() -> None:
-    assert animate.pulse(animate.SETTLED) == animate.PLAIN
-    values = {animate.pulse(f) for f in range(40)}
-    assert values <= {animate.DIM, animate.BRIGHT}
-    assert len(values) == 2  # it breathes rather than sitting at one level
-
-
-def test_body_attrs_is_empty_off_the_landing_splash(db: str) -> None:
-    """The dashboard is an instrument: its lines carry no emphasis."""
-    run("--db", db, "start", "r1", "--goal", "g")
-    app = TuiApp(SQLiteStorage(db))
-    _enter_dashboard(app)
-    assert app.body_attrs() == []
-
-    app.handle_key("enter")  # into a run's detail
-    assert app.view == "detail"
-    assert app.body_attrs() == []
-
-
-def test_landing_spans_stay_inside_their_lines(db: str) -> None:
-    """Every span is a range of the line it belongs to, in order and
-    non-overlapping, so the driver writes each glyph exactly once."""
-    app = TuiApp(SQLiteStorage(db))
-    for width in (80, 100, 40):  # the wide logo and the narrow banner
-        app.width = width
-        for frame in (0, 1, 5, 20, 100):
-            app.frame = frame
-            lines = app.body_lines()
-            attrs = app.body_attrs()
-            assert len(attrs) == len(lines)
-            for line, spans in zip(lines, attrs, strict=True):
-                previous = -1
-                for start, end, _ in spans:
-                    assert 0 <= start < end <= len(line)
-                    assert start >= previous  # sorted, non-overlapping
-                    previous = end
-
-
-def test_a_narrow_splash_animates_within_its_own_width(db: str) -> None:
-    app = TuiApp(SQLiteStorage(db))
-    app.width = 40
-    for frame in range(30):
-        app.frame = frame
-        assert all(len(line) <= 40 for line in app.body_lines())
-
-
-def test_runs_merge_equal_emphasis_so_the_text_is_unchanged() -> None:
-    """A line whose spans all resolve to one attribute is written in a single
-    call, so on a monochrome terminal the drawn text stays identical to the
-    unsegmented path."""
-    line = "the quick brown fox"
-    spans = [(0, 9, animate.ACCENT), (4, 12, animate.BRIGHT), (12, 19, animate.ACCENT)]
-
-    def resolve(flags: int) -> int:
-        return 1 if flags else 0  # monochrome: accent and bright are both bold
-
-    merged = _runs(line, spans, resolve)
-    assert merged == [(0, 19, 1)]  # one call, so the text is drawn unchanged
-
-    def resolve_colour(flags: int) -> int:
-        return flags  # a colour terminal can tell the two apart
-
-    separate = _runs(line, spans, resolve_colour)
-    assert len(separate) > 1  # the band keeps its own emphasis
-    # the runs always partition the line: every column covered exactly once
-    assert separate[0][0] == 0
-    assert [e for _, e, _ in separate] == [s for s, _, _ in separate[1:]] + [len(line)]
-
-
-def test_the_driver_ticks_the_splash_and_keeps_the_text_intact(db: str) -> None:
-    """Three animation ticks, then quit: the frame advanced and the logo still
-    reads as one unbroken string."""
-    run("--db", db, "start", "r1", "--goal", "g")
-    app = TuiApp(SQLiteStorage(db))
-    screen = _FakeScreen([-1, -1, -1])
-    _driver(_FakeCurses(), screen, app, 0.0)
-
-    assert app.frame == 3
-    assert 90 in screen.timeouts  # the animation interval, not a blocking wait
-    drawn = "\n".join(text for _, text in screen.lines)
-    assert "▀▄▄▄▀" in drawn
-    assert "press any key" in drawn
-
-
-def test_the_driver_uses_the_configured_clock_off_the_splash(db: str) -> None:
-    """Leaving the splash restores the configured --refresh timeout exactly."""
-    run("--db", db, "start", "r1", "--goal", "g")
-    app = TuiApp(SQLiteStorage(db))
-    screen = _FakeScreen([ord(" "), ord("q")])
-    _driver(_FakeCurses(), screen, app, 5.0)
-
-    assert 90 in screen.timeouts  # animated while on the splash
-    assert 5000 in screen.timeouts  # the configured --refresh once off it
-    assert app.view == "runs"  # the first key left the splash
-
-
-class _ColourCurses:
-    """A curses that reports colour support, with hooks that can fail.
-
-    The real library can accept ``init_pair`` and then raise out of
-    ``color_pair``; the fakes below hold each failure mode separately so the
-    degrade path is pinned rather than hoped for.
-    """
-
-    A_BOLD = 1
-    A_DIM = 2
-    COLOR_CYAN = 6
-    COLOR_BLACK = 0
-    COLOR_WHITE = 7
-
-    class error(Exception):
-        pass
-
-    def __init__(
-        self, *, has_colors: bool = True, init_fails: bool = False, pair_fails: bool = False
-    ) -> None:
-        self._has_colors = has_colors
-        self._init_fails = init_fails
-        self._pair_fails = pair_fails
-
-    def has_colors(self) -> bool:
-        return self._has_colors
-
-    def start_color(self) -> None:
-        return None
-
-    def init_pair(self, pair: int, fg: int, bg: int) -> None:
-        if self._init_fails:
-            raise self.error("the terminal took the colour calls back")
-
-    def color_pair(self, pair: int) -> int:
-        if self._pair_fails:
-            raise self.error("color_pair is decorative on this terminal")
-        return pair * 256
-
-
-@pytest.mark.parametrize(
-    ("env", "curses", "reason"),
-    [
-        ({"NO_COLOR": "1"}, _ColourCurses(), "NO_COLOR is set"),
-        ({"TERM": "dumb"}, _ColourCurses(), "the terminal is dumb"),
-        ({}, _ColourCurses(has_colors=False), "the terminal reports no colour"),
-    ],
-)
-def test_colour_steps_down_to_monochrome_without_raising(
-    monkeypatch: pytest.MonkeyPatch,
-    env: dict[str, str],
-    curses: _ColourCurses,
-    reason: str,
-) -> None:
-    """Every off switch returns an empty map, so the driver falls back to bold
-    and dim rather than to a traceback."""
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.delenv("TERM", raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-
-    assert _colour_pairs(curses) == {}, f"{reason} should disable colour"
-
-
-def test_colour_survives_a_terminal_that_fails_midway(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A terminal that accepts init_pair and then rejects color_pair still
-    degrades: the failure is on the colour path, not on the screen."""
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setenv("TERM", "xterm-256color")
-
-    assert _colour_pairs(_ColourCurses(init_fails=True)) == {}
-    assert _colour_pairs(_ColourCurses(pair_fails=True)) == {}
-
-
-def test_colour_maps_every_emphasis_flag_when_the_terminal_allows_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Colour on means the three emphasis flags each resolve to an attribute,
-    and the map is indexed by flag so the driver can OR overlapping spans."""
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setenv("TERM", "xterm-256color")
-
-    pairs = _colour_pairs(_ColourCurses())
-
-    assert set(pairs) == {animate.ACCENT, animate.BRIGHT, animate.DIM}
-    assert all(isinstance(attr, int) for attr in pairs.values())
-    assert len(set(pairs.values())) == 3  # distinct, so spans stay distinguishable

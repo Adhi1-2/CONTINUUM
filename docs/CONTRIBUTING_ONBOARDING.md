@@ -27,8 +27,6 @@ Welcome. This guide gets you from clone to green tests without re-deriving conte
 Install once with `uv sync --extra dev` (or `pip install -e ".[dev]"`).
 
 - Recommended: install the [pre-commit hooks](../CONTRIBUTING.md#pre-commit-hooks-optional-but-recommended) before committing.
-- Run all tests: `uv run pytest` or `pytest -q`. Expect `~2,252 passed, ~25 skipped`
-  on main at this writing (`~2,278` collected).
 - Run all tests: `uv run pytest` or `pytest -q`. Expect `~2,320 passed, ~27 skipped`
   on main at this writing (`~2,347` collected).
   <!-- generated via: pytest --collect-only -q; pytest -q -->

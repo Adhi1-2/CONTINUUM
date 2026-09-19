@@ -16,7 +16,6 @@ only a further ``y`` performs the write. Anything else cancels.
 from __future__ import annotations
 
 import contextlib
-import os
 import sys
 import textwrap
 from collections.abc import Callable
@@ -25,47 +24,23 @@ from typing import Any
 from continuum import __version__
 from continuum.cli.exitcodes import ExitCode
 from continuum.storage.base import Storage
-from continuum.tui import animate, model
+from continuum.tui import model
 from continuum.tui.model import RunRow
 
 __all__ = ["TuiApp", "run_tui"]
 
-#: The splash logo, drawn in the mono9 figlet style: solid block and half-block
-#: glyphs at 63 columns, so it centres in a standard 80-column terminal with a
-#: real margin on each side and no drop-shadow row to blur the letterforms.
+#: The splash logo, hand-drawn in the ANSI Shadow style and joined at full
+#: glyph width so it fits a standard 80-column terminal (78 columns exactly).
 _LOGO_LINES = (
-    "   ▄▄▄   ▄▄▄▄  ▄▄   ▄▄▄▄▄▄▄▄ ▄▄▄▄▄  ▄▄   ▄ ▄    ▄ ▄    ▄ ▄    ▄",
-    " ▄▀   ▀ ▄▀  ▀▄ █▀▄  █   █      █    █▀▄  █ █    █ █    █ ██  ██",
-    " █      █    █ █ █▄ █   █      █    █ █▄ █ █    █ █    █ █ ██ █",
-    " █      █    █ █  █ █   █      █    █  █ █ █    █ █    █ █ ▀▀ █",
-    "  ▀▄▄▄▀  █▄▄█  █   ██   █    ▄▄█▄▄  █   ██ ▀▄▄▄▄▀ ▀▄▄▄▄▀ █    █",
+    " ██████╗ ██████╗ ███╗   ██╗████████╗██╗███╗   ██╗██╗   ██╗██╗   ██╗███╗   ███╗",
+    "██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██║████╗  ██║██║   ██║██║   ██║████╗ ████║",
+    "██║     ██║   ██║██╔██╗ ██║   ██║   ██║██╔██╗ ██║██║   ██║██║   ██║██╔████╔██║",
+    "██║     ██║   ██║██║╚██╗██║   ██║   ██║██║╚██╗██║██║   ██║██║   ██║██║╚██╔╝██║",
+    "╚██████╗╚██████╔╝██║ ╚████║   ██║   ██║██║ ╚████║╚██████╔╝╚██████╔╝██║ ╚═╝ ██║",
+    " ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═╝     ╚═╝",
 )
 _LOGO_WIDTH = max(len(line) for line in _LOGO_LINES)
 _LANDING_TAGLINE = "durable recovery for long-running agents"
-_LANDING_PROMPT = "press any key to open the dashboard"
-
-
-def _logo_spans(frame: int, *, pad: int, art_width: int) -> list[tuple[int, int, int]]:
-    """Emphasis for one line of the splash art: the logo's accent colour with
-    the sheen band swept across it.
-
-    The spans are returned non-overlapping and in order, so the driver writes
-    each exactly once. The band is never wider than the art, so it can only
-    recolour glyphs that are already there.
-    """
-    band = animate.shimmer_span(frame, art_width=art_width)
-    if band is None:  # settled, or the art is too narrow to sweep
-        return [(pad, pad + art_width, animate.ACCENT)]
-    start, end = pad + band[0], pad + band[1]
-    return [
-        span
-        for span in (
-            (pad, start, animate.ACCENT),
-            (start, end, animate.BRIGHT),
-            (end, pad + art_width, animate.ACCENT),
-        )
-        if span[0] < span[1]
-    ]
 
 
 class TuiApp:
@@ -100,10 +75,6 @@ class TuiApp:
         self.pending: tuple[str, Callable[[], str]] | None = None
         self.message = ""
         self.show_help = False
-        # The animation clock. SETTLED means the splash holds still: either
-        # CONTINUUM_NO_ANIMATION asked for that, or the frame simply is not
-        # moving yet. Only the landing view reads it (see _landing_render).
-        self.frame = animate.SETTLED if not animate.animation_enabled() else 0
         self.refresh()
 
     # ------------------------------------------------------------------ #
@@ -154,18 +125,6 @@ class TuiApp:
         """Count runs without assessing recovery for each: a bare list read."""
         assert self.storage is not None
         return len(self.storage.list_runs())
-
-    def tick(self) -> None:
-        """Advance the animation frame.
-
-        Touches nothing else, on purpose. The landing screen redraws roughly
-        eleven times a second, so a tick that also read storage would price the
-        idle splash at eleven store scans a second; the driver re-reads the run
-        count on a separate throttle. A settled clock never starts: that is how
-        ``CONTINUUM_NO_ANIMATION`` keeps the splash static.
-        """
-        if self.frame >= 0:
-            self.frame += 1
 
     def _run_id(self) -> str | None:
         if 0 <= self.index < len(self.rows):
@@ -313,87 +272,20 @@ class TuiApp:
             "(left/right or 1-7: tabs, esc: runs, r: refresh, q: quit)"
         )
 
-    def _landing_render(self) -> tuple[list[str], list[list[tuple[int, int, int]]]]:
-        """The splash page and its emphasis, built together so the two cannot
-        drift apart.
+    def _landing_lines(self) -> list[str]:
+        """The splash page: logo, version, how many runs the store holds."""
 
-        Line for line this is the old static layout; the only textual change is
-        the tagline typing itself in. Everything else is emphasis (the logo's
-        accent colour, a sheen sweeping it, a prompt that breathes) layered over
-        text that is already complete, so any single frame of the splash,
-        including the first, already holds the whole logo. The animation never
-        hides a glyph, which also keeps a snapshot of the screen readable.
-        """
-
-        def center(text: str) -> tuple[str, int]:
-            pad = max(0, (self.width - len(text)) // 2)
-            return " " * pad + text, pad
+        def center(text: str) -> str:
+            return " " * max(0, (self.width - len(text)) // 2) + text
 
         if self.width >= _LOGO_WIDTH + 2:
             art: list[str] = list(_LOGO_LINES)
         else:  # too narrow for the logo: a banner that fits, not one that clips
             art = ["C O N T I N U U M"]
-        art_width = len(art[0])
-
-        typed = animate.typewriter(_LANDING_TAGLINE, self.frame)
-        # the cursor blinks only while there is still something to type, and
-        # only when the line has room for it. A splash wider than the terminal
-        # is clipped by the driver, but the line itself must not overflow
-        typing = len(typed) < len(_LANDING_TAGLINE)
-        show_cursor = typing and animate.cursor_visible(self.frame)
-        tagline = typed + ("▋" if show_cursor else "")
-        if len(tagline) > self.width:
-            tagline = typed
-
         count = self._run_count or 0
         runs_line = f"{count} run(s) recorded" if count else "no runs recorded yet"
         if self._read_error:  # the store opened but could not even be counted
             runs_line = self._read_error
-
-        lines: list[str] = [""]
-        attrs: list[list[tuple[int, int, int]]] = [[]]
-        for raw in art:
-            line, pad = center(raw)
-            lines.append(line)
-            attrs.append(_logo_spans(self.frame, pad=pad, art_width=art_width))
-        lines += ["", ""]
-        attrs += [[], []]
-
-        tag_line, tag_pad = center(tagline)
-        lines.append(tag_line)
-        tag_attrs: list[tuple[int, int, int]] = []
-        if typed:
-            tag_attrs.append((tag_pad, tag_pad + len(typed), animate.ACCENT))
-        if show_cursor:
-            # the cursor is the last glyph of the line and stands alone
-            tag_attrs.append((tag_pad + len(typed), tag_pad + len(tagline), animate.BRIGHT))
-        attrs.append(tag_attrs)
-
-        version_line, _ = center(f"v{__version__}   {runs_line}")
-        lines.append(version_line)
-        attrs.append([])
-
-        if self.database_error:
-            for wrapped in textwrap.wrap(
-                f"database unavailable: {self.database_error}",
-                width=max(1, self.width),
-            ):
-                centered, _ = center(wrapped)
-                lines.append(centered)
-                attrs.append([])
-
-        prompt_line, prompt_pad = center(_LANDING_PROMPT)
-        lines += ["", "", prompt_line]
-        attrs += [
-            [],
-            [],
-            [(prompt_pad, prompt_pad + len(_LANDING_PROMPT), animate.pulse(self.frame))],
-        ]
-        return lines, attrs
-
-    def _landing_lines(self) -> list[str]:
-        """The splash page: logo, version, how many runs the store holds."""
-        return self._landing_render()[0]
         status: list[str] = []
         if self.database_error:
             status = [
@@ -448,25 +340,6 @@ class TuiApp:
             else:
                 marked.append(line)
         return marked
-
-    def body_attrs(self) -> list[list[tuple[int, int, int]]]:
-        """Per-body-line emphasis: one list of ``(start, end, flags)`` spans,
-        sorted and non-overlapping, indexed like :meth:`body_lines`.
-
-        Empty on every view but the landing splash. The dashboard is an
-        instrument: its lines hold still, and an empty list is the signal the
-        driver writes each line exactly as it did before animation existed.
-        """
-        if self.view != "landing":
-            return []
-        return self._landing_render()[1]
-
-    def footer_attr(self) -> int:
-        """Emphasis for the footer. The splash's prompt breathes; every other
-        view is plain, so the footer's wording stays exactly as tested."""
-        if self.view == "landing":
-            return animate.pulse(self.frame)
-        return animate.PLAIN
 
     def footer(self) -> str:
         """The bottom line: a pending confirmation outranks everything, and a
@@ -700,152 +573,20 @@ def _addline(screen: Any, y: int, x: int, text: str, attr: int = 0) -> None:
         screen.addnstr(y, x, text, screen.getmaxyx()[1] - x - 1, attr)
 
 
-#: Colour pair ids the TUI owns. The cursor highlight is a plain attribute
-#: rather than a pair, so these are the only two in use.
-_ACCENT_PAIR = 1  # the logo
-_BRIGHT_PAIR = 2  # the sheen band and the breathing prompt
-
-
-def _colour_pairs(curses: Any) -> dict[int, int]:
-    """Map emphasis flags to colour pairs, or ``{}`` when colour is off.
-
-    Colour is opt-in exactly the way the CLI's ``Palette`` makes it opt-in: off
-    for ``NO_COLOR``, off for ``TERM=dumb``, off on a terminal that reports no
-    support, and off if any colour call raises. Empty means the driver falls
-    back to bold and dim, never to a traceback, and never to different text.
-    """
-    if os.environ.get("NO_COLOR") is not None:
-        return {}
-    if os.environ.get("TERM", "").lower() == "dumb":
-        return {}
-    probes = (
-        getattr(curses, name, None)
-        for name in ("has_colors", "start_color", "init_pair", "color_pair")
-    )
-    if not all(callable(probe) for probe in probes):
-        return {}  # a curses stub, as in the tests: monochrome, not a crash
-    try:
-        if not curses.has_colors():
-            return {}
-        curses.start_color()
-        curses.init_pair(_ACCENT_PAIR, curses.COLOR_CYAN, curses.COLOR_BLACK)
-        curses.init_pair(_BRIGHT_PAIR, curses.COLOR_WHITE, curses.COLOR_BLACK)
-        bold = getattr(curses, "A_BOLD", 0) or 0
-        dim = getattr(curses, "A_DIM", 0) or 0
-        return {
-            animate.ACCENT: curses.color_pair(_ACCENT_PAIR),
-            animate.BRIGHT: curses.color_pair(_BRIGHT_PAIR) | bold,
-            animate.DIM: curses.color_pair(_BRIGHT_PAIR) | dim,
-        }
-    except Exception:
-        return {}
-
-
-def _emphasis_table(curses: Any) -> Callable[[int], int]:
-    """Resolve emphasis flags to a single curses attribute.
-
-    Colour pairs are used where the terminal offers them; otherwise bold and
-    dim carry the same emphasis monochrome. Overlapping flags OR together, so
-    a band sweeping an accent-coloured logo can brighten it further.
-    """
-    colours = _colour_pairs(curses)
-    dim = getattr(curses, "A_DIM", 0) or 0
-    bold = getattr(curses, "A_BOLD", 0) or 0
-
-    def resolve(flags: int) -> int:
-        attr = 0
-        if flags & animate.BRIGHT:
-            attr |= colours.get(animate.BRIGHT, bold)
-        if flags & animate.DIM:
-            attr |= colours.get(animate.DIM, dim)
-        if flags & animate.ACCENT:
-            attr |= colours.get(animate.ACCENT, bold)
-        return attr
-
-    return resolve
-
-
-def _runs(
-    line: str, spans: list[tuple[int, int, int]], resolve: Callable[[int], int]
-) -> list[tuple[int, int, int]]:
-    """Partition a line into ``(start, end, attr)`` runs covering every column.
-
-    Neighbouring runs that resolve to the same attribute are merged, so a line
-    whose spans all carry one emphasis, or a terminal that cannot tell them
-    apart, is written as a single call. The text on screen is then identical
-    to the pre-animation path, which is what keeps the drawn output readable
-    by anything that records lines rather than attributes.
-    """
-    cell = [0] * len(line)
-    for start, end, flags in spans:
-        for i in range(max(0, start), min(len(line), end)):
-            cell[i] |= flags
-    runs: list[list[int]] = []
-    for i, flags in enumerate(cell):
-        attr = resolve(flags)
-        if runs and runs[-1][2] == attr:
-            runs[-1][1] = i + 1
-        else:
-            runs.append([i, i + 1, attr])
-    return [(start, end, attr) for start, end, attr in runs]
-
-
-def _write_line(
-    screen: Any,
-    y: int,
-    line: str,
-    spans: list[tuple[int, int, int]],
-    base: int,
-    resolve: Callable[[int], int],
-) -> None:
-    """Write one line with its emphasis, or plain when there is none.
-
-    A line held by the selection cursor keeps the reverse-video highlight it
-    always had; emphasis never competes with the thing that marks the row an
-    operator is about to act on.
-    """
-    if base or not spans:
-        _addline(screen, y, 0, line, base)
-        return
-    for start, end, attr in _runs(line, spans, resolve):
-        _addline(screen, y, start, line[start:end], attr)
-
-
-#: How often the idle splash re-reads its run count when --refresh is unset.
-_LANDING_DATA_PERIOD = 2.0
-
-
 def _driver(curses: Any, screen: Any, app: TuiApp, refresh_seconds: float) -> int:
-    """Draw, wait for one key, repeat.
-
-    Two clocks. On the landing screen the timeout is the animation interval, so
-    the splash moves even with ``--refresh 0`` (the default, where the rest of
-    the dashboard blocks until a key arrives). Each tick advances the frame,
-    and the run count is re-read on a throttle so the idle screen stays cheap.
-    Everywhere else the timeout is exactly what it was: a refresh tick, or a
-    blocking wait.
-    """
+    """Draw, wait for one key, repeat. Auto-refresh ticks arrive as -1."""
     screen.keypad(True)
     # terminals without a cursor control still render fine
     with contextlib.suppress(Exception):
         curses.curs_set(0)
-    resolve = _emphasis_table(curses)
-    dashboard_timeout = int(refresh_seconds * 1000) if refresh_seconds > 0 else -1
-    landing_timeout = int(animate.TICK_SECONDS * 1000)
-    # ticks between run-count reads; with --refresh set, this keeps the same
-    # wall-clock cadence the dashboard always had
-    data_every = max(1, round((refresh_seconds or _LANDING_DATA_PERIOD) / animate.TICK_SECONDS))
-    ticks = 0
+    screen.timeout(int(refresh_seconds * 1000) if refresh_seconds > 0 else -1)
 
     while True:
         screen.erase()
         height, width = screen.getmaxyx()
         app.width = width  # the landing screen centres the logo on this
-        on_landing = app.view == "landing"
-        screen.timeout(landing_timeout if on_landing else dashboard_timeout)
         _addline(screen, 0, 0, app.header(), curses.A_BOLD)
         body = app.body_lines()
-        attrs = app.body_attrs() if on_landing else []
         available = max(1, height - 3)
         if app.cursor >= 0:  # keep the selected line inside the window
             if app.cursor < app.scroll:
@@ -855,20 +596,13 @@ def _driver(curses: Any, screen: Any, app: TuiApp, refresh_seconds: float) -> in
         start = min(app.scroll, max(0, len(body) - available))
         for row, line in enumerate(body[start : start + available], start=start):
             attr = curses.A_REVERSE if row == app.cursor else 0
-            spans = attrs[row] if 0 <= row < len(attrs) else []
-            _write_line(screen, row - start + 2, line, spans, attr, resolve)
-        _addline(screen, height - 1, 0, app.footer(), resolve(app.footer_attr()))
+            _addline(screen, row - start + 2, 0, line, attr)
+        _addline(screen, height - 1, 0, app.footer())
         screen.refresh()
 
         ch = screen.getch()
-        if ch == -1:  # an animation or refresh tick, not a keystroke
-            if on_landing:
-                app.tick()
-                ticks += 1
-                if ticks % data_every == 0:
-                    app.refresh()
-            else:
-                app.refresh()
+        if ch == -1:  # refresh tick (or no key yet on a nonblocking screen)
+            app.refresh()
             continue
         key = _key_name(curses, ch)
         if key is None:
