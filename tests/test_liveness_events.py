@@ -59,6 +59,44 @@ def test_engine_maps_breach_to_wait(tmp_path: Path) -> None:
         assert decision.contract.liveness is not None
         assert decision.contract.liveness["breached"] is True
         assert decision.contract.liveness["breaches"] >= 0
+        # A breach is advisory in the sense of #302 (never a rollback), but it
+        # is not inert: WAIT reaches `continuum resume` as exit 20, which is the
+        # link the health.py docstring and the liveness-watch guide describe.
+        from continuum.cli.exitcodes import exit_code_for
+
+        assert exit_code_for(decision.mode) == 20
+
+
+def test_breach_rationale_states_the_reason_once(tmp_path: Path) -> None:
+    # Regression for #1042: the liveness-breach WAIT block was pasted twice
+    # into _decide, so a breached run reported the identical sentence in the
+    # rationale twice, and the sealed contract's reason read
+    # "...; ..." with the duplicate. One breach, one proposal, one sentence.
+    db = str(tmp_path / "rationale_once.db")
+    with SQLiteStorage(db) as store:
+        run_id = "run_rationale_once"
+        store.create_run_started(Run(run_id=run_id, goal="rationale once"))
+        from continuum.events import Event
+
+        old_ts = datetime.now(UTC) - timedelta(seconds=7200)
+        last_seq = store.last_sequence(run_id)
+        ev = Event(
+            run_id=run_id,
+            sequence=last_seq + 1,
+            type=EventType.TASK_UPDATED,
+            timestamp=old_ts,
+            payload={"completed": 1},
+            prev_hash=store.read_events(run_id)[-1].hash,
+        ).sealed()
+        store.append_sealed(ev)
+        decision = RecoveryEngine(store).assess(run_id)
+        assert decision.mode.value == "wait"
+        assert len(decision.rationale) == len(set(decision.rationale)), decision.rationale
+        assert len(decision.rationale) == 1, decision.rationale
+        assert decision.rationale[0].startswith("liveness breach:")
+        # The sealed reason joins the rationale with "; " and must not
+        # repeat the sentence either.
+        assert decision.contract.reason.count("liveness breach:") == 1
 
 
 def test_watch_appends_detected_and_recovered(tmp_path: Path) -> None:
