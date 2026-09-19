@@ -1784,6 +1784,7 @@ def cmd_complete(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
     """
     run = storage.get_run(args.run_id)  # raises RunNotFound -> NOT_FOUND
     if run.status is RunStatus.COMPLETED:
+        clear_resume_pointer(args.run_id)
         _emit(
             {
                 "run_id": args.run_id,

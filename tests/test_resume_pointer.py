@@ -102,3 +102,15 @@ def _cli_complete(storage: SQLiteStorage, run_id: str) -> None:
 
     rc = cli_main(["--db", storage.path, "complete", run_id], out=io.StringIO(), err=io.StringIO())
     assert rc == 0, f"continuum complete failed with {rc}"
+
+
+def test_cli_retry_on_an_already_completed_run_clears_a_stale_pointer(project: Path) -> None:
+    # A pointer left behind by a completion from before the fix must not
+    # survive a CLI retry: the already-completed branch returned before the
+    # cleanup, so the stale banner kept surfacing finished work.
+    with SQLiteStorage(str(project / "db")) as storage:
+        _checkpointed(storage, "r1")
+        _cli_complete(storage, "r1")
+        _POINTER.write_text(json.dumps({"run_id": "r1"}), encoding="utf-8")
+        _cli_complete(storage, "r1")
+    assert not _POINTER.exists()
