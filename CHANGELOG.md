@@ -120,6 +120,19 @@ All notable changes to this project are documented here. The format follows
   reported mode in output); Windows has no POSIX permission bits and is
   skipped, matching the `tests/test_retry_budgets.py` precedent. A third test
   covers the file-descriptor leak guard in the write helper on every platform.
+- **Every run-completion path now clears the instant-resume pointer (#394).**
+  `.continuum/resume.json` is written on every checkpoint so a `SessionStart`
+  hook can banner the interrupted run without opening the database. A run
+  closed as completed is no longer interrupted, but only `continuum complete`
+  removed the pointer; the TUI's and the dashboard HITL button's `complete_run`
+  claimed to mirror that command and did not, so completing a run from either
+  left the next session banner surfacing finished work as the active run. The
+  cleanup is now a single helper (`continuum.checkpoint.clear_resume_pointer`)
+  all three paths route through. A pointer naming any other run is left in
+  place, and an unreadable or undeletable file, or one holding valid JSON that
+  is not an object, is tolerated rather than failing the completion.
+  `tests/test_resume_pointer.py` pins the helper and each of the three
+  completion paths, and was verified to fail without the fix.
 
 - **The horizon `abort_condition_year` scenario now reaches abort (#1028).**
   The scenario was labelled `correct_mode="abort"` but drove the abort through
@@ -909,7 +922,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,311 collected, ~2,253 passed, ~25 skipped on a minimal env).
+  (~2,347 collected, ~2,320 passed, ~27 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
