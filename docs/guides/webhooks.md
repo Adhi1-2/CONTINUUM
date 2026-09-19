@@ -31,12 +31,7 @@ data-beside-code convention as the gate and gateway registries:
 * `events` filters what the endpoint hears about: `request_human` (the
   default) and optionally `requires_review`. An unknown name is refused at
   load time, because a typo'd filter that silently never fires is the
-  quietest failure there is. `requires_review` fires only for a blocked run
-  (`continuum resume` reporting `request_human`) whose own state was written
-  by a self-certified origin, so goal or progress carries
-  `requires_review` in the validation report. It is a second signal, not a
-  substitute: an endpoint subscribed to both filters hears both rounds, and
-  a run with nothing to review fires it not at all.
+  quietest failure there is.
 * `re_notify_seconds` is the dedup window (below). `retries` and `timeout`
   bound delivery.
 * `dashboard_base_url` turns each notification into a deep link
