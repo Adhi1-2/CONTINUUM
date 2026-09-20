@@ -130,6 +130,29 @@ All notable changes to this project are documented here. The format follows
   both non-projecting, so folding the archived prefix from genesis reaches the
   same state the anchored path already produced. The guard is unchanged and
   still fires when a window genuinely excludes `RUN_STARTED`.
+- **The gateway now enforces a route's `prefix` instead of only parsing it
+  (#1051).** `match_route` narrowed candidates by host and method and never
+  compared the request path against the route, so every path on a registered
+  host was the route's scope: a live claim for `/v1/invoices` spent itself on
+  `/v1/refunds` or `/internal/admin/purge`, the gateway forwarded the request,
+  settled the claim as completed, and wrote `TOOL_COMPLETED` evidence whose
+  `path` recorded the off-prefix URL — the run's log said the invoice was sent
+  while the upstream saw something else entirely. The prefix is the only
+  per-path scope a route has and nothing else narrowed what a claim could
+  reach, so there was no workaround. `match_route` now takes the request path
+  and requires it to fall within the prefix on a whole-segment boundary
+  (`/v1/invoices` admits `/v1/invoices/49`, not `/v1/invoices-archived` or
+  `/v1/refunds`); the path is normalised first (query stripped, percent-decoded,
+  `..` collapsed) because the upstream rewrites `/v1/invoices/../refunds` — and
+  decodes `/v1/invoices/%2e%2e/refunds` to the same thing — before it dispatches,
+  and the refusal has to be about the path actually served. A
+  request on a registered host but under none of its prefixes is refused with
+  `403` naming the prefixes, before the key is rendered and before anything is
+  forwarded or settled. A route written without a `prefix` keeps the whole
+  host, which is what the default `/` has always meant. `match_route`'s new
+  `path` argument is required rather than defaulted: a caller cannot ask for a
+  routing verdict without saying what it is routing, and a silent default
+  would reintroduce the hole as an omission rather than a design.
 - **`resume --pinning` compares against the archived pinning, so a compacted
   run stops reporting every key as newly pinned (#1126).** The drift display
   folded the live event tail alone, and compaction moves the pinning-carrying
