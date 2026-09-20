@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -2918,6 +2919,28 @@ def cmd_hooks_remove(args: argparse.Namespace, storage: Storage, out: Any, err: 
     return ExitCode.OK
 
 
+def _doctor_timeout(raw: str) -> float:
+    """Argparse type for ``mcp doctor --timeout``: finite and strictly positive.
+
+    The deadline bounds every probe, not just the handshake reads, so a value
+    that is not a usable wait is not a slow diagnosis but a wrong one: zero or
+    negative means the probes give up before they start, and a healthy install
+    is reported as entirely broken -- every check fails, including the import
+    and PATH probes that involve no waiting at all. Rejecting it here keeps the
+    failure at argument-parsing time, where the parser's own error handling can
+    name the flag, instead of deep inside a diagnosis.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {raw!r}") from exc
+    if math.isnan(value) or math.isinf(value) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--timeout must be a positive, finite number of seconds, got {raw!r}"
+        )
+    return value
+
+
 def cmd_mcp_doctor(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
     """Diagnose why an MCP host cannot connect to the server (issue #835).
 
@@ -2934,7 +2957,9 @@ def cmd_mcp_doctor(args: argparse.Namespace, storage: Storage, out: Any, err: An
     """
     from continuum.mcp.doctor import render_doctor, run_doctor
 
-    report = run_doctor(timeout=getattr(args, "timeout", None) or 15.0)
+    # ``--timeout`` is validated at parse time (see ``_doctor_timeout``), so
+    # this is the configured positive deadline rather than a best effort.
+    report = run_doctor(timeout=args.timeout)
     _emit(
         report,
         render_doctor(report),
@@ -4243,9 +4268,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mcp_doctor.add_argument(
         "--timeout",
-        type=float,
+        type=_doctor_timeout,
         default=15.0,
-        help="seconds each handshake read waits before giving up (default: 15).",
+        help="seconds each probe waits before giving up (default: 15).",
     )
     mcp_doctor.set_defaults(func=cmd_mcp_doctor)
 

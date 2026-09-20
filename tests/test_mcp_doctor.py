@@ -20,6 +20,8 @@ from pathlib import Path
 from subprocess import TimeoutExpired
 from typing import Any
 
+import pytest
+
 from continuum.cli import ExitCode, main
 from continuum.mcp import doctor
 from continuum.mcp.doctor import (
@@ -253,6 +255,42 @@ def test_cli_json_output_and_exit_codes(monkeypatch: Any, tmp_path: Path) -> Non
     assert "pip install continuum-agent[mcp]" in out.getvalue()
 
 
+def test_an_unusable_timeout_is_rejected_before_any_diagnosis(monkeypatch: Any) -> None:
+    """A deadline that is not a usable wait is a wrong diagnosis, not a slow one.
+
+    The timeout bounds every probe, not just the handshake reads, so zero or a
+    negative value means the probes give up before they start: a healthy
+    install is reported as entirely broken, with every check failing including
+    the import and PATH probes that involve no waiting at all. That is the
+    inverse of what the doctor is for, and it is silent -- nothing in the
+    report hints that the deadline was the cause, so the operator chases a
+    phantom broken install. Refusing the value at parse time names the flag
+    instead, and ``nan`` / ``inf`` are the same class of unusable wait.
+    """
+    monkeypatch.setenv("PATH", _with_scripts_dir_on_path())
+
+    for bad in ("0", "-1", "nan", "inf"):
+        err = io.StringIO()
+        with monkeypatch.context() as capture, pytest.raises(SystemExit) as raised:
+            # argparse's own error path writes to ``sys.stderr``, not the
+            # stream ``main`` is handed.
+            capture.setattr(sys, "stderr", err)
+            main(["mcp", "doctor", "--timeout", bad], out=io.StringIO(), err=io.StringIO())
+
+        assert raised.value.code == 2, bad
+        assert "--timeout" in err.getvalue(), bad
+        assert bad in err.getvalue(), bad
+        # Nothing was diagnosed on the way out.
+        assert "handshake" not in err.getvalue(), bad
+
+    # A usable value still reaches the doctor and exits on the verdict.
+    out = io.StringIO()
+    code = main(["--json", "mcp", "doctor", "--timeout", "20"], out=out, err=io.StringIO())
+
+    assert code == ExitCode.OK
+    assert json.loads(out.getvalue())["healthy"] is True
+
+
 def test_render_doctor_is_one_line_per_finding(monkeypatch: Any, tmp_path: Path) -> None:
     """Every check renders exactly one actionable line, plus its fix when failing.
 
@@ -362,6 +400,32 @@ def test_the_handshake_gives_up_on_a_server_that_never_answers() -> None:
 
     assert finding["status"] == "fail"
     assert "never completed the initialize handshake" in finding["detail"]
+
+
+def test_the_handshake_keeps_stderr_written_after_the_read_deadline() -> None:
+    """A cause printed past the deadline still reaches the report.
+
+    The read deadline firing does not mean the child is done with its
+    diagnosis: a server may spend the deadline window on startup and only
+    write its cause as it gives up. ``close`` terminates it and joins the
+    stderr reader, and the tail is read after that -- snapshotting at the
+    deadline instead would name a timeout where the child's own message was
+    a moment away, which is the opaque failure the doctor exists to remove.
+    """
+    body = (
+        "import sys, time\n"
+        "time.sleep(2)\n"  # past the read deadline, but before close() kills it
+        "sys.stderr.write('the real cause: mcp extra missing\\n')\n"
+        "sys.stderr.flush()\n"
+    )
+    finding, _ = _check(_fake_server(body), timeout=0.4)
+
+    assert finding["status"] == "fail"
+    assert "never completed the initialize handshake" in finding["detail"]
+    assert "the real cause: mcp extra missing" in finding["detail"], (
+        "the child wrote its cause after the deadline and close() must "
+        "still drain it into the report"
+    )
 
 
 def test_the_handshake_reports_a_command_that_cannot_spawn(tmp_path: Path) -> None:

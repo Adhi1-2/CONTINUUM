@@ -142,12 +142,17 @@ def _scripts_dir() -> Path:
 
 
 class _ProbeFailure(Exception):
-    """The handshake did not complete; carries the child's stderr tail."""
+    """The handshake did not complete; ``reason`` is the diagnosis to report.
 
-    def __init__(self, reason: str, stderr_tail: list[str]) -> None:
+    It deliberately does not carry the child's stderr: the tail is only worth
+    reading once the child has terminated, which happens in ``close()`` after
+    this is raised. Snapshotting it here would report a deadline where the
+    cause was a moment away.
+    """
+
+    def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-        self.stderr_tail = stderr_tail
 
 
 class _ServerProbe:
@@ -176,7 +181,8 @@ class _ServerProbe:
             stderr=subprocess.PIPE,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
 
     def _drain_stderr(self) -> None:
         assert self.proc.stderr is not None
@@ -251,16 +257,16 @@ class _ServerProbe:
         while True:
             line = self._read_line()
             if line is None:
-                raise _ProbeFailure("no response within the deadline", self._errors_tail())
+                raise _ProbeFailure("no response within the deadline")
             try:
                 response: dict[str, Any] = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise _ProbeFailure(f"unparseable response: {exc}", self._errors_tail()) from exc
+                raise _ProbeFailure(f"unparseable response: {exc}") from exc
             if response.get("id") == self._id:
                 break
         if "error" in response:
             message = response["error"].get("message", "unknown error")
-            raise _ProbeFailure(f"server returned an error: {message}", self._errors_tail())
+            raise _ProbeFailure(f"server returned an error: {message}")
         return response
 
     def notify(self, method: str) -> None:
@@ -271,7 +277,13 @@ class _ServerProbe:
         return self._errors[-STDERR_TAIL_LINES:]
 
     def close(self) -> None:
-        """Shut the server down; the MCP protocol has no shutdown method."""
+        """Shut the server down; the MCP protocol has no shutdown method.
+
+        The stderr reader is joined after the child terminates so the tail a
+        caller reads next is the child's final output: a server that only
+        writes its cause once it gives up would otherwise be killed mid-message
+        and the report would name a deadline instead of the cause.
+        """
         assert self.proc.stdin is not None
         self.proc.stdin.close()
         try:
@@ -279,6 +291,7 @@ class _ServerProbe:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=5)
+        self._stderr_thread.join(timeout=1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +442,7 @@ def _check_handshake(
                 },
                 notes,
             )
+        failure_reason: str | None = None
         try:
             response = probe.request(
                 "initialize",
@@ -444,15 +458,25 @@ def _check_handshake(
             listed = probe.request("tools/list", {})
             tools = [tool.get("name", "?") for tool in listed.get("result", {}).get("tools", [])]
         except _ProbeFailure as exc:
+            # The child is typically still alive when the deadline fires, and
+            # it may not have written its cause yet. The tail is read *after*
+            # close() below, once the child has terminated and the stderr
+            # reader has drained the pipe: a snapshot taken here would name a
+            # deadline where the child's own message was a moment away.
+            failure_reason = exc.reason
+        finally:
+            probe.close()
+        if failure_reason is not None:
             exit_code = probe.proc.poll()
-            detail = f"the server never completed the initialize handshake ({exc.reason})"
+            detail = f"the server never completed the initialize handshake ({failure_reason})"
             if exit_code is not None:
                 detail += (
                     f"; it exited with code {exit_code} before the handshake"
                     " -- this is what the host reports as CONNECTION_CLOSED"
                 )
-            if exc.stderr_tail:
-                detail += f"; its stderr tail: {' | '.join(exc.stderr_tail)}"
+            stderr_tail = probe._errors_tail()
+            if stderr_tail:
+                detail += f"; its stderr tail: {' | '.join(stderr_tail)}"
             return (
                 {
                     "check": "handshake",
@@ -463,8 +487,6 @@ def _check_handshake(
                 },
                 notes,
             )
-        finally:
-            probe.close()
         server_version = server.get("version") or "unknown version"
         if probe.wire_framing:
             notes.append(
