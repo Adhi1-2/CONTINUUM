@@ -25,6 +25,7 @@ import os
 import queue
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -122,9 +123,17 @@ def _scripts_dir() -> Path:
     The classic failure: ``continuum-mcp`` exists right here but the host's
     PATH does not include this directory, so the bare-name spawn in
     ``.mcp.json`` fails at ``CreateProcess``. Naming the directory tells the
-    operator exactly what to add.
+    operator exactly what to add, so it has to be the *right* directory.
+
+    That rules out the obvious ``Path(sys.executable).resolve().parent``: a
+    venv's ``python`` is a symlink to the base interpreter, and resolving it
+    walks past the venv to that interpreter's ``bin``, which neither holds
+    the script nor is the directory anyone should add. Windows has the same
+    shape one level over: scripts live in ``Scripts`` beside the executable,
+    not beside it. ``sysconfig`` reports the directory the install actually
+    uses on both platforms.
     """
-    return Path(sys.executable).resolve().parent
+    return Path(sysconfig.get_path("scripts"))
 
 
 # --------------------------------------------------------------------------- #

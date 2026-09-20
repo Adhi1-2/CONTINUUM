@@ -15,16 +15,24 @@ import io
 import json
 import os
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Any
 
 from continuum.cli import ExitCode, main
-from continuum.mcp.doctor import render_doctor, run_doctor
+from continuum.mcp.doctor import _scripts_dir, render_doctor, run_doctor
 
 #: The venv's script directory, prepended to PATH by tests that need the
 #: console script resolvable so the healthy-path assertions hold even when
-#: pytest runs without the environment's bin dir on PATH.
-SCRIPTS_DIR = Path(sys.executable).resolve().parent
+#: pytest runs without the environment's bin dir on PATH. Taken from the
+#: function under test rather than recomputed, so the two cannot drift
+#: apart and hide the bug again (see test_scripts_dir_follows_the_venv).
+SCRIPTS_DIR = _scripts_dir()
+
+#: What a venv calls its scripts directory: ``bin`` on POSIX, ``Scripts`` on
+#: Windows. Probed from this interpreter rather than hardcoded, so the
+#: regression test builds a venv the platform's own sysconfig would accept.
+_SCRIPTS_SUBDIR = Path(sysconfig.get_path("scripts")).name
 
 
 def _with_scripts_dir_on_path() -> str:
@@ -129,6 +137,47 @@ def test_exe_not_on_host_path_is_a_failure_state(monkeypatch: Any, tmp_path: Pat
     # The fallback handshake succeeding is the useful extra fact, not a pass.
     assert checks["handshake"]["status"] == "pass"
     assert checks["handshake"]["command"] == [sys.executable, "-u", "-m", "continuum.mcp"]
+
+
+def test_scripts_dir_follows_the_venv_not_the_symlink(monkeypatch: Any, tmp_path: Path) -> None:
+    r"""A venv python is a symlink, and resolving it escapes the venv.
+
+    ``Path(sys.executable).resolve().parent`` on a venv returns the base
+    interpreter's ``bin``, which holds neither the script nor the directory
+    the operator should add to PATH. Windows has the same shape with
+    ``Scripts`` beside the executable. The diagnosis has to name the venv's
+    own directory, so a script installed there is what the fix points at.
+
+    What is built for real is the failure itself: a python that is a symlink
+    into this interpreter, installed in the venv's own scripts directory.
+    Resolving it leaves the venv -- the premise asserted below -- and that
+    is the directory the old logic would have reported.
+
+    What is stubbed is the venv's *identity*, and only that. A venv is
+    established at interpreter startup, before ``sysconfig`` reads the
+    prefix, so repointing ``sys.prefix`` in an already-running interpreter
+    cannot reproduce one (3.13 happens to read it dynamically, 3.11 does
+    not, and the difference is not a property worth depending on). The
+    venv's install location is therefore supplied to ``sysconfig`` directly,
+    which is the question the diagnosis actually asks of it: where does this
+    install put its scripts? The answer is the venv's own directory, never
+    the symlink's target.
+    """
+    venv_bin = tmp_path / "venv" / _SCRIPTS_SUBDIR
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(sys.executable)
+
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(
+        sysconfig, "get_path", lambda name, **_: str(venv_bin) if name == "scripts" else None
+    )
+
+    # The premise: resolving the venv python leaves the venv, which is the
+    # bug the old logic would have baked into the diagnosis.
+    assert venv_python.resolve().parent != venv_bin
+
+    assert _scripts_dir() == venv_bin
 
 
 def test_the_probe_reports_the_wire_framing_it_observed(monkeypatch: Any) -> None:

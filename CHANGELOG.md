@@ -105,6 +105,21 @@ All notable changes to this project are documented here. The format follows
   but it was wrong in the direction of hiding drift, which is the opposite of
   what a drift report is for. `latest_pinning` now folds `read_all_events`, the
   same history the assess (#1050) and watch (#1072) folds already read.
+- **`continuum mcp doctor` names the directory the console script is installed
+  into, not the one the venv python symlinks to.** `_scripts_dir()` took
+  `Path(sys.executable).resolve().parent`, but a venv's `python` is a symlink
+  to the base interpreter and resolving it walks past the venv to that
+  interpreter's `bin` -- a directory that holds neither the script nor the one
+  an operator should add to PATH. Windows has the same shape one level over:
+  scripts install into `Scripts` beside the executable, not beside it. It now
+  reads `sysconfig.get_path("scripts")`, which reports the directory the
+  install actually uses on both platforms. The bug was invisible to the suite
+  because the test module recomputed the same expression for its own
+  expectations, so both sides agreed on the wrong directory; that constant now
+  comes from the function under test, and
+  `tests/test_mcp_doctor.py::test_scripts_dir_follows_the_venv_not_the_symlink`
+  installs a real symlinked python and asserts the old logic's answer for it
+  is wrong.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
