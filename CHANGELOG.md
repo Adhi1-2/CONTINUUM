@@ -52,6 +52,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **CITATION.cff states the released version, and the bump sites are documented
+  (#1120).** The citation file pinned `0.1.0` while the package was `0.1.2`, so
+  anyone citing the project recorded a version two releases stale, and
+  `CONTRIBUTING.md` still said the version lived in two places guarded by
+  checking that "will be added" -- the guard has run in CI since #838 and reads
+  four sites. The file now says `0.1.2`, the paragraph names all five sites a
+  bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
+  release tag), and `tests/test_version_drift.py` checks the citation file
+  alongside the README pins so the drift cannot recur silently.
+
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
