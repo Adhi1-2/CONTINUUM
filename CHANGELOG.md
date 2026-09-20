@@ -6,6 +6,186 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A padded argument token can no longer reset the authorization-bound retry
+  budget (#1052).** The bucket was derived from every argument token, and the
+  arguments are caller-controlled noise plus the real resource, so keeping the
+  idempotency key fixed while varying one throwaway field (a `trace_id`, a
+  request id) moved every retry into a fresh bucket at its full allowance. A
+  `budgets.json` cap of 2 that refused a third identical attempt stayed open
+  indefinitely while each retry carried a new token. `ActionLedger.claim` now
+  derives the bucket from the record the claim defers to when one exists, which
+  is the identity the ledger itself has already decided the attempt is, and
+  settlement paths already derived from those same stored arguments, so a retry
+  and its confirmation share one bucket by construction. Fresh-key minting for
+  a fixed resource still shares the bucket as before (#390, #413). A caller
+  minting both a fresh key and fresh noise per attempt presents no identity the
+  ledger can see and remains on the token fallback -- the documented residual,
+  since declaring such fields `volatile` at every call site is not a fix: a
+  caller that wants around the cap simply forgets to declare them.
+
+### Changed
+
+- **The TUI `tree` view fetches the run once instead of twice (#1157).**
+  `family_lines` in `src/continuum/tui/model.py` called
+  `storage.get_run(run_id)` twice and discarded the first result: the first
+  call was the run-existence guard, the second fetched the record the header
+  actually renders. Both hit storage for the same row, and on the SQLite and
+  Postgres backends that is a round trip on a view an operator re-renders
+  while watching a run tree. The assignment now does both jobs: `run =
+  storage.get_run(run_id)` raises `RunNotFound` for a missing run exactly as
+  the standalone guard did, so no behaviour changes beyond the spared query.
+  The neighbouring views (`checkpoint_rows`, `action_rows`, `event_rows`,
+  `budget_rows`) already fetched the row exactly once for the same guard
+  purpose, so this removes the outlier.
+
+- **The advisory verdict contract is now stated where a reader can find it (#1031).**
+  `RecoveryDecision` and its `permits()` method describe themselves as
+  advisory, not enforcing, and name the four enforcement seams a caller can
+  opt into instead (host gate, HTTP gateway, replay guard, observation hooks),
+  none of which is enabled by a plain install. README gains a "The verdict is
+  advisory, not enforced" subsection under "What CONTINUUM Is Not", and
+  `docs/recovery_walkthrough.md` gains "The verdict is advisory", which points
+  out that the CLI exit code, not the verdict, is what gates a chained
+  pipeline and that calling `CheckpointManager.restore` directly keeps the
+  verdict but drops that enforcement. Behaviour is unchanged: `permits()` had
+  no product caller and still has none, so this documents the existing
+  contract rather than altering it.
+
+### Removed
+
+- **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
+  `DuplicateAction` (`continuum.actions.ledger`) and `LeaseError`
+  (`continuum.concurrency.lease`) were exported exceptions that no code path
+  could raise: duplicate attempts are handled via `fresh=False` outcomes,
+  `UnknownSideEffect`, or `GrantDenied`, while lease contention is signaled by
+  `acquire() -> False`. Dead exception definitions and exports removed.
+- **Dead `observations_evidence_lines` helper (#867).** The function in
+  `src/continuum/recovery/observations.py` was defined once and called
+  nowhere: leftover scaffolding from #208 whose engine-side rendering at
+  `recovery/engine.py` formats the same evidence its own way. Dead code in a
+  safety-critical path misled the next reader into thinking contract evidence
+  flows through it. No callers, not exported through `__all__`; recoverable
+  from history (355ba76) if a future surface needs that exact rendering.
+
+### Fixed
+
+- **Webhook dedup now survives a compaction inside the re-notify window
+  (#1186).** `_within_dedup_window` scanned only the live event tail for the
+  `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
+  but `compact_run` archives exactly those rows. A compaction inside an
+  endpoint's re-notify window (default 3600s) therefore made the next blocked
+  assessment deliver the same verdict again. This is the precise spam the dedup
+  exists to prevent, and in the failure direction that always means more
+  noise: an operator who was paged once and compacted the long blocked run to
+  shrink the log, as the docs suggest, gets paged again for the same standing
+  blockage, and once archived, on every subsequent assessment until the
+  window expires. The scan now reads `read_all_events`, the merged
+  archive-aware history every other durable-state consumer already uses
+  (`ledger._replay`, `gateway`, `provenance_for_run`, the reconcilers).
+  Archived rows keep their original timestamps, so the window computation
+  itself is unchanged and the expired-window path still rings again on time.
+- **The docs-count guard now reads `references/` and the translated READMEs,
+  and the stale counts they held are re-synced (#1109, #1071).** The guard in
+  `tests/test_docs_counts.py` watched only three files, so `references/testing.md`
+  and `references/install.md` quietly stated a collected total of 2,241 while
+  `README.md` stated 2,278, and all five translated READMEs still reported 2,195
+  collected with a 1,380-test narrative. None of those files could fail the
+  guard. Its scope is now the three required docs plus every `README*.md` and
+  every `references/*.md`: a doc that states no total is skipped, and a doc
+  that states a wrong one fails. The collected total is also matched in the
+  `pytest -q` verify comment, whose shape every translation keeps even after
+  all its prose is rephrased, so that one pattern reads all six READMEs.
+  `references/testing.md`, `references/install.md`, and the translated READMEs
+  now carry the same figures as `README.md`.
+
+- **`load_reconcilers` now refuses a registry missing the `probes` wrapper
+  instead of silently loading it as empty (#1062).** A file that maps action
+  types at the top level (`{"send_invoice": {...}}`) instead of nesting them
+  under `probes` is valid JSON, so `raw.get("probes", {})` and
+  `raw.get("probes") or {}` both defaulted to `{}` and the loader returned an
+  empty registry with no warning. Every uncertain action of that type then
+  read as having no probe registered, and nothing in that message pointed at
+  the missing wrapper as the cause. `load_reconcilers` now raises
+  `ReconcilerConfigError` naming the top-level keys it found and the `probes`
+  wrapper they belong under. An empty file (`{}`) is unaffected and still
+  loads as a valid empty registry. `gate.py` has the identical pattern for its
+  `tools` wrapper; left alone here since it's outside this issue's scope.
+
+  The three guidance call sites that read the registry (`resume` in the CLI,
+  the TUI's recovery view, and the MCP server's `continuum_resume`) each
+  caught every exception around `load_reconcilers` and fell back to an empty
+  probe list, so the new diagnostic above was getting silently absorbed the
+  same way the old empty-dict default was. Each now lets `ReconcilerConfigError`
+  through, matching how it already handles other errors: the CLI's existing
+  top-level `ValueError` handler prints it and exits non-zero, the TUI
+  prepends it to the rendered steps rather than dropping the run's guidance
+  entirely, and the MCP server raises it as a `ToolError` so the calling agent
+  sees it.
+
+- **A tampered checkpoint is reported as corrupted, not as missing (#1059).**
+  Both checkpoint resolvers wrapped `storage.get_checkpoint` in a bare
+  `except Exception: pass`, so a record whose body failed validation or whose
+  sealed integrity hash no longer matched was silently retried as a version
+  number and finally reported as a lookup miss. `resolve_checkpoint` and
+  `_anchor_for` now let `CorruptedRecord` through, wrapping it in the same
+  `RewindError`/`ValueError` the resolvers already raise, but naming the
+  corruption instead of pointing the operator at a typo or a missing version.
+  The tamper-evidence the storage layer raises is the one signal an operator
+  most needs on this path, and it was the signal both resolvers converted into
+  noise. A genuine lookup miss still falls through to the version and
+  source-sequence strategies exactly as before.
+
+- **`continuum attest-keygen` writes the private key owner-only (#1056).** The
+  command wrote an unencrypted PKCS8 Ed25519 private key with
+  `Path.write_text`, which creates the file at 0666 masked by the ambient umask
+  (0644 out of the box, readable by every local user on the host) while its
+  own output told the operator to keep it secret. Anyone with read access to the
+  file or a backup copy could produce validly-signed attestations for a tampered
+  event chain. The key is now created through `os.open` with an explicit 0600
+  mode, so it is owner-only from the moment it appears with no window at 0644,
+  and a pre-existing wider-mode file being overwritten is narrowed too, since
+  `open(2)` ignores the mode argument for a file that already exists. The public
+  key stays world-readable, as intended. The command now reports the mode it
+  applied next to the existing "keep the private key secret" line, so an operator
+  on a surprising filesystem can see what they actually got. Two tests pin the
+  property on POSIX (created mode, narrowing of a pre-existing 0644 key,
+  reported mode in output); Windows has no POSIX permission bits and is
+  skipped, matching the `tests/test_retry_budgets.py` precedent. A third test
+  covers the file-descriptor leak guard in the write helper on every platform.
+- **Every run-completion path now clears the instant-resume pointer (#394).**
+  `.continuum/resume.json` is written on every checkpoint so a `SessionStart`
+  hook can banner the interrupted run without opening the database. A run
+  closed as completed is no longer interrupted, but only `continuum complete`
+  removed the pointer; the TUI's and the dashboard HITL button's `complete_run`
+  claimed to mirror that command and did not, so completing a run from either
+  left the next session banner surfacing finished work as the active run. The
+  cleanup is now a single helper (`continuum.checkpoint.clear_resume_pointer`)
+  all three paths route through. A pointer naming any other run is left in
+  place, and an unreadable or undeletable file, or one holding valid JSON that
+  is not an object, is tolerated rather than failing the completion.
+  `tests/test_resume_pointer.py` pins the helper and each of the three
+  completion paths, and was verified to fail without the fix.
+
+- **The horizon `abort_condition_year` scenario now reaches abort (#1028).**
+  The scenario was labelled `correct_mode="abort"` but drove the abort through
+  `DECISION_INVALIDATED`, an event the recovery engine never routes to `ABORT`
+  (decision invalidation escalates to `REQUEST_HUMAN` instead). The scenario
+  failed by construction and capped the published horizon accuracy at 0.60
+  without any real regression in decision quality. `ABORT` is reachable only
+  through the risk policy (`recovery/risk.py` maps `side_effect_duplicate` to
+  `ABORT`), so the scenario now emits that `RISK_OBSERVED` event and exercises
+  the mechanism that exists. Published accuracy moves 0.60 to 0.80, and
+  `references/bench.md` plus the README bench section regenerate from the real
+  run. Two tests pin the property: a fast unit test asserting the
+  `side_effect_duplicate -> abort` mapping holds, and a slow benchmark test
+  asserting the scenario reaches abort, so a future engine change that drops
+  the risk path turns the suite red instead of silently deflating the figure.
+  `quarterly_drift_year` still fails (label `repair`, actual `request_human`)
+  and is deliberately left alone: whether dataset drift should be repaired
+  rather than escalated is an open labelling question, not a defect.
+
 ### Added
 
 - **Curated briefing by provenance (#742).** `continuum briefing` no longer
@@ -776,7 +956,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,286 collected, ~2,261 passed, ~25 skipped on a minimal env).
+  (~2,452 collected, ~2,423 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
