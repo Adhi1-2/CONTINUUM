@@ -146,6 +146,21 @@ All notable changes to this project are documented here. The format follows
   but it was wrong in the direction of hiding drift, which is the opposite of
   what a drift report is for. `latest_pinning` now folds `read_all_events`, the
   same history the assess (#1050) and watch (#1072) folds already read.
+- **The Postgres action index no longer reads as permanently dirty on an
+  ordinary store (#1321).** `action_index_drift` compares the projection
+  against a canonical fold of the log, and the two sides numbered each row on
+  different scales: `_maintain_action_index` takes `nextval` on a sequence
+  that advances once per action event, while the fold numbered a row by its
+  position in the merged row stream, which counts `RUN_STARTED`,
+  `TOOL_CALLED`, `EVIDENCE_ADDED` and every other non-action row too. A
+  normal run has those between its actions, so the two disagreed by one per
+  intervening row and `continuum verify --index` reported a corrupted
+  projection on a store nothing had tampered with, with `--repair-index` no
+  help because a rebuild rewrote the rows with the fold's numbers and the
+  next appended action put them straight back out of step. The fold now
+  counts action events only, 1-based, which is exactly the number the
+  sequence assigned. SQLite was immune -- both sides there use the writing
+  event's `rowid` -- and a regression test now pins that agreement.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
