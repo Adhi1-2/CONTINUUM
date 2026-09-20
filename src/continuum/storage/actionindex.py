@@ -23,6 +23,7 @@ __all__ = [
     "ACTION_EVENT_TYPES",
     "INDEX_DDL_SQLITE",
     "INDEX_DDL_POSTGRES",
+    "index_drift_count",
     "index_entry_from_payload",
 ]
 
@@ -75,3 +76,48 @@ def index_entry_from_payload(
         )
     except (TypeError, ValueError):
         return None
+
+
+def index_drift_count(
+    expected: Mapping[str, tuple[int, str]],
+    stored: Mapping[str, tuple[int, str]],
+) -> int:
+    """Count index rows that disagree with the log fold (issue #1321).
+
+    ``expected`` is the fold of the log and ``stored`` is the projection as it
+    stands; both map a ledger key to ``(updated_seq, status)``. A row
+    disagrees when the log no longer produces it, when the log produces a key
+    the projection lacks, or when the row's status is not the folded one.
+
+    ``updated_seq`` is deliberately *not* compared. Two healthy stores make it
+    disagree with the fold no matter how the fold numbers its rows:
+
+    - The incremental writer consumes one sequence value per action event;
+      the fold counts every row it walks, so a non-action event between two
+      actions shifts the fold off the writer's scale by one.
+    - The fold ranks every archived row below every live one, which holds
+      within a run but not across runs: once a run's actions are archived, the
+      fold puts them before another run's live actions that were written
+      earlier, while the sequence values they were assigned say the opposite.
+    - The value an archived row carries was assigned while it was still live
+      and nothing in the log carries it across compaction, so the fold cannot
+      reproduce it at all without a schema change.
+
+    Comparing it anyway made ``action_index_drift`` report a dirty index on
+    every Postgres store whose first action was not also its first event, and
+    on every store with an archived action -- which is what made ``continuum
+    verify`` unusable as a signal on that backend.
+
+    The omission costs nothing, because the column cannot affect an answer
+    today: ``key`` is the projection's primary key, so the
+    ``ORDER BY updated_seq DESC LIMIT 1`` that consumes it is scoped to a
+    single row and cannot rank anything. Should the schema later allow one row
+    per write of a key, that ranking needs a numbering both sides can
+    reconstruct, and this comparison is where to put it.
+    """
+    missing = sum(1 for key in expected if key not in stored)
+    extra = sum(1 for key in stored if key not in expected)
+    changed = sum(
+        1 for key, (_, status) in expected.items() if stored.get(key, (0, None))[1] != status
+    )
+    return missing + extra + changed

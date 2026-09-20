@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from continuum.actions import ActionLedger
+from continuum.actions.idempotency import idempotency_key
 from continuum.cli import ExitCode
 from continuum.events import EventType
 from continuum.models import Action, ActionStatus, Run, UnknownSideEffect
@@ -173,6 +174,70 @@ def test_spurious_rows_count_as_drift_and_are_removed(store: SQLiteStorage) -> N
     assert store.action_index_drift() >= 1
     store.rebuild_action_index()
     assert store.action_index_drift() == 0
+
+
+# --- renumbering is not corruption (issue #1321) ----------------------------- #
+
+
+def test_renumbering_the_order_column_is_not_drift(store: SQLiteStorage) -> None:
+    """The fold and the writer number rows on different scales by design.
+
+    Compaction re-numbers archived rows below every live value, and the fold
+    counts the non-action events the incremental path skips. Either rescales
+    every row without changing an answer the projection gives, so a store that
+    has only been renumbered must still read clean -- comparing the column
+    directly is what made ``verify`` report a dirty index on healthy stores.
+    """
+    ledger = make_run(store, "run_1")
+    for n in (1, 2):
+        outcome = ledger.claim("send_invoice", {}, key=f"invoice:{n}")
+        ledger.complete(outcome.key, external_id=f"INV-{n}")
+    assert store.action_index_drift() == 0
+    store._connection.execute("UPDATE action_index SET updated_seq = updated_seq * 10")
+    assert store.action_index_drift() == 0
+
+
+def test_a_status_the_log_does_not_support_is_still_drift(store: SQLiteStorage) -> None:
+    """The order column is not compared, so the check needs a real foothold.
+
+    The projection's contract is one row per key holding the folded status of
+    that key's latest write; a row whose status the log no longer produces is
+    corruption an operator must hear about, and it is what the relaxed
+    comparison still has to catch.
+    """
+    ledger = make_run(store, "run_1")
+    ledger.claim("send_invoice", {}, key="invoice:1")
+    store._connection.execute("UPDATE action_index SET updated_seq = 0")
+    assert store.action_index_drift() == 0
+    store._connection.execute("UPDATE action_index SET status = 'completed'")
+    assert store.action_index_drift() == 1
+    assert store.rebuild_action_index() == 1
+    assert store.action_index_drift() == 0
+
+
+def test_rebuild_reports_no_corrections_for_an_intact_compacted_store(
+    store: SQLiteStorage,
+) -> None:
+    """Re-numbering an intact row is not a correction (issue #1321).
+
+    Compaction folds archived rows to negative positions while the index keeps
+    the rowid it wrote while they were live. Rebuild used to count that as a
+    corrected row and rewrite it, which is how a healthy compacted store came
+    to report a dirty index every time it was audited.
+    """
+    ledger = make_run(store, "run_1")
+    outcome = ledger.claim("send_invoice", {}, key="invoice:1")
+    ledger.complete(outcome.key, external_id="INV-1")
+    # compact_run anchors the run itself when it has no version yet.
+    assert store.compact_run("run_1")["archived"] >= 1
+    assert store.action_index_drift() == 0
+    assert store.rebuild_action_index() == 0
+    assert store.action_index_drift() == 0
+    # The archived completion is still what a cross-run lookup returns.
+    key = str(idempotency_key("send_invoice", None, scope="run_1", key="invoice:1"))
+    foreign = store.foreign_action(key, exclude_run="nobody")
+    assert foreign is not None
+    assert foreign.status is ActionStatus.COMPLETED
 
 
 # --- engines without an index ---------------------------------------------------- #

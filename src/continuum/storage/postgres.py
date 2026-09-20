@@ -44,7 +44,7 @@ from continuum.models import (
 )
 from continuum.security.hashing import make_id
 from continuum.state.versioning import canonical_state_json, state_fingerprint
-from continuum.storage.actionindex import index_entry_from_payload
+from continuum.storage.actionindex import index_drift_count, index_entry_from_payload
 from continuum.storage.base import (
     CheckpointNotFound,
     ConcurrentWriteError,
@@ -686,8 +686,21 @@ class PostgresStorage(Storage):
             ) from exc
 
     def rebuild_action_index(self) -> int:
-        """Recompute the whole index from the log (global key space)."""
+        """Recompute the whole index from the log (global key space).
+
+        Live keys take fresh sequence values in fold order rather than the
+        fold's merged position: the position counts the non-action events the
+        sequence skips, so a rebuilt row and the next ``nextval`` were on
+        different scales and the store re-drifted with every action written
+        afterwards (issue #1321). Archived keys keep the fold's negative
+        position, which is already below every value the sequence will ever
+        hand out and already in fold order.
+        """
         canonical = self._canonical_index_rows()
+        rows: list[tuple[str, str, str, str, int, str]] = []
+        for key, (entry, order) in canonical.items():
+            seq = order if order < 0 else self._next_index_ord()
+            rows.append((key, entry[1], entry[2], entry[3], seq, entry[4]))
         with self._write():
             self._connection.execute("DELETE FROM action_index")
             # psycopg's Connection has no executemany; the cursor does.
@@ -695,10 +708,7 @@ class PostgresStorage(Storage):
                 cur.executemany(
                     "INSERT INTO action_index(key, run_id, action_id, status, "
                     "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s)",
-                    [
-                        (key, entry[1], entry[2], entry[3], seq, entry[4])
-                        for key, (entry, seq) in canonical.items()
-                    ],
+                    rows,
                 )
         return 0
 
@@ -707,7 +717,9 @@ class PostgresStorage(Storage):
 
         Store-wide by design, mirroring the SQLite engine: keys live in one
         namespace, so a run-scoped comparison would falsely flag rows owned
-        by another run's later write of the same key.
+        by another run's later write of the same key. Only the key set and
+        each row's status are compared: see
+        :func:`~continuum.storage.actionindex.index_drift_count`.
         """
         expected = {
             key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
@@ -719,9 +731,7 @@ class PostgresStorage(Storage):
                     "SELECT key, updated_seq, status FROM action_index"
                 ).fetchall()
             }
-        extra = set(stored) - set(expected)
-        changed = sum(1 for k, val in expected.items() if stored.get(k) != val)
-        return len(extra) + changed
+        return index_drift_count(expected, stored)
 
     def _canonical_index_rows(self) -> dict[str, tuple[tuple[str, str, str, str, str], int]]:
         """Fold every run's action events; global last-write-per-key wins.

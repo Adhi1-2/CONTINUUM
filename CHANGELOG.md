@@ -52,6 +52,29 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`action_index_drift` no longer reports a clean index as dirty (#1321).**
+  The store-wide drift check compared each index row's `updated_seq` against
+  the value a fresh fold of the log would have written, but the fold and the
+  incremental writer number rows on different scales by design. The fold counts
+  every row it walks while the writer consumes one sequence value per action
+  event, so a store whose first action was not also its first event read dirty
+  on the very first claim. Compaction re-numbers every archived row below every
+  live one, so a store that had compacted once read dirty on every audit
+  afterwards, and could not be repaired: rebuilding rewrote the same numbers
+  the fold still could not reproduce. Both engines shared the comparison and
+  both were affected, contrary to the issue's note that SQLite was already
+  correct; they now share one helper, `index_drift_count` in
+  `src/continuum/storage/actionindex.py`, which compares the key set and each
+  row's status and deliberately ignores the sequence value. The omission costs
+  nothing, because the value cannot affect an answer: `key` is the projection's
+  primary key, so the `ORDER BY updated_seq DESC LIMIT 1` that consumes the
+  column is scoped to a single row and ranks nothing. The Postgres rebuild also
+  hands live keys fresh sequence values in fold order instead of writing the
+  fold's merged position, which was on a third scale and re-drifted the store
+  with every action written after a rebuild. The guard keeps its teeth: a row
+  whose status the log no longer produces is still drift, and is the failure
+  the tests now exercise.
+
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,

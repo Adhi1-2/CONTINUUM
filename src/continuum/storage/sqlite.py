@@ -35,7 +35,7 @@ from continuum.events import CAUSED_BY_TYPES, Event, EventType, IntegrityReport,
 from continuum.models import Action, Origin, Run, RunStatus, SemanticState, StateCheckpoint, utcnow
 from continuum.security.hashing import make_id
 from continuum.state.versioning import canonical_state_json, state_fingerprint
-from continuum.storage.actionindex import index_entry_from_payload
+from continuum.storage.actionindex import index_drift_count, index_entry_from_payload
 from continuum.storage.base import (
     CheckpointNotFound,
     ConcurrentWriteError,
@@ -590,7 +590,9 @@ class SQLiteStorage(Storage):
 
         The projection is keyed globally, so drift is a store-wide property:
         a run-scoped comparison would falsely flag rows owned by another
-        run's later write of the same key.
+        run's later write of the same key. Only the key set and each row's
+        status are compared: see
+        :func:`~continuum.storage.actionindex.index_drift_count`.
         """
         expected = {
             key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
@@ -600,9 +602,7 @@ class SQLiteStorage(Storage):
                 r["key"]: (r["updated_seq"], r["status"])
                 for r in conn.execute("SELECT key, updated_seq, status FROM action_index")
             }
-        extra = set(stored) - set(expected)
-        changed = sum(1 for k, val in expected.items() if stored.get(k) != val)
-        return len(extra) + changed
+        return index_drift_count(expected, stored)
 
     def rebuild_action_index(self) -> int:
         """Recompute the whole index from the log; returns corrected rows.
@@ -610,7 +610,9 @@ class SQLiteStorage(Storage):
         Always global by design: keys live in one store-wide namespace, so a
         per-run rewrite could collide with another run's legitimate row of
         the same key. A correction is any key whose stored row was missing,
-        stale or spurious.
+        stale or spurious. Re-numbering an intact row is not a correction:
+        the archived rows are re-numbered below every live value on purpose,
+        so a store that has compacted once must not look dirty afterwards.
         """
         canonical = self._canonical_index_rows()
         with self._write() as conn:
@@ -627,13 +629,8 @@ class SQLiteStorage(Storage):
                     for key, (entry, seq) in canonical.items()
                 ],
             )
-        corrections = sum(
-            1
-            for k, val in ((k, (seq, entry[3])) for k, (entry, seq) in canonical.items())
-            if before.get(k) != val
-        )
-        corrections += len(set(before) - set(canonical))
-        return corrections
+        after = {key: (seq, entry[3]) for key, (entry, seq) in canonical.items()}
+        return index_drift_count(after, before)
 
     def _canonical_index_rows(self) -> dict[str, tuple[tuple[str, str, str, str, str], int]]:
         """Fold the log into ``{key: ((entry...), order_seq)}``, last write wins.

@@ -13,6 +13,7 @@ import os
 import pytest
 
 from continuum.actions import ActionLedger
+from continuum.actions.idempotency import idempotency_key
 from continuum.checkpoint import CheckpointManager
 from continuum.events import EventType
 from continuum.models import ActionStatus, Origin, Run, RunStatus
@@ -254,17 +255,42 @@ def test_pg_compact_rejects_through_sequence_that_would_eat_the_anchor(
     assert storage.verify_events("pg_kg").ok is True
 
 
+_EVENT_COLUMNS = (
+    "run_id",
+    "sequence",
+    "event_id",
+    "type",
+    "timestamp",
+    "payload",
+    "causer_event_id",
+    "source",
+    "prev_hash",
+    "hash",
+)
+
+
 def test_pg_archive_tampering_fails_verify(storage: PostgresStorage) -> None:
     make_run(storage, "pg_kt", "tamper target")
     CheckpointManager(storage).checkpoint("pg_kt")
     storage.compact_run("pg_kt")
 
+    # The suite shares one database, so the tamper is undone afterwards: a
+    # permanently corrupted archive makes every later store-wide check read
+    # dirty for a reason this test owns (issue #1321).
+    before = storage._connection.execute(
+        "SELECT payload FROM events_archive WHERE run_id = 'pg_kt' ORDER BY sequence LIMIT 1"
+    ).fetchone()["payload"]
     storage._connection.execute(
         "UPDATE events_archive SET payload = '{\"tampered\": true}' WHERE run_id = 'pg_kt'"
     )
-    report = storage.verify_events("pg_kt")
-    assert report.ok is False
-    assert any(v.kind == "TAMPERED_CONTENT" for v in report.violations)
+    try:
+        report = storage.verify_events("pg_kt")
+        assert report.ok is False
+        assert any(v.kind == "TAMPERED_CONTENT" for v in report.violations)
+    finally:
+        storage._connection.execute(
+            "UPDATE events_archive SET payload = %s WHERE run_id = 'pg_kt'", (before,)
+        )
 
 
 def test_pg_deleted_boundary_event_fails_verify(storage: PostgresStorage) -> None:
@@ -272,31 +298,121 @@ def test_pg_deleted_boundary_event_fails_verify(storage: PostgresStorage) -> Non
     CheckpointManager(storage).checkpoint("pg_kb")
     storage.compact_run("pg_kb")
 
+    # The DELETE must stay run-scoped: an unscoped
+    # "sequence = (SELECT MIN(sequence) ... WHERE run_id = 'pg_kb')" takes that
+    # sequence number out of every other run too, and the action index rows
+    # those rows wrote survive as orphans the projection cannot explain.
+    row = storage._connection.execute(
+        f"SELECT {', '.join(_EVENT_COLUMNS)} FROM events WHERE run_id = 'pg_kb' AND sequence ="
+        " (SELECT MIN(sequence) FROM events WHERE run_id = 'pg_kb')"
+    ).fetchone()
     storage._connection.execute(
-        "DELETE FROM events WHERE sequence ="
+        "DELETE FROM events WHERE run_id = 'pg_kb' AND sequence ="
         " (SELECT MIN(sequence) FROM events WHERE run_id = 'pg_kb')"
     )
-    report = storage.verify_events("pg_kb")
-    assert report.ok is False
-    kinds = {v.kind for v in report.violations}
-    assert {"SEQUENCE_GAP", "BROKEN_CHAIN"} & kinds
+    try:
+        report = storage.verify_events("pg_kb")
+        assert report.ok is False
+        kinds = {v.kind for v in report.violations}
+        assert {"SEQUENCE_GAP", "BROKEN_CHAIN"} & kinds
+    finally:
+        storage._connection.execute(
+            f"INSERT INTO events ({', '.join(_EVENT_COLUMNS)}) VALUES"
+            " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            tuple(row[column] for column in _EVENT_COLUMNS),
+        )
 
 
-def test_pg_action_index_covers_the_archive_after_rebuild(
+def test_pg_action_index_covers_the_archive_after_compaction(
     storage: PostgresStorage,
 ) -> None:
-    from continuum.actions.idempotency import idempotency_key
-
     make_run(storage, "pg_ki", "index target")
     ledger = ActionLedger(storage, "pg_ki")
     outcome = ledger.claim("process_doc", {}, key="doc:1")
     ledger.complete(outcome.key, external_id="doc:1")
     storage.compact_run("pg_ki")
 
-    assert storage.action_index_drift() > 0
-    storage.rebuild_action_index()
+    # Compaction alone is not drift: the archived claim is still served, and
+    # the renumbering the fold performs changes no answer the projection gives
+    # (issue #1321).
     assert storage.action_index_drift() == 0
     key = str(idempotency_key("process_doc", None, scope="pg_ki", key="doc:1"))
     foreign = storage.foreign_action(key, exclude_run="some_other_run")
     assert foreign is not None
     assert foreign.status is ActionStatus.COMPLETED
+
+    # The guard used to reach its "> 0" step through that renumbering; now it
+    # can only be reached by a row the log does not support, which is what
+    # makes the check worth running at all.
+    storage._connection.execute("UPDATE action_index SET status = 'failed' WHERE key = %s", (key,))
+    assert storage.action_index_drift() >= 1
+    storage.rebuild_action_index()
+    assert storage.action_index_drift() == 0
+
+
+def test_pg_drift_stays_zero_when_a_non_action_event_precedes_an_action(
+    storage: PostgresStorage,
+) -> None:
+    """The case issue #1321 reports: the fold counts every row while the
+    incremental writer counts only actions, so the two number a row on
+    different scales and the store read dirty the moment it had logged
+    anything but actions. ``verify`` must stay quiet on a store like this.
+    """
+    make_run(storage, "pg_drift_a", "drift")
+    storage.append_event("pg_drift_a", EventType.TASK_UPDATED, {"n": 1})
+    ledger = ActionLedger(storage, "pg_drift_a")
+    ledger.claim("process_doc", {}, key="doc:1")
+    assert storage.action_index_drift() == 0
+    ledger.claim("process_doc", {}, key="doc:2")
+    assert storage.action_index_drift() == 0
+
+
+def test_pg_drift_stays_zero_after_a_rebuild_and_further_actions(
+    storage: PostgresStorage,
+) -> None:
+    """A rebuilt store must stay converged as new actions arrive.
+
+    Rebuild used to write the fold's merged position, which is not the scale
+    the sequence hands out, so a rebuilt row could outrank an action written
+    after it -- the mis-ranking issue #1321 asks to confirm.
+    """
+    make_run(storage, "pg_drift_b", "drift")
+    ledger = ActionLedger(storage, "pg_drift_b")
+    ledger.claim("process_doc", {}, key="doc:1")
+    assert storage.action_index_drift() == 0
+    storage.rebuild_action_index()
+    assert storage.action_index_drift() == 0
+    ledger.claim("process_doc", {}, key="doc:2")
+    ledger.claim("process_doc", {}, key="doc:3")
+    assert storage.action_index_drift() == 0
+    # The rebuilt rows still rank this run's writes in the order they happened.
+    keys = [
+        str(idempotency_key("process_doc", None, scope="pg_drift_b", key=f"doc:{n}"))
+        for n in (1, 2, 3)
+    ]
+    rows = storage._connection.execute(
+        "SELECT key FROM action_index WHERE run_id = 'pg_drift_b' ORDER BY updated_seq"
+    ).fetchall()
+    assert [r["key"] for r in rows] == keys
+
+
+def test_pg_a_status_the_log_does_not_support_is_still_drift(
+    storage: PostgresStorage,
+) -> None:
+    """The order column is not compared, so the check needs a real foothold.
+
+    A row whose status the log no longer produces is corruption an operator
+    must hear about. This is the guarantee the relaxed comparison keeps now
+    that renumbering no longer counts.
+    """
+    make_run(storage, "pg_drift_c", "drift")
+    ActionLedger(storage, "pg_drift_c").claim("process_doc", {}, key="doc:1")
+    key = str(idempotency_key("process_doc", None, scope="pg_drift_c", key="doc:1"))
+    storage._connection.execute("UPDATE action_index SET updated_seq = 0 WHERE key = %s", (key,))
+    assert storage.action_index_drift() == 0
+    storage._connection.execute(
+        "UPDATE action_index SET status = 'completed' WHERE key = %s", (key,)
+    )
+    assert storage.action_index_drift() >= 1
+    storage.rebuild_action_index()
+    assert storage.action_index_drift() == 0

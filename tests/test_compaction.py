@@ -286,12 +286,16 @@ def test_a_key_with_no_archived_claim_still_gets_a_fresh_slot(db: str) -> None:
     assert kind is GuardKind.ALLOW and value == {"doc": 99}
 
 
-def test_action_index_covers_the_archive_after_rebuild(tmp_path: Path) -> None:
+def test_action_index_covers_the_archive_after_compaction(tmp_path: Path) -> None:
     """The derived index must not forget archived claims (PR #260 review):
-    after compaction it lags until rebuilt, then cross-run lookups see the
-    archived completion again. A second run interleaves global insertion
-    order, so the post-compaction fold provably differs from what the
-    incremental index recorded."""
+    after compaction a cross-run lookup still sees the archived completion.
+
+    Compaction used to look like drift, because the fold re-numbers the rows
+    it moved below every live value while the index kept the value it wrote
+    while they were live. That renumbering changes no answer the projection
+    gives, so it is not drift (issue #1321): the store reports clean, and the
+    archived claim is still served without a rebuild.
+    """
     path = str(tmp_path / "idx.db")
     with SQLiteStorage(path) as store:
         store.create_run_started(Run(run_id="r1", goal="one"))
@@ -303,13 +307,20 @@ def test_action_index_covers_the_archive_after_rebuild(tmp_path: Path) -> None:
         store.append_event("r2", EventType.TASK_UPDATED, {"n": 1})
 
         store.compact_run("r1")
-        assert store.action_index_drift() > 0
-        store.rebuild_action_index()
         assert store.action_index_drift() == 0
         key = str(idempotency_key("process_doc", None, scope="r1", key="doc:1"))
         foreign = store.foreign_action(key, exclude_run="r2")
     assert foreign is not None
     assert foreign.status is ActionStatus.COMPLETED
+
+    # The guard used to reach a dirty reading through that renumbering; now it
+    # can only be reached by a row whose status the log does not support,
+    # which is what makes the check worth running at all (issue #1321).
+    with SQLiteStorage(path) as store:
+        store._connection.execute("UPDATE action_index SET status = 'failed' WHERE key = ?", (key,))
+        assert store.action_index_drift() >= 1
+        assert store.rebuild_action_index() >= 1
+        assert store.action_index_drift() == 0
 
 
 # --- capability gate and projection hygiene -------------------------------------- #
