@@ -17,10 +17,20 @@ import os
 import sys
 import sysconfig
 from pathlib import Path
+from subprocess import TimeoutExpired
 from typing import Any
 
 from continuum.cli import ExitCode, main
-from continuum.mcp.doctor import _scripts_dir, render_doctor, run_doctor
+from continuum.mcp import doctor
+from continuum.mcp.doctor import (
+    _check_handshake,
+    _check_resolution,
+    _check_sdk,
+    _handshake_command,
+    _scripts_dir,
+    render_doctor,
+    run_doctor,
+)
 
 #: The venv's script directory, prepended to PATH by tests that need the
 #: console script resolvable so the healthy-path assertions hold even when
@@ -285,3 +295,168 @@ def test_the_handshake_reads_frames_without_select_on_pipes(monkeypatch: Any) ->
     handshake = _by_name(report)["handshake"]
     assert handshake["status"] == "pass"
     assert "continuum_record_progress" in handshake["tools"]
+
+
+#: The protocol each fake server below speaks: read the request, answer it.
+#: ``-c`` body, so the command is this interpreter on every platform -- no
+#: PATH lookup, no extension, no shebang.
+def _fake_server(body: str) -> list[str]:
+    """An argv whose stdout speaks whatever protocol failure ``body`` enacts."""
+    return [sys.executable, "-c", body]
+
+
+def _check(command: list[str] | None, timeout: float = 5.0) -> tuple[Any, list[Any]]:
+    finding, notes = _check_handshake(command, timeout)
+    return finding, notes
+
+
+def test_the_handshake_reports_a_server_that_answers_with_an_error() -> None:
+    """A JSON-RPC error is a server that is up, and the message is the detail.
+
+    ``CONNECTION_CLOSED`` is not the only way a spawn fails; a server that
+    answers with an error object would otherwise surface as a bare
+    "never completed the handshake", burying the message that names the cause.
+    """
+    body = (
+        "import json, sys\n"
+        "req = json.loads(sys.stdin.readline())\n"
+        'sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], '
+        '"error": {"code": -32601, "message": "method not allowed"}}) + "\\n")\n'
+        "sys.stdout.flush()\n"
+    )
+    finding, _ = _check(_fake_server(body))
+
+    assert finding["status"] == "fail"
+    assert "server returned an error: method not allowed" in finding["detail"]
+
+
+def test_the_handshake_names_an_unparseable_response() -> None:
+    """A line that is not JSON is reported as wire corruption, not silence.
+
+    The framing probe's whole point is that the wire is observed byte for
+    byte; a server that logs to stdout (a common misconfiguration) sends
+    exactly this shape.
+    """
+    body = (
+        "import json, sys\n"
+        "req = json.loads(sys.stdin.readline())\n"
+        'sys.stdout.write("this line is not json\\n")\n'
+        "sys.stdout.flush()\n"
+    )
+    finding, _ = _check(_fake_server(body))
+
+    assert finding["status"] == "fail"
+    assert "unparseable response" in finding["detail"]
+
+
+def test_the_handshake_gives_up_on_a_server_that_never_answers() -> None:
+    """A wedged server is bounded by the deadline, then killed by close().
+
+    Both timeouts in the read path have to fire for this to be a diagnosis
+    rather than a hang: the per-chunk deadline (``queue.get``) and the
+    whole-read deadline (``remaining <= 0``). And ``close`` must not join a
+    server that ignores a closed stdin -- it kills it, or the probe leaks a
+    process per diagnosis.
+    """
+    finding, _ = _check(_fake_server("import time\ntime.sleep(120)\n"), timeout=1.0)
+
+    assert finding["status"] == "fail"
+    assert "never completed the initialize handshake" in finding["detail"]
+
+
+def test_the_handshake_reports_a_command_that_cannot_spawn(tmp_path: Path) -> None:
+    """No spawnable command is itself a finding, not an exception.
+
+    ``_handshake_command`` returns None when resolution found neither a
+    script nor the module fallback -- the doctor's job here is to say so
+    plainly instead of crashing on the None it produced.
+    """
+    finding, _ = _check(None)
+
+    assert finding["status"] == "fail"
+    assert "no spawnable command to probe" in finding["detail"]
+    assert "pip install continuum-agent[mcp]" in finding["fix"]
+
+
+def test_the_handshake_reports_an_unspawnable_executable(tmp_path: Path) -> None:
+    """An executable that does not exist is ``OSError``, not a traceback.
+
+    The command came from a stale registration, which is exactly the state
+    issue #841 says the doctor should name a remedy for.
+    """
+    missing = tmp_path / "no-such-server"
+    finding, _ = _check([str(missing)])
+
+    assert finding["status"] == "fail"
+    assert "spawning" in finding["detail"]
+    assert str(missing) in finding["detail"]
+
+
+def test_resolution_distinguishes_not_on_path_from_not_installed(monkeypatch: Any) -> None:
+    """The same failure names a different fix depending on one file.
+
+    ``continuum-mcp`` off PATH is fixed by adding the directory; the script
+    absent from the interpreter's own scripts dir is fixed by reinstalling.
+    The diagnosis has to tell them apart because the operator cannot.
+    """
+    monkeypatch.setattr(
+        doctor,
+        "_run_probe",
+        lambda code, **_: (0, '{"which": null, "module": true, "path": "/x"}', ""),
+    )
+
+    for exists, remedy in (
+        (True, "add"),
+        (False, "reinstall with"),
+    ):
+        monkeypatch.setattr(doctor, "_script_exists_next_to_interpreter", lambda e=exists: e)
+        resolution = _check_resolution(5.0)
+        assert resolution["status"] == "fail", exists
+        assert remedy in resolution["fix"], exists
+
+
+def test_a_probe_that_times_out_is_a_failure_not_a_hang(monkeypatch: Any) -> None:
+    """A probe past its deadline becomes a finding, never an infinite wait.
+
+    ``shutil.which`` walks PATH in the child; a PATH with a loop or a huge
+    network mount makes both probes slow, which is why the remedy names it.
+    """
+
+    def _hang(code: str, **_: Any) -> tuple[int, str, str]:
+        raise TimeoutExpired(cmd=[sys.executable, "-c", code], timeout=1.0)
+
+    monkeypatch.setattr(doctor, "_run_probe", _hang)
+
+    sdk = _check_sdk(1.0)
+    assert sdk["status"] == "fail"
+    assert "timed out" in sdk["detail"]
+
+    resolution = _check_resolution(1.0)
+    assert resolution["status"] == "fail"
+    assert "timed out" in resolution["detail"]
+    assert "PATH" in resolution["fix"]
+
+
+def test_a_probe_that_fails_is_reported_as_such(monkeypatch: Any) -> None:
+    """A resolution probe that dies cannot answer, so the check says so."""
+    monkeypatch.setattr(doctor, "_run_probe", lambda code, **_: (1, "", "boom"))
+
+    resolution = _check_resolution(5.0)
+    assert resolution["status"] == "fail"
+    assert "boom" in resolution["detail"]
+
+
+def test_the_handshake_command_follows_resolution() -> None:
+    """Resolution's two answers map to the two commands, and its failure to none.
+
+    A pure function over the resolution finding: pinning it keeps the
+    wiring between the two checks from silently changing shape.
+    """
+    assert _handshake_command({"resolved": "/opt/bin/continuum-mcp"}) == ["/opt/bin/continuum-mcp"]
+    assert _handshake_command({"resolved": None, "module_fallback": True}) == [
+        sys.executable,
+        "-u",
+        "-m",
+        "continuum.mcp",
+    ]
+    assert _handshake_command({"resolved": None, "module_fallback": False}) is None
