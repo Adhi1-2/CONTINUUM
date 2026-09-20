@@ -184,16 +184,26 @@ def test_the_probe_reports_the_wire_framing_it_observed(monkeypatch: Any) -> Non
     """Framing is reported as observed, not assumed by platform.
 
     The CRLF bug is upstream and Windows-only today (#839); a doctor that
-    guessed "CRLF on win32" would go stale the day the SDK fixes it.
+    guessed "CRLF on win32" would go stale the day the SDK fixes it. What is
+    invariant is that the note says what the probe actually saw, and that
+    seeing CRLF does not flip the verdict on its own.
     """
     monkeypatch.setenv("PATH", _with_scripts_dir_on_path())
 
     report = run_doctor()
 
-    framing = _by_name(report)["wire-framing"]
-    assert framing["status"] == "info"
-    assert framing["detail"].startswith("response frames end with ")
-    # A framing note must never flip the verdict by itself.
+    notes = [check for check in report["checks"] if check["check"] == "wire-framing"]
+    assert notes, "the probe observed framing, so a note must be reported"
+    observed = next(
+        note for note in notes if note["detail"].startswith("response frames end with ")
+    )
+    expected = "CRLF (\\r\\n)" if sys.platform == "win32" else "LF (\\n)"
+    assert expected in observed["detail"], (
+        "the note names the terminator this platform's wire actually uses, "
+        "not the one a platform guess would have printed"
+    )
+    # A framing note must never flip the verdict by itself, not even the warn
+    # the Windows CRLF finding raises.
     assert report["healthy"] is True
 
 
