@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from continuum.actions import ActionLedger, ProbeReconciler, Resolution, reconcile_pending
+from continuum.actions.authority import record_authority_consumed
 from continuum.checkpoint import CheckpointManager
 from continuum.environment import CallableProvider, StaticProvider, capture
 from continuum.events import EventType
@@ -575,6 +576,77 @@ def test_confirmation_survives_compaction(store: SQLiteStorage) -> None:
     after = RecoveryEngine(store).assess("r1")
     assert after.mode is RecoveryMode.RESUME
     assert after.safe
+
+
+def test_a_risk_trigger_survives_compaction(store: SQLiteStorage) -> None:
+    """A risk observed before the anchor still proposes its mode afterwards
+    (#1050). The fold has to see the archived prefix: losing the trigger
+    downgrades ``rollback`` to ``request_human``, and the downgrade direction
+    of a broken fold is always toward less caution."""
+    seed(store)
+    risk = store.append_event(
+        "run_1",
+        EventType.RISK_OBSERVED,
+        {"trigger": "meltdown", "score": 1.0},
+        source=Origin.EXTERNAL_MONITOR,
+    )
+    before = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert before.mode is RecoveryMode.ROLLBACK
+    assert risk.event_id in before.contract.triggering_risks
+
+    store.compact_run("run_1")
+    # compaction anchored past the risk, so the trigger left the live tail.
+    assert not any(e.type is EventType.RISK_OBSERVED for e in store.read_events("run_1")), (
+        "precondition failed: the risk trigger is still live"
+    )
+
+    after = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert after.mode is RecoveryMode.ROLLBACK, "compaction dropped the risk trigger"
+    assert risk.event_id in after.contract.triggering_risks
+
+
+def test_a_liveness_breach_count_survives_compaction(store: SQLiteStorage) -> None:
+    """A silence detected before the anchor still counts afterwards (#1050):
+    the contract reports a breach count, and compaction must not reset it to
+    zero and present a noisy run as quiet."""
+    seed(store)
+    store.append_event(
+        "run_1",
+        EventType.LIVENESS_SILENCE_DETECTED,
+        {"silence_seconds": 4000, "threshold_seconds": 3600, "phase": "otherwise"},
+    )
+    before = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert before.contract.liveness is not None
+    assert before.contract.liveness["breaches"] == 1
+
+    store.compact_run("run_1")
+    assert not any(
+        e.type is EventType.LIVENESS_SILENCE_DETECTED for e in store.read_events("run_1")
+    ), "precondition failed: the breach is still live"
+
+    after = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert after.contract.liveness is not None
+    assert after.contract.liveness["breaches"] == 1, "compaction reset the breach count"
+
+
+def test_a_consumed_authority_survives_compaction(store: SQLiteStorage) -> None:
+    """An authority consumed before the anchor still blocks resume afterwards
+    (#1050). The gate keeps refusing to forward, so assess reporting clear
+    would make ``continuum resume`` advertise a safe resume the gate denies."""
+    seed(store)
+    record_authority_consumed(store, "run_1", "cred-archive-1050")
+    before = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert before.mode is RecoveryMode.REQUEST_HUMAN
+    assert any("cred-archive-1050" in line for line in before.rationale)
+
+    store.compact_run("run_1")
+    assert not any(e.type is EventType.AUTHORITY_CONSUMED for e in store.read_events("run_1")), (
+        "precondition failed: the consumed authority is still live"
+    )
+
+    after = RecoveryEngine(store).assess("run_1", current_environment=env("v4"))
+    assert after.mode is RecoveryMode.REQUEST_HUMAN, "compaction dropped the authority block"
+    assert any("cred-archive-1050" in line for line in after.rationale)
 
 
 def test_assess_degrades_when_the_archive_read_fails(store: SQLiteStorage) -> None:

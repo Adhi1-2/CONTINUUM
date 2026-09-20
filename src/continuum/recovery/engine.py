@@ -394,11 +394,13 @@ class RecoveryEngine:
             from continuum.recovery.health import advisory_for_storage
 
             liveness_advisory = advisory_for_storage(self.storage, run_id)
-            # Count prior breaches as DETECTED events
+            # Count prior breaches as DETECTED events. A breach recorded before
+            # the anchor still counts: the archived prefix is part of the run's
+            # history, and compaction must not reset a silence counter the
+            # contract reports (#1050).
             try:
-                evs = self.storage.read_events(run_id)
                 liveness_breaches = sum(
-                    1 for e in evs if e.type == EventType.LIVENESS_SILENCE_DETECTED
+                    1 for e in archive_aware_events if e.type is EventType.LIVENESS_SILENCE_DETECTED
                 )
             except Exception:
                 liveness_breaches = 0
@@ -415,9 +417,11 @@ class RecoveryEngine:
 
             policy = load_risk_policy()
             try:
-                risk_events = [
-                    e for e in self.storage.read_events(run_id) if e.type == EventType.RISK_OBSERVED
-                ]
+                # The archived prefix is included: a risk observed before the
+                # anchor still proposes its mode, and compaction must not empty
+                # triggering_risks -- the downgrade direction is always toward
+                # less caution (#1050).
+                risk_events = [e for e in archive_aware_events if e.type is EventType.RISK_OBSERVED]
             except Exception:
                 risk_events = []
             best_mode = None
@@ -472,9 +476,11 @@ class RecoveryEngine:
         # forwarding, but the recovery decision must also surface the block
         # so that `continuum resume` does not report safe when the gate would
         # still deny. A later AUTHORITY_RECONCILED with valid true clears the
-        # map inside collect_consumed_authorities.
+        # map inside collect_consumed_authorities. The fold sees the archived
+        # prefix: an authority consumed before the anchor still blocks, and
+        # compaction must not drop it from the rationale (#1050).
         try:
-            consumed_authorities = collect_consumed_authorities(self.storage.read_events(run_id))
+            consumed_authorities = collect_consumed_authorities(archive_aware_events)
         except Exception:
             # An empty map is the *unblocked* answer, and this block exists to
             # be the check that survives a degraded log: when the ledger

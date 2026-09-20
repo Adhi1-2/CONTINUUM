@@ -52,6 +52,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`assess` now folds the archived prefix for every signal that changes the
+  verdict (#1050).** Three scans in `RecoveryEngine.assess` read the live
+  event tail only: the `RISK_OBSERVED` scan that maps a trigger to a recovery
+  mode, the `LIVENESS_SILENCE_DETECTED` count the contract reports as
+  `breaches`, and the `AUTHORITY_CONSUMED` scan behind the
+  `consumed authority blocks resume` rationale. `compact_run` archives exactly
+  those rows, so after a compaction a run whose risk trigger still stood read
+  as having no trigger, whose silence had been breached read as quiet, and
+  whose authority had been consumed read as clear. Each is the same
+  archive-blindness family as #1186, #1172, #1128, #1126 and #1072, but these
+  three change the verdict itself rather than a display, and every one of them
+  degrades toward less caution: `rollback` became `request_human`, a breach
+  count fell to zero, and a block the gate still enforces stopped being
+  reported. All three now fold the shared `read_all_events` history the rest
+  of `assess` already fetched, so a signal recorded before the anchor still
+  contributes as if compaction had never happened.
+
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
