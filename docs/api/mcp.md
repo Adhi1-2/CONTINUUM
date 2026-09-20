@@ -69,6 +69,26 @@ host's PATH and spawn cwd. Install is idempotent and repoints a moved
 virtualenv; `continuum mcp remove` deletes only the entries install wrote.
 See [the CLI reference](cli.md#mcp) for the flags.
 
+#### The registration lifecycle
+
+Registration is written once and then has to survive everything that happens
+to an install afterwards. That lifecycle is defined rather than left
+ambiguous (issue #841), because every row is a real failure mode a user would
+otherwise diagnose by hand:
+
+| You did                                 | What happens to the registration                                                                                                                                                               |
+| --------------------------------------- | ------------------------------------------------                                                                                                                                               |
+| `pip install -U "continuum-agent[mcp]"` | The venv path or interpreter may change; re-run `continuum mcp install` to repoint it in place. No duplicate entry is created: install recognises the entry it wrote and replaces the command. |
+| Moved the project, renamed the venv     | Same as an upgrade: the baked path is stale, re-run `continuum mcp install`. `continuum mcp doctor` reports the stale resolution as a failure.                                                 |
+| `continuum mcp install` again           | Idempotent. An unchanged install rewrites the same values; a moved one repoints. Nothing is duplicated.                                                                                        |
+| `continuum mcp remove`                  | Deletes the entries install wrote and recognises; a foreign or hand-edited entry under the same name is left alone.                                                                            |
+| `pip uninstall continuum-agent`         | Removes the code; the registration survives and now points at nothing. Run `continuum mcp remove` to clear it, so a host does not keep trying to spawn a server that no longer exists.         |
+
+Re-running `install` after any of the first three rows is the documented
+remediation and is always safe, which is what makes the command usable from a
+setup script: it never has to be guarded with "only if not already
+installed".
+
 ### The committed `.mcp.json`
 
 Claude Code also discovers the server from the project's `.mcp.json`, which
