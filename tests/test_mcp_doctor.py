@@ -428,6 +428,43 @@ def test_the_handshake_keeps_stderr_written_after_the_read_deadline() -> None:
     )
 
 
+def test_the_handshake_attributes_a_server_that_exits_as_it_gives_up() -> None:
+    """A dying child's exit code reaches the report, not just its timeout (issue #835).
+
+    The read deadline fires the instant stdout goes quiet, and a server that
+    is dying -- a fast-failing one closes stdout and exits within
+    milliseconds, a slow one holds both open until it gives up -- is often
+    still alive in that instant, before the OS has reaped it. An immediate
+    ``poll()`` then reports a live process for a server that is already
+    going, which hides the exit code that distinguishes ``CONNECTION_CLOSED``
+    from a server that is genuinely wedged, and with it the stderr tail that
+    names the cause. That is the failure the doctor exists to diagnose.
+    ``close`` waits for the child to terminate before the failure is
+    reported, so both are read from a process that is done.
+
+    This makes the window deterministic rather than hoping a fast child loses
+    the race: the child is alive when the deadline fires and exits while
+    ``close`` waits, which is the same code path a millisecond-scale failure
+    takes, on any machine speed.
+    """
+    body = (
+        "import sys, time\n"
+        "time.sleep(1.5)\n"
+        "sys.stderr.write('error: the MCP server needs the optional mcp "
+        "dependency\\n')\n"
+        "sys.exit(3)\n"
+    )
+    finding, _ = _check(_fake_server(body), timeout=1.0)
+
+    assert finding["status"] == "fail"
+    # If poll() ran before close() waited for the child, it would be None at
+    # the deadline and this clause would be unreachable: the report would say
+    # only "no response within the deadline".
+    assert "exited with code 3 before the handshake" in finding["detail"]
+    assert "this is what the host reports as CONNECTION_CLOSED" in finding["detail"]
+    assert "the MCP server needs the optional mcp dependency" in finding["detail"]
+
+
 def test_the_handshake_reports_a_command_that_cannot_spawn(tmp_path: Path) -> None:
     """No spawnable command is itself a finding, not an exception.
 
