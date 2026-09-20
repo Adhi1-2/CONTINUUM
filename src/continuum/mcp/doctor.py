@@ -174,6 +174,10 @@ class _ServerProbe:
         self.wire_framing: str | None = None
         self._errors: list[str] = []
         self._id = 0
+        #: Bytes already read past the last returned frame. One ``os.read`` can
+        #: deliver several frames at once, so the surplus is kept for the next
+        #: ``_read_line`` instead of being dropped.
+        self._inbox: bytes = b""
         self.proc = subprocess.Popen(
             command + ["--db", db_path],
             stdin=subprocess.PIPE,
@@ -221,10 +225,17 @@ class _ServerProbe:
             return None  # deadline: "server never became ready"
 
     def _read_line(self) -> str | None:
-        """Read one frame, or None on timeout/EOF, bounded by ``timeout``."""
-        buffer = b""
+        """Read one frame, or None on timeout/EOF, bounded by ``timeout``.
+
+        Bytes past the first newline are kept in ``self._inbox`` rather than
+        discarded: one ``os.read`` routinely returns more than a frame, because
+        the server writes its response and any notification back to back and
+        the pipe coalesces whatever was written between reads. Throwing the
+        tail away would drop the frame a later request is waiting for and the
+        report would name a timeout the server never caused.
+        """
         deadline = time.monotonic() + self.timeout
-        while b"\n" not in buffer:
+        while b"\n" not in self._inbox:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None  # timeout: "server never became ready"
@@ -234,8 +245,9 @@ class _ServerProbe:
             chunk = self._read_chunk(deadline)
             if not chunk:
                 return None  # timeout or EOF: the server closed the connection
-            buffer += chunk
-        line, _, _ = buffer.partition(b"\n")
+            self._inbox += chunk
+        line, sep, rest = self._inbox.partition(b"\n")
+        self._inbox = rest if sep else b""
         self._observe_framing(line)
         return line.decode("utf-8", errors="replace")
 

@@ -465,6 +465,54 @@ def test_the_handshake_attributes_a_server_that_exits_as_it_gives_up() -> None:
     assert "the MCP server needs the optional mcp dependency" in finding["detail"]
 
 
+def test_a_frame_coalesced_with_a_notification_is_not_lost() -> None:
+    """Bytes past the first newline belong to the next frame (issue #835).
+
+    A server commonly writes a notification and the response back to back,
+    and one ``os.read`` then returns both at once, because a pipe coalesces
+    whatever was written between reads. ``_read_line`` split on the first
+    newline and threw the rest away, so the notification's frame was dropped
+    and the response after it never arrived: the report said the server never
+    answered one that had. The surplus is kept in an inbox for the next read.
+
+    The fake server writes the notification and the answer in a single
+    ``sys.stdout.write`` with one flush, which makes one read deliver both on
+    every platform and at any machine speed -- no timing to win or lose. The
+    notification is skipped by ``request`` (its id is not ours), which is what
+    makes the dropped frame fatal: the answer it discards is the only one sent.
+    """
+    body = (
+        "import json, sys\n"
+        "while True:\n"
+        "    line = sys.stdin.readline()\n"
+        "    if not line:\n"
+        "        break\n"
+        "    request = json.loads(line)\n"
+        "    if 'id' not in request:\n"
+        "        continue  # the client's own notification, nothing to answer\n"
+        "    notification = json.dumps(\n"
+        "        {'jsonrpc': '2.0', 'method': 'notifications/message',\n"
+        "         'params': {'level': 'info'}}\n"
+        "    )\n"
+        "    if request['method'] == 'initialize':\n"
+        "        result = {'serverInfo': {'name': 'coalesced', 'version': '1'},\n"
+        "                  'protocolVersion': '2024-11-05', 'capabilities': {}}\n"
+        "    else:\n"
+        "        result = {'tools': [{'name': 'continuum_ping'}]}\n"
+        "    answer = json.dumps(\n"
+        "        {'jsonrpc': '2.0', 'id': request['id'], 'result': result}\n"
+        "    )\n"
+        "    # One write, one flush: one os.read returns both frames.\n"
+        "    sys.stdout.write(notification + '\\n' + answer + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+    finding, _ = _check(_fake_server(body), timeout=3.0)
+
+    assert finding["status"] == "pass", finding.get("detail")
+    assert finding["server"] == "coalesced"
+    assert finding["tools"] == ["continuum_ping"]
+
+
 def test_the_handshake_reports_a_command_that_cannot_spawn(tmp_path: Path) -> None:
     """No spawnable command is itself a finding, not an exception.
 
