@@ -117,6 +117,34 @@ def test_module_fallback_when_no_console_script_exists(
     assert entry["args"][:3] == ["-u", "-m", "continuum.mcp"]
 
 
+def test_a_script_on_path_but_not_beside_the_interpreter_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no sibling script, PATH's answer is what gets baked.
+
+    The sibling lookup misses whenever the interpreter has no console script
+    beside it (a base interpreter with the package's scripts elsewhere, or a
+    checkout driven through ``python -m``), and that is the case where PATH
+    resolution is the thing doing the work. What it resolves is still an
+    absolute command, so it is still safe to bake.
+    """
+    monkeypatch.chdir(tmp_path)
+    on_path = tmp_path / "elsewhere" / ("continuum-mcp.exe" if os.name == "nt" else "continuum-mcp")
+    on_path.parent.mkdir()
+    on_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(mcp_install, "_sibling_script", lambda: None)
+    monkeypatch.setattr(mcp_install.shutil, "which", lambda name: str(on_path))
+    settings = tmp_path / "claude.json"
+
+    code, out, err = _install(settings)
+    assert code == ExitCode.OK, err
+
+    payload = json.loads(out)
+    assert payload["form"] == "script"
+    assert payload["command"] == [str(on_path)]
+    assert _local_entry(settings)["command"] == str(on_path)
+
+
 def test_missing_extra_refuses_to_write_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,6 +241,107 @@ def test_remove_deletes_only_what_install_wrote(
     code, out, err = run("--json", "mcp", "remove", "--settings", str(settings))
     assert code == ExitCode.OK, err
     assert json.loads(out)["removed"] is False
+
+
+def test_remove_prunes_the_containers_it_emptied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remove leaves the file as if the install had never happened.
+
+    A local-scope registration sits three containers deep (``projects`` ->
+    this project -> ``mcpServers``), a project-scope one two (``mcpServers``).
+    When our entry is the only thing in all of them, all of them go; the
+    alternative is a per-user settings file left permanently holding an empty
+    project keyed by an absolute path, which is exactly the kind of residue a
+    user notices and files a bug about.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = tmp_path / "claude.json"
+
+    code, _, err = _install(settings)
+    assert code == ExitCode.OK, err
+    assert "projects" in json.loads(settings.read_text(encoding="utf-8"))
+
+    code, out, err = run("--json", "mcp", "remove", "--settings", str(settings))
+    assert code == ExitCode.OK, err
+    assert json.loads(out)["removed"] is True
+    assert settings.read_text(encoding="utf-8") == "{}\n"
+
+    # Project scope prunes its own container the same way.
+    committed = tmp_path / ".mcp.json"
+    code, _, err = run("--json", "mcp", "install", "--scope", "project")
+    assert code == ExitCode.OK, err
+    assert "mcpServers" in json.loads(committed.read_text(encoding="utf-8"))
+
+    code, out, err = run("--json", "mcp", "remove", "--scope", "project")
+    assert code == ExitCode.OK, err
+    assert json.loads(out)["removed"] is True
+    assert committed.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_remove_is_a_quiet_noop_when_the_settings_file_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing from a file that was never written reports nothing to fix.
+
+    The command is documented as safe to run unconditionally from a setup
+    script, so the nothing-registered state has to be a clean no-op rather
+    than a "file not found" the caller has to guard for.
+    """
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "claude.json"
+
+    code, out, err = run("--json", "mcp", "remove", "--settings", str(missing))
+
+    assert code == ExitCode.OK, err
+    assert json.loads(out)["removed"] is False
+    assert not missing.exists()
+
+
+def test_a_settings_file_the_command_cannot_read_is_never_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed file is reported, not recreated.
+
+    The settings files are hand-edited and hold unrelated configuration, so
+    every shape that is not the one expected raises instead of being
+    replaced: silently recreating a file a typo broke would trade a one-line
+    fix for a whole settings file gone. This is the same contract as the
+    foreign-entry case above, one layer down -- the file itself, not an entry
+    in it.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = tmp_path / "claude.json"
+
+    # Not JSON at all.
+    settings.write_text("{not json", encoding="utf-8")
+    code, _, err = _install(settings)
+    assert code == ExitCode.ERROR
+    assert "not valid JSON" in err
+    assert settings.read_text(encoding="utf-8") == "{not json"
+
+    # Valid JSON, but not an object.
+    settings.write_text("[]\n", encoding="utf-8")
+    code, _, err = _install(settings)
+    assert code == ExitCode.ERROR
+    assert "does not contain a JSON object" in err
+    assert settings.read_text(encoding="utf-8") == "[]\n"
+
+    # An object, but a container the registration needs is taken. Each shape is
+    # built as a value and serialised, never interpolated into a JSON string:
+    # a project key is an absolute path, and on Windows its backslashes would
+    # make the hand-rolled string invalid JSON.
+    cwd = str(Path.cwd())
+    for scope, contents in (
+        ("project", {"mcpServers": ["not a dict"]}),
+        ("local", {"projects": "a string"}),
+        ("local", {"projects": {cwd: "not a dict"}}),
+        ("local", {"projects": {cwd: {"mcpServers": ["not a dict"]}}}),
+    ):
+        settings.write_text(json.dumps(contents), encoding="utf-8")
+        code, _, err = _install(settings, "--scope", scope)
+        assert code == ExitCode.ERROR, (scope, contents)
+        assert "is not an object" in err, (scope, contents)
 
 
 def test_remove_leaves_the_committed_registration_alone(
@@ -353,6 +482,11 @@ def test_project_scope_writes_the_shared_mcp_json(
         # Bare name (what CONNECTION_CLOSED usually means) and garbage.
         ({"command": "continuum-mcp", "args": ["--db", "/proj/continuum.db"]}, False),
         ({"command": "/venv/bin/continuum-mcp"}, False),
+        # Absolute command and db, but the args are not all strings; a
+        # hand-edit that drops a value into args must not become deletable.
+        ({"command": "/venv/bin/continuum-mcp", "args": ["--db", None]}, False),
+        # No --db at all: ours always bakes one, so this is not ours.
+        ({"command": "/venv/bin/continuum-mcp", "args": []}, False),
         ("not even a dict", False),
     ],
 )
