@@ -134,7 +134,7 @@ All notable changes to this project are documented here. The format follows
   `docs/index.html` stated 2,163 tests and 45 CLI commands while the suite
   collected 2,401 and the parser built 46 -- the figures a first-time visitor
   sees were the oldest in the repo, and nothing noticed, because every existing
-  guard reads markdown. The page now states 2,397 tests (the README canonical
+  guard reads markdown. The page now states 2,452 tests (the README canonical
   figure the rest of the docs agree on) and 46 commands, and two guards now
   read the page: `tests/test_docs_counts.py` treats it as a counted file, so
   its test figure must agree with every markdown figure exactly, and
