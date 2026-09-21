@@ -100,7 +100,7 @@ All notable changes to this project are documented here. The format follows
   `budgets.__all__` with no consumer anywhere in the repo. Every refusal site
   (`cli/main.py`, `mcp/server.py`, `actions/ledger.py`) refuses and returns;
   none computes or applies a delay, and the module's own docstring states
-  CONTINUUM never retries anything itself — it counts and gates. The helper
+  CONTINUUM never retries anything itself; it counts and gates. The helper
   shipped speculatively with #240 ("ships as a pure exponential+cap helper;
   CONTINUUM never retries itself") and no caller arrived in the year since.
   Removed with its tests. Recoverable from history (6217a65) if a real
