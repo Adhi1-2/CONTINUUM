@@ -8,6 +8,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Compacting one run no longer makes the action index read another run's
+  writes as dirty (#1322).** `action_index_drift` compares the stored
+  projection against a canonical fold of the log, and the fold treated
+  `events_archive` and `events` as two segments -- everything archived ranked
+  below everything live. That holds inside a single run, where the archive is
+  its own prefix, but not across runs: while one run compacts, others keep
+  appending, so a write made *later* in wall-clock time could sit in the
+  archive below an *earlier* live write. The projection then stopped
+  reproducing the number the incremental writer had stored and `verify`
+  reported a dirty index on a store nothing had tampered with, until
+  `rebuild_action_index` was run. The fold now merges the two tables into one
+  stream ordered by `(timestamp, run_id, sequence)`, and the number stored in
+  `updated_seq` is epoch microseconds of the event's own timestamp rather than
+  a row position or a sequence value -- both of which compaction reassigns,
+  since it moves rows between tables and deletes the originals. No schema
+  change is required: `timestamp` was already the one global write-order
+  column that survives the archive move unchanged.
+
+  A store whose `action_index` rows were written by an earlier build keep the
+  old numbers until they are rewritten; on such a store `drift` still reads
+  non-zero, and `continuum verify --index --repair-index` (or any
+  `rebuild_action_index` call) brings them onto the new scale in one pass. The
+  incremental writer, both backfills, and both folds share one helper,
+  `continuum.storage.actionindex.index_order_for`, so the three cannot drift
+  apart in what number they assign.
+
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
   arguments are caller-controlled noise plus the real resource, so keeping the
