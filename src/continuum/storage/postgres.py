@@ -669,11 +669,17 @@ class PostgresStorage(Storage):
         return [self._row_to_event(row) for row in rows]
 
     def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
-        """Indexed cross-run ledger lookup (issue #216)."""
+        """Indexed cross-run ledger lookup (issue #216).
+
+        ``key`` is the projection's primary key, so the lookup matches at most
+        one row and no ordering is needed to choose between candidates -- the
+        ``ORDER BY updated_seq DESC`` that used to be here ranked a single row,
+        which is why its numbering could drift from the fold's without ever
+        changing an answer (issue #1321).
+        """
         with self._read():
             row = self._connection.execute(
-                "SELECT action_json FROM action_index WHERE key = %s AND run_id != %s "
-                "ORDER BY updated_seq DESC LIMIT 1",
+                "SELECT action_json FROM action_index WHERE key = %s AND run_id != %s LIMIT 1",
                 (key, exclude_run),
             ).fetchone()
         if row is None:
@@ -686,49 +692,65 @@ class PostgresStorage(Storage):
             ) from exc
 
     def rebuild_action_index(self) -> int:
-        """Recompute the whole index from the log (global key space).
+        """Recompute the whole index from the log; returns corrected rows.
 
-        Live keys take fresh sequence values in fold order rather than the
-        fold's merged position: the position counts the non-action events the
-        sequence skips, so a rebuilt row and the next ``nextval`` were on
-        different scales and the store re-drifted with every action written
-        afterwards (issue #1321). Archived keys keep the fold's negative
-        position, which is already below every value the sequence will ever
-        hand out and already in fold order.
+        Mirrors the SQLite engine: the fold's own position is written back for
+        every row, and the correction count is the drift that called for the
+        repair, measured the same way :meth:`action_index_drift` measures it.
+        This used to return ``0`` unconditionally while the repair ran, so the
+        same corruption reported "1 row(s) corrected" on one engine and
+        "0 row(s) corrected" on the other (#1267).
+
+        No sequence values are minted here. Rebuilding used to take one
+        ``nextval`` per live key outside the write lock, which is a round trip
+        per key on the shared autocommit connection and widens the window
+        between the fold and its DELETE; a concurrent writer's row landing in
+        that window is deleted and not re-folded, so the projection silently
+        loses a live key. Minting values was only ever worthwhile to keep the
+        ordering :meth:`foreign_action` used to apply, and that ordering ranks
+        a single row, so the cost bought nothing (issue #1321).
         """
         canonical = self._canonical_index_rows()
-        rows: list[tuple[str, str, str, str, int, str]] = []
-        for key, (entry, order) in canonical.items():
-            seq = order if order < 0 else self._next_index_ord()
-            rows.append((key, entry[1], entry[2], entry[3], seq, entry[4]))
         with self._write():
+            before = {
+                r["key"]: (int(r["updated_seq"]), r["status"], r["action_json"])
+                for r in self._connection.execute(
+                    "SELECT key, updated_seq, status, action_json FROM action_index"
+                ).fetchall()
+            }
             self._connection.execute("DELETE FROM action_index")
             # psycopg's Connection has no executemany; the cursor does.
             with self._connection.cursor() as cur:
                 cur.executemany(
                     "INSERT INTO action_index(key, run_id, action_id, status, "
                     "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s)",
-                    rows,
+                    [
+                        (key, entry[1], entry[2], entry[3], seq, entry[4])
+                        for key, (entry, seq) in canonical.items()
+                    ],
                 )
-        return 0
+        after = {
+            key: (seq, entry[3], entry[4]) for key, (entry, seq) in canonical.items()
+        }
+        return index_drift_count(after, before)
 
     def action_index_drift(self) -> int:
         """Count index rows that disagree with the log. Read-only.
 
         Store-wide by design, mirroring the SQLite engine: keys live in one
         namespace, so a run-scoped comparison would falsely flag rows owned
-        by another run's later write of the same key. Only the key set and
-        each row's status are compared: see
+        by another run's later write of the same key. The key set and each
+        row's contents are compared: see
         :func:`~continuum.storage.actionindex.index_drift_count`.
         """
         expected = {
-            key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
+            key: (seq, entry[3], entry[4]) for key, (entry, seq) in self._canonical_index_rows().items()
         }
         with self._read():
             stored = {
-                r["key"]: (int(r["updated_seq"]), r["status"])
+                r["key"]: (int(r["updated_seq"]), r["status"], r["action_json"])
                 for r in self._connection.execute(
-                    "SELECT key, updated_seq, status FROM action_index"
+                    "SELECT key, updated_seq, status, action_json FROM action_index"
                 ).fetchall()
             }
         return index_drift_count(expected, stored)

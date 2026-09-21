@@ -569,11 +569,15 @@ class SQLiteStorage(Storage):
 
         O(log n) via the primary key instead of folding every run's events.
         The newest row wins, matching the fold's last-write-per-key rule.
+        ``key`` is the primary key, so the lookup matches at most one row and
+        no ordering is needed to choose the newest -- the ``ORDER BY
+        updated_seq DESC`` that used to be here ranked a single row, which is
+        why its numbering could drift from the fold's without changing an
+        answer (issue #1321).
         """
         with self._read() as conn:
             row = conn.execute(
-                "SELECT action_json FROM action_index WHERE key = ? AND run_id != ? "
-                "ORDER BY updated_seq DESC LIMIT 1",
+                "SELECT action_json FROM action_index WHERE key = ? AND run_id != ? LIMIT 1",
                 (key, exclude_run),
             ).fetchone()
         if row is None:
@@ -590,17 +594,20 @@ class SQLiteStorage(Storage):
 
         The projection is keyed globally, so drift is a store-wide property:
         a run-scoped comparison would falsely flag rows owned by another
-        run's later write of the same key. Only the key set and each row's
-        status are compared: see
+        run's later write of the same key. The key set and each row's contents
+        are compared: see
         :func:`~continuum.storage.actionindex.index_drift_count`.
         """
         expected = {
-            key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
+            key: (seq, entry[3], entry[4])
+            for key, (entry, seq) in self._canonical_index_rows().items()
         }
         with self._read() as conn:
             stored = {
-                r["key"]: (r["updated_seq"], r["status"])
-                for r in conn.execute("SELECT key, updated_seq, status FROM action_index")
+                r["key"]: (r["updated_seq"], r["status"], r["action_json"])
+                for r in conn.execute(
+                    "SELECT key, updated_seq, status, action_json FROM action_index"
+                )
             }
         return index_drift_count(expected, stored)
 
@@ -617,8 +624,10 @@ class SQLiteStorage(Storage):
         canonical = self._canonical_index_rows()
         with self._write() as conn:
             before = {
-                r["key"]: (r["updated_seq"], r["status"])
-                for r in conn.execute("SELECT key, updated_seq, status FROM action_index")
+                r["key"]: (r["updated_seq"], r["status"], r["action_json"])
+                for r in conn.execute(
+                    "SELECT key, updated_seq, status, action_json FROM action_index"
+                )
             }
             conn.execute("DELETE FROM action_index")
             conn.executemany(
@@ -629,7 +638,7 @@ class SQLiteStorage(Storage):
                     for key, (entry, seq) in canonical.items()
                 ],
             )
-        after = {key: (seq, entry[3]) for key, (entry, seq) in canonical.items()}
+        after = {key: (seq, entry[3], entry[4]) for key, (entry, seq) in canonical.items()}
         return index_drift_count(after, before)
 
     def _canonical_index_rows(self) -> dict[str, tuple[tuple[str, str, str, str, str], int]]:

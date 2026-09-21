@@ -388,3 +388,45 @@ def test_repair_refuses_when_the_chain_fails(tmp_path: Path) -> None:
     assert body.get("action_index_repair") == "refused_chain_failed"
     # And the drift is reported as unknown rather than silently repaired.
     assert body["action_index_drift"] is None
+
+
+def test_a_lost_row_counts_once_not_twice(store: SQLiteStorage) -> None:
+    """A row the projection dropped is one row of drift, not two (review 1324).
+
+    ``index_drift_count`` used to fall back to a default that never matched a
+    real status, so a key present in the fold but absent from the projection
+    was counted by the ``missing`` term *and* again by the ``changed`` term.
+    ``verify --index`` then reported two rows of drift for one lost row, and
+    the rebuild reported two corrections for one repair.
+    """
+    ledger = make_run(store, "run_1")
+    outcomes = [ledger.claim("send_invoice", {}, key=f"invoice:{n}") for n in (1, 2)]
+    assert store.action_index_drift() == 0
+
+    store._connection.execute("DELETE FROM action_index WHERE key = ?", (str(outcomes[0].key),))
+    assert store.action_index_drift() == 1, "one lost row is one row of drift"
+    assert store.rebuild_action_index() == 1, "one lost row is one correction"
+    assert store.action_index_drift() == 0
+
+
+def test_a_rewritten_action_json_is_drift(store: SQLiteStorage) -> None:
+    """``action_json`` is what the idempotency guard acts on, so a rewritten
+    row is a wrong answer rather than a cosmetic mismatch (review 1324).
+
+    The column embeds ``run_id`` and ``action_id``, so comparing it covers a
+    tamper of either of those too. Renumbering the row alone is still clean.
+    """
+    ledger = make_run(store, "run_1")
+    outcome = ledger.claim("send_invoice", {}, key="invoice:1")
+    assert store.action_index_drift() == 0
+
+    from continuum.actions.idempotency import idempotency_key
+
+    key = idempotency_key("send_invoice", None, scope="run_1", key="invoice:1")
+    store._connection.execute("UPDATE action_index SET action_json = '{}' WHERE key = ?", (key,))
+    assert store.action_index_drift() == 1
+    assert store.rebuild_action_index() == 1
+    refreshed = store.foreign_action(str(key), exclude_run="nobody")
+    assert refreshed is not None, "the repair restored the row the guard reads"
+    assert refreshed.status is ActionStatus.STARTED
+    assert store.action_index_drift() == 0

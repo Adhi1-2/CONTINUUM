@@ -64,16 +64,36 @@ All notable changes to this project are documented here. The format follows
   the fold still could not reproduce. Both engines shared the comparison and
   both were affected, contrary to the issue's note that SQLite was already
   correct; they now share one helper, `index_drift_count` in
-  `src/continuum/storage/actionindex.py`, which compares the key set and each
-  row's status and deliberately ignores the sequence value. The omission costs
-  nothing, because the value cannot affect an answer: `key` is the projection's
-  primary key, so the `ORDER BY updated_seq DESC LIMIT 1` that consumes the
-  column is scoped to a single row and ranks nothing. The Postgres rebuild also
-  hands live keys fresh sequence values in fold order instead of writing the
-  fold's merged position, which was on a third scale and re-drifted the store
-  with every action written after a rebuild. The guard keeps its teeth: a row
-  whose status the log no longer produces is still drift, and is the failure
-  the tests now exercise.
+  `src/continuum/storage/actionindex.py`, which compares the key set, each
+  row's status and its embedded Action record, and deliberately ignores the
+  sequence value. That ordering has been removed rather than tolerated: `key`
+  is the projection's primary key, so the `ORDER BY updated_seq DESC LIMIT 1`
+  the Postgres and SQLite lookups applied is scoped to a single row and ranks
+  nothing, which is why the column could drift from the fold without ever
+  changing an answer. The Postgres rebuild no longer mints fresh sequence
+  values at all -- it writes the fold's own position back for every row, like
+  the SQLite engine, which removes one `nextval` round trip per live key taken
+  on the shared autocommit connection outside the write lock, a window in which
+  a concurrent writer's row could be deleted and lost rather than re-folded.
+  The guard keeps its teeth, and gains one: a row whose status the log no
+  longer produces is still drift, and comparing `action_json` catches a
+  rewritten Action record, which is the exact string `foreign_action` hands
+  back to the idempotency guard and so is a silent wrong answer rather than a
+  cosmetic mismatch.
+
+- **`action_index_drift` counts a lost row once, not twice (#1321).**
+  The shared helper's fallback for a key absent from the projection never
+  equalled a real status, so a key present in the fold but missing from the
+  index was counted by the `missing` term and again by the `changed` term.
+  `verify --index` reported two rows of drift for one lost row, and the
+  rebuild's "N row(s) corrected" doubled with it. The `changed` term now ranges
+  only over keys the projection still holds. Covered on both engines.
+
+- **Postgres `rebuild_action_index` reports the number of rows it corrected
+  (#1267).** It returned `0` unconditionally while the repair ran, so the same
+  corruption printed "1 row(s) corrected" on SQLite and "0 row(s) corrected"
+  on Postgres. It now returns the drift that called for the repair, measured
+  the same way `action_index_drift` measures it.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the

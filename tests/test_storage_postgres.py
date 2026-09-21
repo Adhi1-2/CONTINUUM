@@ -20,6 +20,17 @@ from continuum.models import ActionStatus, Origin, Run, RunStatus
 from continuum.storage.base import ConcurrentWriteError, RunNotFound
 from continuum.storage.postgres import PostgresStorage
 
+
+class _Abort(Exception):
+    """Sentinel raised inside a ``transaction()`` block to roll it back.
+
+    psycopg3 commits a ``transaction()`` block on a clean exit and rolls it
+    back on a propagating one, so raising this is how the tamper tests undo
+    their corruption. An ``assert`` that fails inside the block propagates
+    too, so the row is restored even when the test itself fails -- the
+    snapshot-and-restore this replaced only repaired the happy path.
+    """
+
 DSN = os.environ.get("CONTINUUM_TEST_POSTGRES_DSN")
 
 
@@ -255,20 +266,6 @@ def test_pg_compact_rejects_through_sequence_that_would_eat_the_anchor(
     assert storage.verify_events("pg_kg").ok is True
 
 
-_EVENT_COLUMNS = (
-    "run_id",
-    "sequence",
-    "event_id",
-    "type",
-    "timestamp",
-    "payload",
-    "causer_event_id",
-    "source",
-    "prev_hash",
-    "hash",
-)
-
-
 def test_pg_archive_tampering_fails_verify(storage: PostgresStorage) -> None:
     make_run(storage, "pg_kt", "tamper target")
     CheckpointManager(storage).checkpoint("pg_kt")
@@ -276,21 +273,23 @@ def test_pg_archive_tampering_fails_verify(storage: PostgresStorage) -> None:
 
     # The suite shares one database, so the tamper is undone afterwards: a
     # permanently corrupted archive makes every later store-wide check read
-    # dirty for a reason this test owns (issue #1321).
-    before = storage._connection.execute(
-        "SELECT payload FROM events_archive WHERE run_id = 'pg_kt' ORDER BY sequence LIMIT 1"
-    ).fetchone()["payload"]
-    storage._connection.execute(
-        "UPDATE events_archive SET payload = '{\"tampered\": true}' WHERE run_id = 'pg_kt'"
-    )
+    # dirty for a reason this test owns (issue #1321). psycopg commits a
+    # transaction() block on a clean exit and rolls it back on a propagating
+    # one, so the test raises to undo its own corruption -- which also restores
+    # the row when an assertion inside the block fails, where the
+    # snapshot-and-restore this replaced only repaired the happy path, and
+    # needs no knowledge of the row's current contents at all.
     try:
-        report = storage.verify_events("pg_kt")
-        assert report.ok is False
-        assert any(v.kind == "TAMPERED_CONTENT" for v in report.violations)
-    finally:
-        storage._connection.execute(
-            "UPDATE events_archive SET payload = %s WHERE run_id = 'pg_kt'", (before,)
-        )
+        with storage._connection.transaction():
+            storage._connection.execute(
+                "UPDATE events_archive SET payload = '{\"tampered\": true}' WHERE run_id = 'pg_kt'"
+            )
+            report = storage.verify_events("pg_kt")
+            assert report.ok is False
+            assert any(v.kind == "TAMPERED_CONTENT" for v in report.violations)
+            raise _Abort
+    except _Abort:
+        pass
 
 
 def test_pg_deleted_boundary_event_fails_verify(storage: PostgresStorage) -> None:
@@ -302,25 +301,22 @@ def test_pg_deleted_boundary_event_fails_verify(storage: PostgresStorage) -> Non
     # "sequence = (SELECT MIN(sequence) ... WHERE run_id = 'pg_kb')" takes that
     # sequence number out of every other run too, and the action index rows
     # those rows wrote survive as orphans the projection cannot explain.
-    row = storage._connection.execute(
-        f"SELECT {', '.join(_EVENT_COLUMNS)} FROM events WHERE run_id = 'pg_kb' AND sequence ="
-        " (SELECT MIN(sequence) FROM events WHERE run_id = 'pg_kb')"
-    ).fetchone()
-    storage._connection.execute(
-        "DELETE FROM events WHERE run_id = 'pg_kb' AND sequence ="
-        " (SELECT MIN(sequence) FROM events WHERE run_id = 'pg_kb')"
-    )
+    # Rolled back rather than re-inserted, for the same reason as the tamper
+    # above: an INSERT that has to enumerate the column list stops restoring
+    # the row the day a migration adds a NOT NULL column to events.
     try:
-        report = storage.verify_events("pg_kb")
-        assert report.ok is False
-        kinds = {v.kind for v in report.violations}
-        assert {"SEQUENCE_GAP", "BROKEN_CHAIN"} & kinds
-    finally:
-        storage._connection.execute(
-            f"INSERT INTO events ({', '.join(_EVENT_COLUMNS)}) VALUES"
-            " (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            tuple(row[column] for column in _EVENT_COLUMNS),
-        )
+        with storage._connection.transaction():
+            storage._connection.execute(
+                "DELETE FROM events WHERE run_id = 'pg_kb' AND sequence ="
+                " (SELECT MIN(sequence) FROM events WHERE run_id = 'pg_kb')"
+            )
+            report = storage.verify_events("pg_kb")
+            assert report.ok is False
+            kinds = {v.kind for v in report.violations}
+            assert {"SEQUENCE_GAP", "BROKEN_CHAIN"} & kinds
+            raise _Abort
+    except _Abort:
+        pass
 
 
 def test_pg_action_index_covers_the_archive_after_compaction(
@@ -372,28 +368,27 @@ def test_pg_drift_stays_zero_after_a_rebuild_and_further_actions(
 ) -> None:
     """A rebuilt store must stay converged as new actions arrive.
 
-    Rebuild used to write the fold's merged position, which is not the scale
-    the sequence hands out, so a rebuilt row could outrank an action written
-    after it -- the mis-ranking issue #1321 asks to confirm.
+    Rebuild writes the fold's own position back for every row, which is a
+    different scale from the sequence the incremental writer hands out. That
+    used to matter only because ``foreign_action`` ranked rows by that column;
+    the ranking is gone, the row a lookup reads is chosen by the primary key,
+    and the two scales meeting in one table changes no answer. What still has
+    to hold is convergence: a rebuilt store that then logs more actions must
+    not read dirty, and must not need rebuilding again.
     """
     make_run(storage, "pg_drift_b", "drift")
     ledger = ActionLedger(storage, "pg_drift_b")
     ledger.claim("process_doc", {}, key="doc:1")
     assert storage.action_index_drift() == 0
-    storage.rebuild_action_index()
+    assert storage.rebuild_action_index() == 0, "an intact store repairs nothing"
     assert storage.action_index_drift() == 0
     ledger.claim("process_doc", {}, key="doc:2")
     ledger.claim("process_doc", {}, key="doc:3")
     assert storage.action_index_drift() == 0
-    # The rebuilt rows still rank this run's writes in the order they happened.
-    keys = [
-        str(idempotency_key("process_doc", None, scope="pg_drift_b", key=f"doc:{n}"))
-        for n in (1, 2, 3)
-    ]
-    rows = storage._connection.execute(
-        "SELECT key FROM action_index WHERE run_id = 'pg_drift_b' ORDER BY updated_seq"
-    ).fetchall()
-    assert [r["key"] for r in rows] == keys
+    # Every claim the store made is still reachable through the projection.
+    for n in (1, 2, 3):
+        key = idempotency_key("process_doc", None, scope="pg_drift_b", key=f"doc:{n}")
+        assert storage.foreign_action(str(key), exclude_run="nobody") is not None
 
 
 def test_pg_a_status_the_log_does_not_support_is_still_drift(
@@ -413,6 +408,28 @@ def test_pg_a_status_the_log_does_not_support_is_still_drift(
     storage._connection.execute(
         "UPDATE action_index SET status = 'completed' WHERE key = %s", (key,)
     )
-    assert storage.action_index_drift() >= 1
-    storage.rebuild_action_index()
+    assert storage.action_index_drift() == 1
+    # The count the CLI prints is the drift that called for the repair, and it
+    # matches the number the SQLite engine prints for the same corruption
+    # (#1267): this used to return 0 while the repair ran.
+    assert storage.rebuild_action_index() == 1
     assert storage.action_index_drift() == 0
+
+
+def test_pg_a_lost_index_row_counts_once_and_is_repaired_once(
+    storage: PostgresStorage,
+) -> None:
+    """A row the projection lost is one row of drift on this engine too, not
+    two (review 1324). The drift helper's fallback counted a missing key in
+    both the ``missing`` and the ``changed`` term, so ``verify --index`` and
+    the rebuild's "N row(s) corrected" both doubled it."""
+    make_run(storage, "pg_drift_d", "drift")
+    ledger = ActionLedger(storage, "pg_drift_d")
+    outcomes = [ledger.claim("process_doc", {}, key=f"doc:{n}") for n in (1, 2)]
+    assert storage.action_index_drift() == 0
+
+    storage._connection.execute("DELETE FROM action_index WHERE key = %s", (str(outcomes[0].key),))
+    assert storage.action_index_drift() == 1
+    assert storage.rebuild_action_index() == 1
+    assert storage.action_index_drift() == 0
+    assert storage.foreign_action(str(outcomes[0].key), exclude_run="nobody") is not None
