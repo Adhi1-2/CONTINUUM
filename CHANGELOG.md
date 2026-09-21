@@ -71,6 +71,28 @@ All notable changes to this project are documented here. The format follows
   no product caller and still has none, so this documents the existing
   contract rather than altering it.
 
+- **The retry-budget gate now answers the same question `claim` does (#1080).**
+  `continuum_intercept_action` guards the run-level retry budget (#240) before
+  it calls `claim`, and the guard decided whether a claim needed a slot from the
+  *derived* idempotency key alone. `claim` can answer from a different key: the
+  drift-tolerant identity lookup recognises an already-recorded action when the
+  argument hash misses, and an unscoped key can be held by another run. Whenever
+  the two disagreed, the budget was counted against a key `claim` never records
+  under, and an exhausted allowance refused with "raise the limit" in front of
+  an answer that needed no retry at all. The settled set also omitted STARTED,
+  so a claim interrupted mid-flight -- the case a recovery is most likely to
+  meet first -- was gated as an attempt once its one slot was spent, and the run
+  was told to raise a budget that was working as intended instead of being told
+  an outcome is owed and unknown.
+
+  The three lookups `claim` performs are extracted into
+  `ActionLedger.resolve_prior` (exact key, then another run's record for an
+  unscoped key, then the identity fallback, skipped when the caller asserted its
+  own key), and the gate resolves through it. A claim is only counted as an
+  attempt when it opens a slot, and the count uses the stored key `claim`
+  settles against. Callers passing an explicit `key` are unaffected: no drift is
+  possible and the derived key is the stored key.
+
 ### Removed
 
 - **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
@@ -89,16 +111,39 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **The action index fold is ordered by wall-clock time across the archive
-  boundary, so a run's archived claim keeps outranking another run's later live
-  write of the same key (#1054).** Both engines folded the archive and the live
-  tail in one stream numbered per table, so an archived action claimed long ago
-  could outrank -- or be outranked by -- a newer live write of the same key
-  depending on which table's sequence happened to sort first, and
-  last-write-per-key was only true by accident. The fold now reads the archive
-  and the live tail as two ordered halves, archive first, with archived rows
-  given positions below every possible live value, so the ordering the fold
-  assumes is the ordering it gets on both backends.
+- **The action index fold orders an unscoped key's writes by wall-clock time
+  across the archive boundary, so a run's archived completion keeps outranking
+  another run's earlier live failure of the same key (#1054).** An unscoped key
+  lives in one store-wide namespace, but the fold iterated the whole
+  `events_archive` before every live row, on the reasoning that archived rows
+  predate live ones. That holds within a run, not across runs: once run A
+  completed a key that run B had failed earlier and run A then compacted, the
+  archive-first ordering ranked run B's stale failure above run A's completion,
+  and `rebuild_action_index`, the repair path, was what wrote the wrong row.
+  The next claim of that key saw `fresh: True` against a completed side effect
+  and re-fired it. Both engines now merge the archived and live streams on
+  timestamp, ties broken on `(run_id, sequence)` so the fold stays
+  deterministic, putting every row on one wall-clock timeline where
+  last-write-per-key is true order.
+- **`replay --upto` works on a compacted run instead of failing for every value
+  of `N` and blaming the operator for it (#1172).** `cmd_replay` read only the
+  live event tail, where `RUN_STARTED` no longer lives once a run is compacted,
+  so its guard rejected every `--upto` request and advised "increase `--upto`"
+  -- the one fix that cannot help, because the event had moved into the archive
+  rather than being excluded by the window. `--upto 999` failing on a run whose
+  head was 13 is what proved the message was wrong about the cause. The command
+  now windows the full history, archived prefix included, the way `cmd_events`
+  already does; `--upto` remains the bisection tool it is documented as, on the
+  long-lived runs compaction exists to serve. `_verify_against_stored` had the
+  same blind spot one function down: it re-derived the stored version's prefix
+  from `read_events(upto=source_sequence)`, which reads an empty log on a
+  compacted run because the prefix starts at sequence 1 and compaction moves
+  exactly that range. Left alone it would have reported every healthy
+  checkpoint as corrupt once the primary read was corrected, so both sites now
+  window `read_all_events`. `STATE_CHECKPOINTED` and `EVENT_LOG_ANCHORED` are
+  both non-projecting, so folding the archived prefix from genesis reaches the
+  same state the anchored path already produced. The guard is unchanged and
+  still fires when a window genuinely excludes `RUN_STARTED`.
 - **`resume --pinning` compares against the archived pinning, so a compacted
   run stops reporting every key as newly pinned (#1126).** The drift display
   folded the live event tail alone, and compaction moves the pinning-carrying
