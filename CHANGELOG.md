@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A padded argument token can no longer reset the authorization-bound retry
+  budget (#1052).** The bucket was derived from every argument token, and the
+  arguments are caller-controlled noise plus the real resource, so keeping the
+  idempotency key fixed while varying one throwaway field (a `trace_id`, a
+  request id) moved every retry into a fresh bucket at its full allowance. A
+  `budgets.json` cap of 2 that refused a third identical attempt stayed open
+  indefinitely while each retry carried a new token. `ActionLedger.claim` now
+  derives the bucket from the record the claim defers to when one exists, which
+  is the identity the ledger itself has already decided the attempt is, and
+  settlement paths already derived from those same stored arguments, so a retry
+  and its confirmation share one bucket by construction. Fresh-key minting for
+  a fixed resource still shares the bucket as before (#390, #413). A caller
+  minting both a fresh key and fresh noise per attempt presents no identity the
+  ledger can see and remains on the token fallback -- the documented residual,
+  since declaring such fields `volatile` at every call site is not a fix: a
+  caller that wants around the cap simply forgets to declare them.
+
 ### Changed
 
 - **The TUI `tree` view fetches the run once instead of twice (#1157).**
@@ -71,6 +90,22 @@ All notable changes to this project are documented here. The format follows
   both non-projecting, so folding the archived prefix from genesis reaches the
   same state the anchored path already produced. The guard is unchanged and
   still fires when a window genuinely excludes `RUN_STARTED`.
+- **`resume --pinning` compares against the archived pinning, so a compacted
+  run stops reporting every key as newly pinned (#1126).** The drift display
+  folded the live event tail alone, and compaction moves the pinning-carrying
+  `ACTION_RECORDED` into `events_archive` while the anchor marker that replaces
+  it carries no pinning at all. The fold therefore read `{}` as the run's
+  recorded identity and `pinning_drift({}, current)` called every key newly
+  pinned -- including on a run whose recorded pinning was byte-identical to the
+  one passed at resume. The wrong directions were exactly the ones an operator
+  would act on: a genuinely *changed* hash
+  rendered as "newly pinned" instead of "changed", hiding the previous value,
+  and a key that had been unpinned never rendered at all, because the
+  `unpinned (was ...)` line needs the old value the empty record could not
+  supply. The display is informational and never gated recovery (issue #241),
+  but it was wrong in the direction of hiding drift, which is the opposite of
+  what a drift report is for. `latest_pinning` now folds `read_all_events`, the
+  same history the assess (#1050) and watch (#1072) folds already read.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
@@ -100,6 +135,16 @@ All notable changes to this project are documented here. The format follows
   all its prose is rephrased, so that one pattern reads all six READMEs.
   `references/testing.md`, `references/install.md`, and the translated READMEs
   now carry the same figures as `README.md`.
+
+- **A consumed authority no longer downgrades a stricter recovery verdict
+  (#1146).** `RecoveryEngine.assess` overwrote the mode with
+  `REQUEST_HUMAN` whenever a consumed authority blocked resume, discarding an
+  `ABORT` or `ROLLBACK` the risk policy had already proposed — both strictly
+  more cautious, per the module's own "the engine always returns the maximum
+  proposed mode" invariant. The rationale still named the abort the verdict
+  no longer delivered. The block now escalates to `max(mode, REQUEST_HUMAN)`
+  instead of replacing it, so the authority raises the floor without
+  weakening the ceiling.
 
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
@@ -957,7 +1002,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,397 collected, ~2,320 passed, ~27 skipped on a minimal env).
+  (~2,452 collected, ~2,423 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses

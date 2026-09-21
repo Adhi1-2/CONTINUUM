@@ -1371,6 +1371,27 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             )
             return 2
         run_id = active.run_id
+    # Terminal runs have nothing to resume (#1197). Exit non-zero so
+    # `continuum resume && ./start-agent.sh` cannot continue onto a closed run.
+    run = storage.get_run(run_id)
+    if run.status in (
+        RunStatus.COMPLETED,
+        RunStatus.ABORTED,
+        RunStatus.FAILED,
+        RunStatus.CRASHED,
+    ):
+        msg = f"Run {run_id} is terminal ({run.status.value}); nothing to resume."
+        payload = {
+            "run_id": run_id,
+            "status": run.status.value,
+            "error": "terminal_run",
+            "message": msg,
+            "safe": False,
+        }
+        # Machine JSON on stdout (same as every other resume _emit); text stays human-readable.
+        _emit(payload, msg, as_json=args.json, stream=out)
+        # UNSAFE (30): run exists but resuming is not safe (distinct from NOT_FOUND / 2).
+        return ExitCode.UNSAFE
     engine = RecoveryEngine(storage, strict_unknown=not args.tolerate_unknown)
     decision = engine.assess(
         run_id,
@@ -1425,7 +1446,12 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
 
         try:
             current = normalize_pinning(json.loads(args.pinning))
-            recorded = latest_pinning(storage.read_events(run_id))
+            # The newest pinning is usually an archived ACTION_RECORDED: the
+            # fold must see the prefix compaction moved, or a compacted run
+            # reads {} as its recorded pinning and reports every key as newly
+            # pinned (#1126). Mirrors the assess (#1050) and watch (#1072)
+            # folds over the same history.
+            recorded = latest_pinning(storage.read_all_events(run_id))
             drift_lines = compute_drift(recorded, current)
             if drift_lines:
                 text += "\n\nPinning drift (informational):\n" + "\n".join(
