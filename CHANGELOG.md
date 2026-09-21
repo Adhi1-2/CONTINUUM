@@ -6,7 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A padded argument token can no longer reset the authorization-bound retry
+  budget (#1052).** The bucket was derived from every argument token, and the
+  arguments are caller-controlled noise plus the real resource, so keeping the
+  idempotency key fixed while varying one throwaway field (a `trace_id`, a
+  request id) moved every retry into a fresh bucket at its full allowance. A
+  `budgets.json` cap of 2 that refused a third identical attempt stayed open
+  indefinitely while each retry carried a new token. `ActionLedger.claim` now
+  derives the bucket from the record the claim defers to when one exists, which
+  is the identity the ledger itself has already decided the attempt is, and
+  settlement paths already derived from those same stored arguments, so a retry
+  and its confirmation share one bucket by construction. Fresh-key minting for
+  a fixed resource still shares the bucket as before (#390, #413). A caller
+  minting both a fresh key and fresh noise per attempt presents no identity the
+  ledger can see and remains on the token fallback -- the documented residual,
+  since declaring such fields `volatile` at every call site is not a fix: a
+  caller that wants around the cap simply forgets to declare them.
+
 ### Changed
+
+- **The `__all__` guard now walks the installed package instead of five
+  hand-listed modules (#1228).** `tests/test_module_all_exports.py` asserted
+  that names in `__all__` resolve by importing five modules by name, so a
+  rename that forgot `__all__` stayed green on the other 117 modules that
+  declare one. `test_all_symbols_exist_on_modules` now enumerates the package
+  with `pkgutil.walk_packages` and checks every module it finds (122 today,
+  against a floor of 90 so a walk that silently shrank to nothing fails
+  instead of passing vacuously), and `test_star_import_execution` covers the
+  same set, catching a module whose import has a side effect or a name that
+  shadows an earlier one. A second check, `__all__` equals the public names a
+  leaf module defines itself, is added per-module on a curated list: it
+  cannot hold package-wide, because aggregator modules (`continuum.actions`
+  re-exports all 15 of its entries from submodules) legitimately list names
+  they do not define and some modules hold a public name back on purpose
+  (`continuum.budgets` keeps `FALLBACK_MAX_ATTEMPTS` private to its own
+  defaulting). Both are per-module policy, so only modules that define their
+  whole surface are pinned.
 
 - **The TUI `tree` view fetches the run once instead of twice (#1157).**
   `family_lines` in `src/continuum/tui/model.py` called
@@ -52,48 +89,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **`action_index_drift` no longer reports a clean index as dirty (#1321).**
-  The store-wide drift check compared each index row's `updated_seq` against
-  the value a fresh fold of the log would have written, but the fold and the
-  incremental writer number rows on different scales by design. The fold counts
-  every row it walks while the writer consumes one sequence value per action
-  event, so a store whose first action was not also its first event read dirty
-  on the very first claim. Compaction re-numbers every archived row below every
-  live one, so a store that had compacted once read dirty on every audit
-  afterwards, and could not be repaired: rebuilding rewrote the same numbers
-  the fold still could not reproduce. Both engines shared the comparison and
-  both were affected, contrary to the issue's note that SQLite was already
-  correct; they now share one helper, `index_drift_count` in
-  `src/continuum/storage/actionindex.py`, which compares the key set, each
-  row's status and its embedded Action record, and deliberately ignores the
-  sequence value. That ordering has been removed rather than tolerated: `key`
-  is the projection's primary key, so the `ORDER BY updated_seq DESC LIMIT 1`
-  the Postgres and SQLite lookups applied is scoped to a single row and ranks
-  nothing, which is why the column could drift from the fold without ever
-  changing an answer. The Postgres rebuild no longer mints fresh sequence
-  values at all -- it writes the fold's own position back for every row, like
-  the SQLite engine, which removes one `nextval` round trip per live key taken
-  on the shared autocommit connection outside the write lock, a window in which
-  a concurrent writer's row could be deleted and lost rather than re-folded.
-  The guard keeps its teeth, and gains one: a row whose status the log no
-  longer produces is still drift, and comparing `action_json` catches a
-  rewritten Action record, which is the exact string `foreign_action` hands
-  back to the idempotency guard and so is a silent wrong answer rather than a
-  cosmetic mismatch.
-
-- **`action_index_drift` counts a lost row once, not twice (#1321).**
-  The shared helper's fallback for a key absent from the projection never
-  equalled a real status, so a key present in the fold but missing from the
-  index was counted by the `missing` term and again by the `changed` term.
-  `verify --index` reported two rows of drift for one lost row, and the
-  rebuild's "N row(s) corrected" doubled with it. The `changed` term now ranges
-  only over keys the projection still holds. Covered on both engines.
-
-- **Postgres `rebuild_action_index` reports the number of rows it corrected
-  (#1267).** It returned `0` unconditionally while the repair ran, so the same
-  corruption printed "1 row(s) corrected" on SQLite and "0 row(s) corrected"
-  on Postgres. It now returns the drift that called for the repair, measured
-  the same way `action_index_drift` measures it.
+- **`resume --pinning` compares against the archived pinning, so a compacted
+  run stops reporting every key as newly pinned (#1126).** The drift display
+  folded the live event tail alone, and compaction moves the pinning-carrying
+  `ACTION_RECORDED` into `events_archive` while the anchor marker that replaces
+  it carries no pinning at all. The fold therefore read `{}` as the run's
+  recorded identity and `pinning_drift({}, current)` called every key newly
+  pinned -- including on a run whose recorded pinning was byte-identical to the
+  one passed at resume. The wrong directions were exactly the ones an operator
+  would act on: a genuinely *changed* hash
+  rendered as "newly pinned" instead of "changed", hiding the previous value,
+  and a key that had been unpinned never rendered at all, because the
+  `unpinned (was ...)` line needs the old value the empty record could not
+  supply. The display is informational and never gated recovery (issue #241),
+  but it was wrong in the direction of hiding drift, which is the opposite of
+  what a drift report is for. `latest_pinning` now folds `read_all_events`, the
+  same history the assess (#1050) and watch (#1072) folds already read.
 
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
@@ -123,6 +134,16 @@ All notable changes to this project are documented here. The format follows
   all its prose is rephrased, so that one pattern reads all six READMEs.
   `references/testing.md`, `references/install.md`, and the translated READMEs
   now carry the same figures as `README.md`.
+
+- **A consumed authority no longer downgrades a stricter recovery verdict
+  (#1146).** `RecoveryEngine.assess` overwrote the mode with
+  `REQUEST_HUMAN` whenever a consumed authority blocked resume, discarding an
+  `ABORT` or `ROLLBACK` the risk policy had already proposed — both strictly
+  more cautious, per the module's own "the engine always returns the maximum
+  proposed mode" invariant. The rationale still named the abort the verdict
+  no longer delivered. The block now escalates to `max(mode, REQUEST_HUMAN)`
+  instead of replacing it, so the authority raises the floor without
+  weakening the ceiling.
 
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
@@ -980,7 +1001,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,397 collected, ~2,320 passed, ~27 skipped on a minimal env).
+  (~2,452 collected, ~2,423 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
