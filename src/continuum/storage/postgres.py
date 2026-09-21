@@ -624,9 +624,21 @@ class PostgresStorage(Storage):
         needs_fresh_anchor = lv is None or through_sequence is not None or lv.source_sequence < head
         if needs_fresh_anchor:
             try:
-                CheckpointManager(self).checkpoint(
+                manager = CheckpointManager(self)
+                # The anchor must project over full history: after an earlier
+                # compaction the live tail begins at the anchor markers with
+                # no RUN_STARTED, so a live-only fold would conclude the run
+                # never started (issue #648). Per-turn checkpoint evaluation
+                # deliberately keeps the cheaper live-tail read.
+                state = manager.project_current(run_id, full_history=True)
+                manager.checkpoint(
                     run_id,
+                    state=state,
                     force_version=True,
+                    # The anchor carries the environment the run's newest
+                    # checkpoint already recorded when none is supplied
+                    # (#1049): an environment-blind anchor makes every pinned
+                    # dependency UNKNOWN at the next assessment.
                     environment=self._anchor_environment(run_id, environment),
                 )
             except Exception as exc:
