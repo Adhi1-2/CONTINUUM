@@ -16,8 +16,8 @@ All notable changes to this project are documented here. The format follows
   for want of a snapshot to compare against. A run that resumed cleanly one
   moment before compaction downgraded to `REQUEST_HUMAN` one moment after,
   with nothing about the world having changed. Both engines now thread an
-  optional `environment` through `compact_run` — `continuum compact` captures
-  one from `--env` the way `continuum validate` does — and when the caller
+  optional `environment` through `compact_run`: `continuum compact` captures
+  one from `--env` the way `continuum validate` does, and when the caller
   supplies none, the anchor carries forward the environment the run's newest
   checkpoint already recorded, because compaction observes the world rather
   than changing it. A run with no recorded checkpoint still anchors with
