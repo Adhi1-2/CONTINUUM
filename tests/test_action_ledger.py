@@ -1191,3 +1191,45 @@ def test_reconciling_an_unknown_outcome_as_occurred_needs_no_prior_receipt(
     assert settled is not None
     assert settled.status is ActionStatus.COMPLETED
     assert settled.external_id == "found-it"
+
+
+def test_a_terminal_foreign_record_does_not_bypass_the_drift_fallback(
+    store: SQLiteStorage,
+) -> None:
+    """A FAILED record elsewhere leaves no live effect, so the local drift
+    fallback must still get its turn.
+
+    The old claim ordering ran ``_identity_match`` after setting a foreign
+    FAILED/COMPENSATED record aside, so a locally completed action under a
+    drifted key still deduplicated. When the lookups were extracted into
+    ``resolve_prior``, the foreign lookup returned immediately for any status,
+    and the fallback was never reached: the claim opened a fresh slot and
+    re-performed the effect, the exact duplicate-side-effect class this ledger
+    exists to prevent.
+    """
+    _seed_run(store, "runA")
+    _seed_run(store, "runB")
+    other = ActionLedger(store, "runA")
+    local = ActionLedger(store, "runB")
+
+    # Another run failed the same unscoped identity: no live effect there.
+    foreign = other.claim("send.invoice", {"invoice": "INV-9"}, scoped_to_run=False)
+    other.fail(foreign.key, "rejected before send", certain=True)
+
+    # This run already completed the same identity under a drifted key.
+    first = local.claim(
+        "send.invoice",
+        {"invoice_id": "INV-9", "target": "/tmp/outbox/INV-9.sent"},
+        scoped_to_run=False,
+    )
+    local.complete(first.key, external_id="EXT-9")
+
+    drifted = {"invoice": "INV-9"}
+    resolved = local.resolve_prior("send.invoice", drifted, scoped_to_run=False)
+    assert resolved is not None, "the local completed record must still be found"
+    assert resolved[0] == first.key, "must be the stored key, not the derived one"
+    assert resolved[1].status is ActionStatus.COMPLETED
+
+    replay = local.claim("send.invoice", drifted, scoped_to_run=False)
+    assert not replay.fresh, "the completed effect must not be re-performed"
+    assert replay.external_id == "EXT-9"

@@ -74,6 +74,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`resolve_prior` keeps the drift fallback reachable when a foreign record is
+  terminal (#1080).** Extracting claim's lookups into `resolve_prior` returned a
+  foreign FAILED/COMPENSATED record immediately, but the claim ordering it was
+  extracted from set such a record aside and still ran the drift-tolerant
+  identity match: an unscoped claim whose local run had already completed the
+  same identity under a drifted key deduplicated against it. The early return
+  dropped that fallback, so the claim opened a fresh slot and re-performed the
+  effect, the exact duplicate-side-effect class the ledger exists to prevent.
+  The foreign lookup now defers only to a live or undecided effect
+  (COMPLETED, STARTED, UNKNOWN), and a terminal one falls through to the
+  identity match, matching claim's original ordering.
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,

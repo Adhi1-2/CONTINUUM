@@ -621,14 +621,12 @@ class ActionLedger:
         retry budget (issue #240) is evaluated at the intercept site, before
         claim opens a slot; resolving under the derived key while claim answers
         from another one let an exhausted budget suppress the very dedup and
-        reconciliation answers the gate exists to pass through (issue #1080).
-
-        In order: the exact idempotency key; then, for an unscoped claim, another
-        run's record under the same run-global key (issue 34); then, only when the
-        caller asserted no identity of its own, the drift-tolerant
-        :meth:`_identity_match`. An explicit key *is* the identity, so the
-        fallbacks are skipped for it: no drift is possible, and the derived key is
-        the stored key.
+        reconciliation answers the gate exists to pass through (issue #1080).        In order: the exact idempotency key; then, for an unscoped claim, another
+        run's record under the same run-global key (issue 34) when it holds a
+        live or undecided effect; then, only when the caller asserted no identity
+        of its own, the drift-tolerant :meth:`_identity_match`. An explicit key
+        *is* the identity, so the fallbacks are skipped for it: no drift is
+        possible, and the derived key is the stored key.
 
         Returns ``(stored_key, action)``. For an identity match the key is the
         *stored* key rather than the freshly-derived one, because that is the key
@@ -646,9 +644,17 @@ class ActionLedger:
         existing = self.get(idem)
         if existing is None and not scoped_to_run:
             # The local log has no such action, but an unscoped key claims
-            # global identity, so another run may already hold it.
+            # global identity, so another run may already hold it. Defer only
+            # to a live or undecided effect: a FAILED/COMPENSATED foreign
+            # record leaves nothing standing, and returning it here would
+            # bypass the drift-tolerant fallback below, which the claim
+            # ordering this extraction preserves kept in the path (issue 34).
             foreign = self._foreign_action(idem)
-            if foreign is not None:
+            if foreign is not None and foreign.status in (
+                ActionStatus.COMPLETED,
+                ActionStatus.STARTED,
+                ActionStatus.UNKNOWN,
+            ):
                 return IdempotencyKey(idem), foreign
         if existing is not None:
             return IdempotencyKey(idem), existing
