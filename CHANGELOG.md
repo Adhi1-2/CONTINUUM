@@ -111,7 +111,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **The Postgres backend now stores and returns a fork's `parent_run_id`
+- **CITATION.cff states the released version, and the bump sites are documented
+  (#1120).** The citation file pinned `0.1.0` while the package was `0.1.2`, so
+  anyone citing the project recorded a version two releases stale, and
+  `CONTRIBUTING.md` still said the version lived in two places guarded by
+  checking that "will be added" -- the guard has run in CI since #838 and reads
+  four sites. The file now says `0.1.2`, the paragraph names all five sites a
+  bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
+  release tag), and `tests/test_version_drift.py` checks the citation file
+  alongside the README pins so the drift cannot recur- **The Postgres backend now stores and returns a fork's `parent_run_id`
   (#1079).** Both `create_run` and `create_run_started` inserted only the six
   columns the schema had before lineage existed, and `_row_to_run` never read
   the column back, so `runs.parent_run_id` was declared with a foreign key to
