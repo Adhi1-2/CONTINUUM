@@ -417,7 +417,7 @@ def test_a_rewritten_action_json_is_drift(store: SQLiteStorage) -> None:
     tamper of either of those too. Renumbering the row alone is still clean.
     """
     ledger = make_run(store, "run_1")
-    outcome = ledger.claim("send_invoice", {}, key="invoice:1")
+    ledger.claim("send_invoice", {}, key="invoice:1")
     assert store.action_index_drift() == 0
 
     from continuum.actions.idempotency import idempotency_key

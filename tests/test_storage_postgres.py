@@ -31,6 +31,7 @@ class _Abort(Exception):
     snapshot-and-restore this replaced only repaired the happy path.
     """
 
+
 DSN = os.environ.get("CONTINUUM_TEST_POSTGRES_DSN")
 
 

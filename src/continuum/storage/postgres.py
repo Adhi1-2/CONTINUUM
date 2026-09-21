@@ -736,9 +736,7 @@ class PostgresStorage(Storage):
                         for key, (entry, seq) in canonical.items()
                     ],
                 )
-        after = {
-            key: (seq, entry[3], entry[4]) for key, (entry, seq) in canonical.items()
-        }
+        after = {key: (seq, entry[3], entry[4]) for key, (entry, seq) in canonical.items()}
         return index_drift_count(after, before)
 
     def action_index_drift(self) -> int:
@@ -751,7 +749,8 @@ class PostgresStorage(Storage):
         :func:`~continuum.storage.actionindex.index_drift_count`.
         """
         expected = {
-            key: (seq, entry[3], entry[4]) for key, (entry, seq) in self._canonical_index_rows().items()
+            key: (seq, entry[3], entry[4])
+            for key, (entry, seq) in self._canonical_index_rows().items()
         }
         with self._read():
             stored = {
