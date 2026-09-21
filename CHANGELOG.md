@@ -71,6 +71,28 @@ All notable changes to this project are documented here. The format follows
   no product caller and still has none, so this documents the existing
   contract rather than altering it.
 
+- **The retry-budget gate now answers the same question `claim` does (#1080).**
+  `continuum_intercept_action` guards the run-level retry budget (#240) before
+  it calls `claim`, and the guard decided whether a claim needed a slot from the
+  *derived* idempotency key alone. `claim` can answer from a different key: the
+  drift-tolerant identity lookup recognises an already-recorded action when the
+  argument hash misses, and an unscoped key can be held by another run. Whenever
+  the two disagreed, the budget was counted against a key `claim` never records
+  under, and an exhausted allowance refused with "raise the limit" in front of
+  an answer that needed no retry at all. The settled set also omitted STARTED,
+  so a claim interrupted mid-flight -- the case a recovery is most likely to
+  meet first -- was gated as an attempt once its one slot was spent, and the run
+  was told to raise a budget that was working as intended instead of being told
+  an outcome is owed and unknown.
+
+  The three lookups `claim` performs are extracted into
+  `ActionLedger.resolve_prior` (exact key, then another run's record for an
+  unscoped key, then the identity fallback, skipped when the caller asserted its
+  own key), and the gate resolves through it. A claim is only counted as an
+  attempt when it opens a slot, and the count uses the stored key `claim`
+  settles against. Callers passing an explicit `key` are unaffected: no drift is
+  possible and the derived key is the stored key.
+
 ### Removed
 
 - **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
@@ -98,6 +120,25 @@ All notable changes to this project are documented here. The format follows
   bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
   release tag), and `tests/test_version_drift.py` checks the citation file
   alongside the README pins so the drift cannot recur silently.
+- **`replay --upto` works on a compacted run instead of failing for every value
+  of `N` and blaming the operator for it (#1172).** `cmd_replay` read only the
+  live event tail, where `RUN_STARTED` no longer lives once a run is compacted,
+  so its guard rejected every `--upto` request and advised "increase `--upto`"
+  -- the one fix that cannot help, because the event had moved into the archive
+  rather than being excluded by the window. `--upto 999` failing on a run whose
+  head was 13 is what proved the message was wrong about the cause. The command
+  now windows the full history, archived prefix included, the way `cmd_events`
+  already does; `--upto` remains the bisection tool it is documented as, on the
+  long-lived runs compaction exists to serve. `_verify_against_stored` had the
+  same blind spot one function down: it re-derived the stored version's prefix
+  from `read_events(upto=source_sequence)`, which reads an empty log on a
+  compacted run because the prefix starts at sequence 1 and compaction moves
+  exactly that range. Left alone it would have reported every healthy
+  checkpoint as corrupt once the primary read was corrected, so both sites now
+  window `read_all_events`. `STATE_CHECKPOINTED` and `EVENT_LOG_ANCHORED` are
+  both non-projecting, so folding the archived prefix from genesis reaches the
+  same state the anchored path already produced. The guard is unchanged and
+  still fires when a window genuinely excludes `RUN_STARTED`.
 - **`resume --pinning` compares against the archived pinning, so a compacted
   run stops reporting every key as newly pinned (#1126).** The drift display
   folded the live event tail alone, and compaction moves the pinning-carrying
