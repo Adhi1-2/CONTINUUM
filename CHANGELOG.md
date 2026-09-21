@@ -136,15 +136,15 @@ All notable changes to this project are documented here. The format follows
   host was the route's scope: a live claim for `/v1/invoices` spent itself on
   `/v1/refunds` or `/internal/admin/purge`, the gateway forwarded the request,
   settled the claim as completed, and wrote `TOOL_COMPLETED` evidence whose
-  `path` recorded the off-prefix URL — the run's log said the invoice was sent
+  `path` recorded the off-prefix URL: the run's log said the invoice was sent
   while the upstream saw something else entirely. The prefix is the only
   per-path scope a route has and nothing else narrowed what a claim could
   reach, so there was no workaround. `match_route` now takes the request path
   and requires it to fall within the prefix on a whole-segment boundary
   (`/v1/invoices` admits `/v1/invoices/49`, not `/v1/invoices-archived` or
   `/v1/refunds`); the path is normalised first (query stripped, percent-decoded,
-  `..` collapsed) because the upstream rewrites `/v1/invoices/../refunds` — and
-  decodes `/v1/invoices/%2e%2e/refunds` to the same thing — before it dispatches,
+  `..` collapsed) because the upstream rewrites `/v1/invoices/../refunds` and
+  decodes `/v1/invoices/%2e%2e/refunds` to the same thing before it dispatches,
   and the refusal has to be about the path actually served. A
   request on a registered host but under none of its prefixes is refused with
   `403` naming the prefixes, before the key is rendered and before anything is
