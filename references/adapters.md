@@ -396,6 +396,11 @@ the whole host, which is what the default `/` has always meant. The path is
 normalised before the comparison (query stripped, percent-decoded, `..`
 collapsed), because the upstream rewrites `/v1/invoices/../refunds` before it
 dispatches and the refusal has to be about the path that is actually served.
+It is normalised exactly once: `unquote` is not idempotent, so a second pass
+turns a doubly-encoded separator like `/v1%252finvoices/49` into a real one,
+and the boundary would then judge `/v1/invoices/49` while the upstream decodes
+once and serves `/v1%2finvoices/49`, one literal segment that is not under the
+prefix at all.
 
 The claim itself comes from whichever seam the app already uses:
 `ActionLedger.claim(...)` in process, `continuum_intercept_action` over MCP, or

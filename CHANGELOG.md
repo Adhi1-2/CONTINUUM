@@ -152,7 +152,16 @@ All notable changes to this project are documented here. The format follows
   host, which is what the default `/` has always meant. `match_route`'s new
   `path` argument is required rather than defaulted: a caller cannot ask for a
   routing verdict without saying what it is routing, and a silent default
-  would reintroduce the hole as an omission rather than a design.
+  would reintroduce the hole as an omission rather than a design. The path is
+  normalised exactly once, because `urllib.parse.unquote` is not idempotent:
+  `/v1%252finvoices/49` decodes to `/v1%2finvoices/49` on the first pass and to
+  `/v1/invoices/49` on the second, and the gateway was normalising in
+  `match_route` and again in `_path_under_prefix`, so a doubly-encoded
+  separator made the boundary see the invoice path, spend the claim, and write
+  evidence that the invoice was sent while the upstream, which decodes once,
+  served one literal segment that never reached the invoice endpoint. The
+  verdict is now taken on the raw request line, which is what the upstream
+  decodes.
 - **`resume --pinning` compares against the archived pinning, so a compacted
   run stops reporting every key as newly pinned (#1126).** The drift display
   folded the live event tail alone, and compaction moves the pinning-carrying
