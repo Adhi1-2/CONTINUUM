@@ -400,6 +400,62 @@ def test_compacting_the_earlier_writer_keeps_the_later_one_winning(tmp_path: Pat
         assert owner is not None and owner.run_id == "run_b" and owner.status is ActionStatus.FAILED
 
 
+def test_repair_keeps_a_later_archived_completion_above_an_earlier_live_failure(
+    store: SQLiteStorage,
+) -> None:
+    """The severe half of the same root cause (#1054).
+
+    Compaction is per-run, so the *later* write can be archived while an
+    *earlier* write of the same unscoped key stays live in another run: run B
+    completes the key and compacts straight away, while run A's earlier failure
+    was never compacted and is still live. True order puts B's completion last,
+    and that is what the incremental writer stored.
+
+    The segment-merge fold ranked the whole archive below the whole live log,
+    so ``rebuild_action_index`` -- the *repair* path -- "corrected" the row to
+    A's failure, and the next claim saw ``fresh: True`` against a side effect
+    that had already happened and re-fired it. Folding one wall-clock timeline
+    instead makes the repair agree with the incremental writer, so the
+    completion stands and the claim still hits the cache.
+    """
+    from continuum.actions.idempotency import idempotency_key
+
+    make_run(store, "run_a")
+    late = make_run(store, "run_b")
+    key = str(idempotency_key("send_invoice", None, scope=None, key="invoice:1054"))
+
+    # The earlier failure, which stays live: run A never compacts.
+    store.append_event(
+        "run_a",
+        EventType.ACTION_RECORDED,
+        {
+            "key": key,
+            "action": Action(
+                run_id="run_a", action_type="send_invoice", status=ActionStatus.FAILED
+            ).model_dump(mode="json"),
+        },
+    )
+    # The later completion, then its own compaction. A failure recorded
+    # elsewhere leaves no live effect in the way, so run B opens its own slot.
+    outcome = late.claim("send_invoice", {}, key="invoice:1054", scoped_to_run=False)
+    assert outcome.fresh is True
+    assert late.complete(outcome.key, external_id="INV-1054") is not None
+    store.compact_run("run_b")
+
+    # The incremental row is correct and the canonical fold agrees with it.
+    assert store.action_index_drift() == 0
+    assert store.rebuild_action_index() == 0, "repair must not demote the later completion"
+    assert store.action_index_drift() == 0
+
+    # The claim path still sees the completion and does not re-fire it.
+    replay = make_run(store, "run_c").claim(
+        "send_invoice", {}, key="invoice:1054", scoped_to_run=False
+    )
+    assert replay.fresh is False
+    assert replay.action.status is ActionStatus.COMPLETED
+    assert replay.action.external_id == "INV-1054"
+
+
 def test_repair_refuses_when_the_chain_fails(tmp_path: Path) -> None:
     """A tampered log must never be folded into the projection (review 221)."""
     db = str(tmp_path / "tamper.db")

@@ -493,6 +493,56 @@ def test_pg_compacting_the_later_writer_does_not_invert_ownership(
     assert storage.rebuild_action_index() == 0
 
 
+def test_pg_repair_keeps_a_later_archived_completion_above_an_earlier_live_failure(
+    isolated_storage: PostgresStorage,
+) -> None:
+    """The Postgres twin of the #1054 regression in ``tests/test_action_index.py``.
+
+    This is the engine whose fold ranked the whole ``events_archive`` below the
+    whole live ``ctid`` stream, so the repair path itself demoted a completion
+    that had already been archived and the next claim re-fired the side effect.
+    """
+    from continuum.actions.idempotency import idempotency_key
+
+    storage = isolated_storage
+    make_run(storage, "pg_early")
+    make_run(storage, "pg_late")
+    key = str(idempotency_key("send_invoice", None, scope=None, key="pg:1054"))
+
+    # The earlier failure, which stays live: this run never compacts.
+    storage.append_event(
+        "pg_early",
+        EventType.ACTION_RECORDED,
+        {
+            "key": key,
+            "action": Action(
+                run_id="pg_early", action_type="send_invoice", status=ActionStatus.FAILED
+            ).model_dump(mode="json"),
+        },
+    )
+    # The later completion, then its own compaction. A failure recorded
+    # elsewhere leaves no live effect in the way, so this run opens its own slot.
+    ledger = ActionLedger(storage, "pg_late")
+    outcome = ledger.claim("send_invoice", {}, key="pg:1054", scoped_to_run=False)
+    assert outcome.fresh is True
+    assert ledger.complete(outcome.key, external_id="INV-PG-1054") is not None
+    storage.compact_run("pg_late")
+
+    # The incremental row is correct and the canonical fold agrees with it.
+    assert storage.action_index_drift() == 0
+    assert storage.rebuild_action_index() == 0, "repair must not demote the later completion"
+    assert storage.action_index_drift() == 0
+
+    # The claim path still sees the completion and does not re-fire it.
+    make_run(storage, "pg_third")
+    replay = ActionLedger(storage, "pg_third").claim(
+        "send_invoice", {}, key="pg:1054", scoped_to_run=False
+    )
+    assert replay.fresh is False
+    assert replay.action.status is ActionStatus.COMPLETED
+    assert replay.action.external_id == "INV-PG-1054"
+
+
 def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
     """A parentless run must load back as parentless, not as a corrupt row."""
     make_run(storage, "pg_solo", "solo")

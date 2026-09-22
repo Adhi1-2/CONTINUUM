@@ -34,6 +34,18 @@ All notable changes to this project are documented here. The format follows
   `continuum.storage.actionindex.index_order_for`, so the three cannot drift
   apart in what number they assign.
 
+  The same segment merge also repairs the severe half of the same root cause:
+  `rebuild_action_index` itself could demote a completion and re-fire a
+  completed side effect (#1054). An unscoped key lives in one store-wide
+  namespace, so the *later* write can be archived (its own run compacted)
+  while an *earlier* write of the same key stays live in another run. Ranking
+  the whole archive below the whole live log then made the repair path rewrite
+  the row onto the earlier failure, and the next claim saw `fresh: True`
+  against a side effect that had already happened. Folding one wall-clock
+  timeline makes the repair agree with the incremental writer, so the
+  completion stands and the claim still hits the cache. This subsumes the
+  separate fold-only change that was open for #1054.
+
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
   arguments are caller-controlled noise plus the real resource, so keeping the
@@ -1105,7 +1117,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,484 collected, ~2,423 passed, ~28 skipped on a minimal env).
+  (~2,486 collected, ~2,423 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
