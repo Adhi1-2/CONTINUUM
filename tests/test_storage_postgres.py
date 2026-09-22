@@ -377,3 +377,32 @@ def test_pg_rebuild_keeps_an_archived_completion_above_an_earlier_live_failure(
     )
     assert replayed.fresh is False
     assert replayed.action.external_id == "ext-1"
+
+
+def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
+    """A parentless run must load back as parentless, not as a corrupt row."""
+    make_run(storage, "pg_solo", "solo")
+    assert storage.get_run("pg_solo").parent_run_id is None
+
+
+def test_pg_child_run_keeps_its_parent_after_the_round_trip(
+    storage: PostgresStorage,
+) -> None:
+    """A fork's lineage column must survive the write and the read (#1079).
+
+    ``children_of`` filters ``list_runs`` on ``parent_run_id``, so a dropped
+    column made the family resume block vacuous here while SQLite enforced it.
+    """
+    make_run(storage, "pg_par", "supervise")
+    storage.create_run_started(
+        Run(run_id="pg_kid", goal="work", parent_run_id="pg_par"),
+        source=Origin.HUMAN,
+    )
+
+    assert storage.get_run("pg_kid").parent_run_id == "pg_par"
+    assert storage.get_run("pg_par").parent_run_id is None
+
+    from continuum.recovery.family import children_of
+
+    assert [run.run_id for run in children_of(storage, "pg_par")] == ["pg_kid"]
+    assert children_of(storage, "pg_kid") == []
