@@ -560,6 +560,66 @@ def test_the_prefix_is_enforced_through_match_route(tmp_path: Path) -> None:
     assert decide("/v1/invoices/../refunds").allow is False
 
 
+def test_a_doubly_encoded_separator_does_not_buy_the_prefix(tmp_path: Path) -> None:
+    """The path is decoded once, as the upstream does, not twice (#1051).
+
+    ``unquote`` is not idempotent: ``/v1%252finvoices/49`` decodes to
+    ``/v1%2finvoices/49`` once and to ``/v1/invoices/49`` twice. The second
+    pass made the gateway see the invoice path, spend the claim, and record
+    evidence that the invoice was sent, while the upstream decoded once and
+    served one literal segment that never reached the invoice endpoint. The
+    recorded path is the raw request line, so the verdict also has to be about
+    the raw line and not a pre-normalised stand-in.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    route = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(store, "run_1")
+    outcome = ledger.claim("send_invoice", {"id": "I-6"}, key="invoice:I-6")
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [route],
+        host="api.example.com",
+        method="POST",
+        path="/v1%252finvoices/49",
+        body={"id": "I-6"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert decision.allow is False
+    assert "not under any of its prefixes" in decision.reason
+    # The refusal names what the upstream actually serves, not the
+    # twice-decoded path the old double normalisation invented.
+    assert "/v1%2finvoices/49" in decision.reason
+
+    # Nothing was forwarded, so the claim is still live and unspent.
+    folded = fold_action_events(store.read_events("run_1"))
+    assert folded[outcome.key].status is ActionStatus.STARTED
+
+    # The same raw line, genuinely encoded once, is the invoice path and is
+    # admitted: decoding exactly once does not tighten the boundary.
+    once = match_route(
+        [route],
+        host="api.example.com",
+        method="POST",
+        path="/v1/invoices/%34%39",
+        body={"id": "I-6"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert once.allow is True
+
+
 def test_two_prefixes_on_one_host_route_to_the_right_claim(tmp_path: Path) -> None:
     """A host can carry more than one operation; the path picks the route."""
     from continuum.actions.ledger import fold_action_events

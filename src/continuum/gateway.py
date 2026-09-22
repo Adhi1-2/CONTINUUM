@@ -208,6 +208,9 @@ def _path_under_prefix(path: str, prefix: str) -> bool:
     registered without a prefix keeps the whole host, which is what the
     default ``"/"`` has always meant. Both sides are normalised here so a
     caller cannot hand in an uncollapsed path and slip past the boundary.
+    Callers pass the raw request line, not an already-normalised path, since
+    ``unquote`` is not idempotent: a second pass decodes a doubly-encoded
+    separator into a real one and judges a path the upstream never serves.
     """
     normalized = _normalize_path(prefix)
     if normalized == "/":
@@ -255,8 +258,13 @@ def match_route(
     # the key is even rendered: without it, one claim for /v1/invoices spends
     # itself on every path the host serves, and the recorded evidence says the
     # invoice was sent while the upstream saw something else (issue #1051).
+    # The raw request line goes in, not a pre-normalised one: ``unquote`` is
+    # not idempotent, so normalising here and again inside
+    # ``_path_under_prefix`` would decode a doubly-encoded separator twice and
+    # see a path the upstream, which decodes once, never serves. The claim
+    # would then be spent on a request the prefix never really admitted.
     requested = _normalize_path(path)
-    scoped = [r for r in candidates if _path_under_prefix(requested, r.prefix)]
+    scoped = [r for r in candidates if _path_under_prefix(path, r.prefix)]
     if not scoped:
         return Decision(
             False,
