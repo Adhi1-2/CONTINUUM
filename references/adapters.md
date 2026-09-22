@@ -389,7 +389,7 @@ a proxy that forwards anywhere would be an open relay wearing CONTINUUM's name.
 `prefix` is enforced, not just recorded: the request path must fall within it,
 on a whole-segment boundary, so a claim for `/v1/invoices` covers
 `/v1/invoices/49` but not `/v1/refunds` or `/v1/invoices-archived`. It is the
-only per-path scope a route has — without the check one claim spends itself on
+only per-path scope a route has; without the check one claim spends itself on
 every path the host serves, and the recorded evidence says the invoice was sent
 while the upstream saw something else. A route written without a `prefix` keeps
 the whole host, which is what the default `/` has always meant. The path is
