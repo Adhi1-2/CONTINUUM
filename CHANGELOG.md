@@ -111,6 +111,28 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **CITATION.cff states the released version, and the bump sites are documented
+  (#1120).** The citation file pinned `0.1.0` while the package was `0.1.2`, so
+  anyone citing the project recorded a version two releases stale, and
+  `CONTRIBUTING.md` still said the version lived in two places guarded by
+  checking that "will be added" -- the guard has run in CI since #838 and reads
+  four sites. The file now says `0.1.2`, the paragraph names all five sites a
+  bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
+  release tag), and `tests/test_version_drift.py` checks the citation file
+  alongside the README pins so the drift cannot recur- **The Postgres backend now stores and returns a fork's `parent_run_id`
+  (#1079).** Both `create_run` and `create_run_started` inserted only the six
+  columns the schema had before lineage existed, and `_row_to_run` never read
+  the column back, so `runs.parent_run_id` was declared with a foreign key to
+  the parent and then left permanently null. Every fork silently lost its
+  lineage on the Postgres engine, and because `children_of`
+  (`recovery/family.py`) filters `list_runs` on that column, the family
+  resume block was vacuous there: a Postgres deployment would never refuse a
+  parent RESUME over an unsafe child, and would report the same empty family
+  the CLI tree and TUI render from. SQLite wrote and read the column in all
+  three places, so the two engines disagreed on a safety property with no
+  error anywhere. Both inserts now carry `run.parent_run_id` and the row maps
+  it into the `Run`, matching SQLite; the contract suite gained a case that
+  forks on the engine and asserts `children_of` resolves the child.
 - **`replay --upto` works on a compacted run instead of failing for every value
   of `N` and blaming the operator for it (#1172).** `cmd_replay` read only the
   live event tail, where `RUN_STARTED` no longer lives once a run is compacted,
