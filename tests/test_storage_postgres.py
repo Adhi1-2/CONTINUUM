@@ -543,6 +543,45 @@ def test_pg_repair_keeps_a_later_archived_completion_above_an_earlier_live_failu
     assert replay.action.external_id == "INV-PG-1054"
 
 
+def test_pg_backfill_seeds_an_emptied_index_on_the_folds_own_scale(
+    isolated_storage: PostgresStorage,
+) -> None:
+    """Reopening a store with action events but no projection rebuilds it (#1322).
+
+    ``_backfill_action_index`` runs from ``_create_schema`` whenever action
+    events exist and ``action_index`` does not. Its rows must already carry the
+    fold's own numbers, or a store rebuilt this way reads dirty until its first
+    explicit rebuild. The SQLite twin is
+    ``test_v2_database_backfills_on_open``.
+    """
+    from continuum.actions.idempotency import idempotency_key
+
+    storage = isolated_storage
+    make_run(storage, "pg_backfill")
+    key = str(idempotency_key("send_invoice", None, scope=None, key="pg:backfill"))
+    ledger = ActionLedger(storage, "pg_backfill")
+    outcome = ledger.claim("send_invoice", {}, key="pg:backfill", scoped_to_run=False)
+    assert outcome.fresh is True
+    assert ledger.complete(outcome.key, external_id="INV-BACKFILL") is not None
+
+    # Wipe the projection but keep the log, then reopen: _create_schema seeds it.
+    dsn = storage._connection.info.dsn
+    storage._connection.execute("DELETE FROM action_index")
+    assert storage.foreign_action(key, exclude_run="nobody") is None
+    storage.close()
+
+    reopened = PostgresStorage(dsn)
+    try:
+        found = reopened.foreign_action(key, exclude_run="nobody")
+        assert found is not None
+        assert found.status is ActionStatus.COMPLETED
+        assert found.external_id == "INV-BACKFILL"
+        # The seeded rows already sit on the fold's scale, so nothing is owed.
+        assert reopened.action_index_drift() == 0
+    finally:
+        reopened.close()
+
+
 def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
     """A parentless run must load back as parentless, not as a corrupt row."""
     make_run(storage, "pg_solo", "solo")
