@@ -195,6 +195,9 @@ class PostgresStorage(Storage):
             )
         except Exception as exc:  # connection refused, auth, missing driver, etc.
             raise RuntimeError(f"could not connect to PostgreSQL at {dsn!r}: {exc}") from exc
+        # The normalised locator, kept verbatim: connection.info.dsn redacts the
+        # password, so a caller that reopens from it cannot authenticate.
+        self.dsn = dsn
         self._lock = threading.RLock()
         self._configure()
         self._create_schema()

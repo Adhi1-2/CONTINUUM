@@ -565,7 +565,11 @@ def test_pg_backfill_seeds_an_emptied_index_on_the_folds_own_scale(
     assert ledger.complete(outcome.key, external_id="INV-BACKFILL") is not None
 
     # Wipe the projection but keep the log, then reopen: _create_schema seeds it.
-    dsn = storage._connection.info.dsn
+    # ``storage.dsn`` rather than ``connection.info.dsn``: psycopg redacts the
+    # password from the latter, so a store reopened on it cannot authenticate
+    # against a server that requires one (CI's service container; a Homebrew
+    # ``trust`` server masks the bug locally).
+    dsn = storage.dsn
     storage._connection.execute("DELETE FROM action_index")
     assert storage.foreign_action(key, exclude_run="nobody") is None
     storage.close()
