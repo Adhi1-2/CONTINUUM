@@ -123,7 +123,16 @@ def test_derived_provenance_for_events_reads_an_origin_source() -> None:
 
 def test_derived_provenance_for_events_parses_a_string_source() -> None:
     # Events read back from JSON carry the enum value as a plain string; the
-    # helper parses it rather than degrading to EXTERNAL_AGENT.
+    # helper parses it rather than degrading to EXTERNAL_AGENT. A single human
+    # source asserting HUMAN is what proves the parse arm ran: a broken parse
+    # would fall through to EXTERNAL_AGENT and this would fail.
+    events = [_RawEvent(1, Origin.HUMAN.value)]
+    assert derived_provenance_for_events(events) is Origin.HUMAN
+
+
+def test_derived_provenance_for_events_parses_a_string_source_to_the_weakest() -> None:
+    # The parsed origins still fold through min, so a string human source
+    # alongside a string external agent source degrades to the weaker one.
     events = [
         _RawEvent(1, Origin.HUMAN.value),
         _RawEvent(2, Origin.EXTERNAL_AGENT.value),
@@ -142,6 +151,24 @@ def test_derived_provenance_for_events_degrades_an_absent_source() -> None:
     # A None source (a hand-built dict, or an event with no source field) also
     # degrades rather than being skipped, so the fold stays monotone.
     events = [_RawEvent(1, Origin.HUMAN), _RawEvent(2, None)]
+    assert derived_provenance_for_events(events) is Origin.EXTERNAL_AGENT
+
+
+class _AttributelessEvent:
+    """An object with a sequence but no ``source`` attribute at all.
+
+    ``getattr(e, "source", None)`` reads this the same as an explicit None, but
+    the two shapes reach the helper from different callers: a projection
+    intermediary may simply omit the field. Pinning it keeps the ``getattr``
+    default from silently becoming a skip.
+    """
+
+    def __init__(self, sequence: int) -> None:
+        self.sequence = sequence
+
+
+def test_derived_provenance_for_events_degrades_a_missing_source_attribute() -> None:
+    events = [_RawEvent(1, Origin.HUMAN), _AttributelessEvent(2)]
     assert derived_provenance_for_events(events) is Origin.EXTERNAL_AGENT
 
 
