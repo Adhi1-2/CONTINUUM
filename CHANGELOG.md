@@ -206,6 +206,19 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
+- **The Level 4 MCP inspector walkthrough now names the config the repository
+  ships (#1395).** `references/testing.md` pointed
+  `@modelcontextprotocol/inspector --cli` at `mcp-config.json`, which has never
+  existed anywhere in the tree (not tracked, never committed, absent on disk),
+  so the copy-pasted command failed at the exact step meant to exercise the
+  protocol boundary. It now points at the tracked `.mcp.json`, whose
+  `continuum-mcp` entry is the server the `--server continuum-mcp` flag names. A
+  guard in `tests/test_docs_mcp_inspector.py` folds the fenced command's
+  backslash continuations and asserts, for every inspector command in
+  `references/` and `docs/`, that its `--config` file is present in the tree and
+  its `--server` name is an entry in that file, so a walkthrough cannot drift
+  back out of sync with the shipped config.
+
 - **File-derived progress no longer bloats the log on a compacted run.**
   `record_file_progress` gates its mirror on a projection of the log, but folded
   the live tail (`read_events`) alone. Once a run has been compacted the
