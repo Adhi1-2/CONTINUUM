@@ -206,6 +206,27 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
+- **The AutoGen wrapper now awaits the real async `run_json` instead of
+  settling the ledger before the tool ran (#1392).** `wrap_autogen_tool`
+  replaced `run_json` with a synchronous function, but AutoGen core declares
+  `run_json` as a coroutine function on both the `Tool` protocol and
+  `BaseTool`. Calling the original returned a coroutine nothing in the wrapper
+  awaited, so `guard.complete` fired immediately with the unrun coroutine as
+  its result: the claim was recorded COMPLETED before the side effect
+  executed, and the `except` clause could never see the tool body raise,
+  because that body only runs when the framework awaits the returned
+  coroutine, outside the wrapper. A failed side effect was then durably
+  recorded COMPLETED, which inverts what the ledger exists for. On recovery a
+  failed effect looks done and is never retried or reconciled, and a crash
+  between the premature completion and the real execution loses the effect
+  with the ledger claiming success. The replacement is now `async def` and
+  awaits the original, so claim and settle bracket the real execution and a
+  tool error reaches `guard.fail` and is re-raised exactly as before. The
+  test fake's `run_json` was synchronous, which is why CI never saw the
+  mismatch; it is now `async def` and two new tests pin that nothing settles
+  before the coroutine is awaited and that an async failure is recorded
+  FAILED.
+
 - **File-derived progress no longer bloats the log on a compacted run.**
   `record_file_progress` gates its mirror on a projection of the log, but folded
   the live tail (`read_events`) alone. Once a run has been compacted the
