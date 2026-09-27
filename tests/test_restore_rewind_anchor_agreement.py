@@ -10,6 +10,8 @@ discard a larger span of history than ``rewind`` for the identical input.
 
 from __future__ import annotations
 
+import pytest
+
 from continuum.checkpoint.rewind import resolve_checkpoint
 from continuum.events import EventType
 from continuum.models import Goal, Run, SemanticState, StateCheckpoint
@@ -66,3 +68,21 @@ def test_version_target_without_collision_resolves_to_its_sequence() -> None:
 
     assert _anchor_for(storage, RUN_ID, 7) == 4
     assert _anchor_for(storage, RUN_ID, "7") == 4
+
+
+def test_unknown_int_target_reports_version_and_source_sequence() -> None:
+    """An int matching neither field exhausts both passes and is reported."""
+    storage = _storage()
+    _put(storage, version=1, sequence=2)
+
+    with pytest.raises(ValueError, match="version/source_sequence 999"):
+        _anchor_for(storage, RUN_ID, 999)
+
+
+def test_unknown_numeric_string_target_is_reported() -> None:
+    """A numeric string matching neither field falls through to the miss."""
+    storage = _storage()
+    _put(storage, version=1, sequence=2)
+
+    with pytest.raises(ValueError, match="no checkpoint '999'"):
+        _anchor_for(storage, RUN_ID, "999")
