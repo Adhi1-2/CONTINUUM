@@ -24,6 +24,7 @@ one. Nothing is excluded by default.
 from __future__ import annotations
 
 import os
+import posixpath
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -64,10 +65,18 @@ def _canonicalize_paths(value: Any) -> Any:
     a separator and are not URLs), and normalization is purely lexical
     (``normpath`` plus ``~`` expansion). It never resolves against the process
     working directory, so the result is deterministic on any machine.
+
+    Separators are folded to ``/`` and the path is collapsed with
+    :func:`posixpath.normpath` rather than :func:`os.path.normpath`, because the
+    latter emits ``\\`` on Windows and ``/`` on POSIX -- the same argument would
+    then hash differently depending on the host OS, silently defeating
+    cross-machine deduplication (issue #1437). Folding first also lets a
+    Windows-style spelling (``a\\b\\..\\c``) and its POSIX form collapse to one
+    canonical value everywhere.
     """
     if isinstance(value, str):
         if "://" not in value and ("/" in value or "\\" in value):
-            return os.path.normpath(os.path.expanduser(value))
+            return posixpath.normpath(os.path.expanduser(value).replace("\\", "/"))
         return value
     if isinstance(value, Mapping):
         return {k: _canonicalize_paths(v) for k, v in value.items()}

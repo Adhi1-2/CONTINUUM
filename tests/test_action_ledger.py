@@ -734,6 +734,22 @@ def test_path_canonicalization_does_not_collapse_distinct_paths() -> None:
     assert a != b
 
 
+def test_path_canonicalization_is_platform_independent() -> None:
+    """The same path must hash identically whatever separator the host writes.
+
+    ``os.path.normpath`` emits ``\\`` on Windows and ``/`` on POSIX, so a
+    Windows workstation and a Linux CI worker used to derive different keys for
+    one action and re-fire the side effect on replay (issue #1437). The
+    canonical form folds separators to ``/`` on every platform, so a
+    backslash-spelled path and its forward-slash form collapse to one hash.
+    """
+    assert arguments_hash({"path": "data\\output\\report.txt"}) == arguments_hash(
+        {"path": "data/output/report.txt"}
+    )
+    # `..` collapses the same way regardless of the separator style used.
+    assert arguments_hash({"path": "a\\b\\..\\c"}) == arguments_hash({"path": "a/c"})
+
+
 def test_identity_match_recognises_a_completed_action_across_field_renames(
     ledger: ActionLedger,
 ) -> None:
