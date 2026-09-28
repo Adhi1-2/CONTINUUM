@@ -70,6 +70,46 @@ def test_source_completed_target_dependent_blocks_and_names_source_sequence() ->
         storage.close()
 
 
+def test_source_completion_reconciled_away_no_longer_blocks_the_merge() -> None:
+    """A completion undone by a later reconcile is not a live depended result.
+
+    ``_collect_completions`` folded the action stream but ``continue``-d on any
+    non-COMPLETED record, so a later ``ACTION_RECONCILED(occurred=False)`` (or
+    ``ACTION_COMPENSATED``) never removed the earlier COMPLETED entry. The
+    effect the reconcile just confirmed absent was still counted as a result the
+    target depends on, and the merge was refused for stranding a result that no
+    longer exists -- diverging from ``derive()``'s newest-status-wins fold.
+    """
+    storage = SQLiteStorage(":memory:")
+    try:
+        _make_run(storage, "target")
+        _make_run(storage, "source")
+        ledger_src = ActionLedger(storage, "source")
+        outcome = ledger_src.claim("github.create_issue", {"title": "t"}, key="k1")
+        ledger_src.complete(outcome.key, external_id="42")
+        expected_key = idempotency_key(
+            "github.create_issue", {"title": "t"}, scope="source", key="k1"
+        )
+        storage.append_event(
+            "target",
+            EventType.WORK_ADDED,
+            {"task_id": "w1", "prerequisite": [expected_key]},
+        )
+        # While the completion stands the merge is refused (baseline behaviour).
+        with pytest.raises(EditPreconditionError):
+            approve_merge(
+                storage, "target", source_run_id="source", anchor_sequence=0, reason="cross"
+            )
+        # A probe then confirms the effect never happened.
+        ledger_src.reconcile(outcome.key, occurred=False)
+        # Nothing live depends on k1 any more, so the merge must be allowed.
+        approve_merge(
+            storage, "target", source_run_id="source", anchor_sequence=0, reason="cross-after"
+        )
+    finally:
+        storage.close()
+
+
 def test_source_depended_with_carry_forward_passes_and_lineage_stamps() -> None:
     storage = SQLiteStorage(":memory:")
     try:

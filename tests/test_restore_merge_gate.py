@@ -320,6 +320,44 @@ def test_restore_reactivates_history_depended_differs_from_fork() -> None:
         storage.close()
 
 
+def test_restore_ignores_a_completion_that_was_compensated_away() -> None:
+    """A survivor-referenced completion that is later compensated is not live.
+
+    ``_filtered_depended_for_edit`` (the restore branch) built its completions
+    map by ``continue``-ing on any non-COMPLETED record, so a later
+    ``ACTION_COMPENSATED`` never removed the earlier COMPLETED entry. A restore
+    whose surviving prefix referenced the key was then refused for depending on
+    a result that had been deliberately undone, unlike ``derive()`` which folds
+    newest-status-wins.
+    """
+    from continuum.actions.idempotency import idempotency_key
+    from continuum.recovery.gate import check_preconditions as gate_check
+
+    storage = _make_storage(run_id="run_2")
+    try:
+        expected_key = idempotency_key(
+            "github.create_issue", {"title": "t"}, scope="run_2", key="k1"
+        )
+        storage.append_event(
+            "run_2",
+            EventType.WORK_ADDED,
+            {"task_id": "w0", "description": "early need", "prerequisite": [expected_key]},
+        )
+        ledger = ActionLedger(storage, "run_2")
+        outcome = ledger.claim("github.create_issue", {"title": "t"}, key="k1")
+        ledger.complete(outcome.key, external_id="42")
+        anchor = 2  # after the surviving WORK_ADDED, before the completion
+        # While the completion stands the restore is refused (baseline).
+        with pytest.raises(RestorePreconditionError):
+            gate_check(storage, "run_2", anchor, edit_type="restore")
+        # The effect is then deliberately undone.
+        ledger.compensate(outcome.key, note="rolled back", by="op")
+        # Nothing surviving depends on a live result any more; restore must pass.
+        gate_check(storage, "run_2", anchor, edit_type="restore")
+    finally:
+        storage.close()
+
+
 def test_falsifiable_restore_skipping_unsettled_claim_refuses_like_fork() -> None:
     """Falsifiable from #389/#408: checkpoint mid-run after intercept.
 

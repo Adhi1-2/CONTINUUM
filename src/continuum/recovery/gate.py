@@ -293,16 +293,25 @@ def _filtered_depended_for_edit(
             action = Action.model_validate(event.payload["action"])
         except Exception:
             continue
-        if action.status is not ActionStatus.COMPLETED:
-            continue
-        from continuum.recovery.preconditions import DependedResult
+        if action.status is ActionStatus.COMPLETED:
+            from continuum.recovery.preconditions import DependedResult
 
-        completions[str(raw_key)] = DependedResult(
-            key=str(raw_key),
-            action_id=action.action_id,
-            action_type=action.action_type,
-            sequence=event.sequence,
-        )
+            completions[str(raw_key)] = DependedResult(
+                key=str(raw_key),
+                action_id=action.action_id,
+                action_type=action.action_type,
+                sequence=event.sequence,
+            )
+        else:
+            # Newest status wins, mirroring derive()'s watched.pop (#389).
+            # A later record that flips the action out of COMPLETED -- an
+            # ACTION_COMPENSATED (COMPENSATED) or an ACTION_RECONCILED with
+            # occurred=False (FAILED) -- means the effect no longer exists
+            # and is not a live depended result. `continue`-ing here left the
+            # earlier COMPLETED entry in place, so a compensated/reconciled-away
+            # effect was still counted and the restore was refused as if a
+            # surviving step depended on a result that had been undone.
+            completions.pop(str(raw_key), None)
     restored_set = frozenset(
         item for key, item in completions.items() if key in survivors or item.action_id in survivors
     )
@@ -392,16 +401,22 @@ def _collect_completions(storage: Storage, run_id: str, anchor: int, head: int) 
             action = Action.model_validate(event.payload["action"])
         except Exception:
             continue
-        if action.status is not ActionStatus.COMPLETED:
-            continue
-        from continuum.recovery.preconditions import DependedResult
+        if action.status is ActionStatus.COMPLETED:
+            from continuum.recovery.preconditions import DependedResult
 
-        completions[str(raw_key)] = DependedResult(
-            key=str(raw_key),
-            action_id=action.action_id,
-            action_type=action.action_type,
-            sequence=event.sequence,
-        )
+            completions[str(raw_key)] = DependedResult(
+                key=str(raw_key),
+                action_id=action.action_id,
+                action_type=action.action_type,
+                sequence=event.sequence,
+            )
+        else:
+            # Newest status wins, mirroring derive()'s watched.pop (#389). A
+            # later ACTION_COMPENSATED (COMPENSATED) or ACTION_RECONCILED with
+            # occurred=False (FAILED) undoes the completion, so it is no longer
+            # a live depended result; leaving the earlier COMPLETED entry in
+            # place made the merge refuse over an effect that no longer exists.
+            completions.pop(str(raw_key), None)
     return completions
 
 
