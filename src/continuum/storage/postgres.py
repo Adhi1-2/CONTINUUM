@@ -865,9 +865,13 @@ class PostgresStorage(Storage):
         canonical: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}
         order = 0
         for row in [*archived, *rows]:
-            payload = (
-                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            )
+            raw = row["payload"]
+            if not isinstance(raw, dict):
+                try:
+                    raw = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            payload = raw
             if is_offload_descriptor(payload):
                 with suppress(Exception):
                     payload = load_blob_payload(self.storage_dir, payload)
