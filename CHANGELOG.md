@@ -104,8 +104,6 @@ All notable changes to this project are documented here. The format follows
   since declaring such fields `volatile` at every call site is not a fix: a
   caller that wants around the cap simply forgets to declare them.
 
-### Changed
-
 - **The `__all__` guard now walks the installed package instead of five
   hand-listed modules (#1228).** `tests/test_module_all_exports.py` asserted
   that names in `__all__` resolve by importing five modules by name, so a
@@ -136,6 +134,23 @@ All notable changes to this project are documented here. The format follows
   The neighbouring views (`checkpoint_rows`, `action_rows`, `event_rows`,
   `budget_rows`) already fetched the row exactly once for the same guard
   purpose, so this removes the outlier.
+
+### Changed
+
+- **Recovery anchors are now produced by a product path (#1097).**
+  `CheckpointManager.checkpoint_on_recovery` and `last_recovery_anchor` had no
+  caller in `src/` (only tests) so the `RECOVERY` trigger, the `keep_anchors`
+  guard in `prune`, and the anchor branch in `cleanup_ephemeral_artifacts` all
+  protected a set that could never be populated. `continuum resume <run>
+  --repair` now records an anchor after a non-RESUME verdict, before the
+  `RECOVERY_STARTED` event so the pin covers the state the verdict judged rather
+  than the state after the repair bookkeeping landed, and `continuum restore
+  <run> --reason ... --to-recovery-anchor` rolls back to it (refusing with an
+  error when no anchor exists, and refusing a `--to`/`--anchor` given alongside).
+  A plain `resume` stays read-only and records nothing: judging is still
+  separate from acting, so the write lives in the CLI caller, never in
+  `RecoveryEngine.assess`. An anchor failure is reported on stderr and never
+  changes the verdict or its exit code.
 
 - **The advisory verdict contract is now stated where a reader can find it (#1031).**
   `RecoveryDecision` and its `permits()` method describe themselves as
