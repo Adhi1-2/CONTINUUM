@@ -144,10 +144,12 @@ When a run is bound to a tenant identity, only keys whose `tenant` field matches
 
 ## Poisoning forensics and erasure
 
-Every memory write is a ledger row keyed by tenant namespace. Enumeration is therefore a filter:
+Every memory write is a ledger row recorded under the `mem_write` action type. The
+rendered `mem:` identity is the ledger key, not a field on the action record, so
+enumeration filters on the registered `action_type`:
 
 ```bash
-continuum actions <run> --json | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if 'mem:' in a['action_id']])"
+continuum actions <run> --json | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if a['action_type'] == 'mem_write'])"
 ```
 
 `continuum forget --tenant X` builds on this enumeration to list exactly what to delete externally and to append a tombstone event:
