@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The `requires_review` webhook event filter now fires, instead of being
+  accepted by the registry and silently never delivered (#1180).**
+  `notify_blocked` selects endpoints by matching the `mode` string it is
+  handed, and `cmd_resume` only ever forwarded a `RecoveryMode` value, which
+  has no `requires_review` member. An operator who configured the documented
+  filter got zero notifications, forever, with no warning: the exact silent
+  failure the strict loader validation was written to prevent. The CLI now
+  derives the review round from the validation report rather than the enum,
+  and when a blocked run's goal or progress was downgraded for a
+  self-certified origin it delivers a second round to endpoints subscribed to
+  `requires_review`, alongside the human-gate round and under its own dedup
+  key. A run with nothing to review still fires it not at all, and the payload
+  reports its own mode so the recipient can tell which bell rang. The original
+  fix (PR #1203) was dropped in a merge-of-main and never landed.
+
 - **The MCP candidate fold now reads the full history, so `continuum_record_progress`
   and `continuum_record_plan` keep working on a compacted run (#1133).**
   `_project_candidate` folded only the live tail; once compaction moved

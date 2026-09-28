@@ -23,7 +23,7 @@ from continuum.checkpoint import CheckpointManager
 from continuum.cli import ExitCode, main
 from continuum.environment import StaticProvider, capture
 from continuum.events import EventType
-from continuum.models import RecoveryContract, RecoverySafety, Run, utcnow
+from continuum.models import Origin, RecoveryContract, RecoverySafety, Run, utcnow
 from continuum.recovery.notify import SIGNATURE_HEADER, verify_signature
 from continuum.recovery.webhooks import (
     EVENT_REQUEST_HUMAN,
@@ -501,6 +501,30 @@ def _seed_blocked_run(db: str) -> None:
         ActionLedger(storage, "run_1").claim("github.create_issue", {"title": "Anomaly"})
 
 
+def _seed_self_certified_blocked_run(db: str) -> None:
+    """A request_human run whose state was written by a self-certified origin.
+
+    The unreconciled side effect makes the verdict ``request_human``; the
+    ``EXTERNAL_AGENT`` origins downgrade goal and progress to
+    ``requires_review``. Both conditions at once is what the
+    ``requires_review`` event filter exists to signal (issue #1180).
+    """
+    with SQLiteStorage(db) as storage:
+        storage.create_run(Run(run_id="run_1", goal="g"))
+        storage.append_event(
+            "run_1", EventType.RUN_STARTED, {"goal": "g"}, source=Origin.EXTERNAL_AGENT
+        )
+        storage.append_event(
+            "run_1",
+            EventType.TASK_UPDATED,
+            {"completed": 1, "pending": 0, "failed": 0, "total": 1},
+            source=Origin.EXTERNAL_AGENT,
+        )
+        from continuum.actions import ActionLedger
+
+        ActionLedger(storage, "run_1").claim("github.create_issue", {"title": "Anomaly"})
+
+
 def test_resume_notifies_on_request_human(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     captured: dict = {}
@@ -526,6 +550,52 @@ def test_resume_notifies_on_request_human(tmp_path: Path, monkeypatch: pytest.Mo
         # Dedup state is the event log, so a fresh process does not re-ring.
         assert len(captured["hits"]) == 1, err2
         assert "notification sent" not in err2
+    finally:
+        server.shutdown()
+
+
+def test_resume_fires_the_requires_review_filter_for_self_certified_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented requires_review filter must ring, not silently no-op (#1180).
+
+    A self-certified blocked run carries both signals at once: the verdict is
+    request_human and its components were downgraded to requires_review. An
+    endpoint opted into the review filter hears about it, alongside, not
+    instead of, the human-gate endpoint. Regression for the fix merged as
+    PR #1203 and dropped in a merge-of-main.
+    """
+    monkeypatch.chdir(tmp_path)
+    captured: dict = {}
+    server = _receiver(captured)
+    try:
+        db = str(tmp_path / "demo.db")
+        _seed_self_certified_blocked_run(db)
+        (tmp_path / ".continuum").mkdir(exist_ok=True)
+        (tmp_path / ".continuum" / "webhooks.json").write_text(
+            json.dumps(
+                {
+                    "endpoints": [
+                        {"url": f"http://127.0.0.1:{server.server_port}/human"},
+                        {
+                            "url": f"http://127.0.0.1:{server.server_port}/review",
+                            "events": ["requires_review"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, _, err = _run_cli("--db", db, "resume", "run_1")
+        assert code == ExitCode.REQUIRES_HUMAN
+        bodies = [json.loads(hit["body"]) for hit in captured["hits"]]
+        assert len(bodies) == 2, err
+        events = sorted(b["event"] for b in bodies)
+        assert events == ["request_human", "requires_review"]
+        review = next(b for b in bodies if b["event"] == "requires_review")
+        assert review["mode"] == "requires_review"
+        assert review["run_id"] == "run_1"
     finally:
         server.shutdown()
 
