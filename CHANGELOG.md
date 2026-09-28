@@ -47,6 +47,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`record-plan` now succeeds on compacted runs (#1438).** `cmd_record_plan`
+  queried `read_events` for its preflight projection check and post-write
+  emission, which on a compacted run reads only the post-anchor live tail.
+  Because `RUN_STARTED` lives in `events_archive`, projecting the candidate
+  against that truncated history raised `ProjectionError` and refused valid
+  plans with exit code 1. The command now queries `read_all_events` so the
+  preflight fold and state emission see the full merged event history.
+
 - **The MCP candidate fold now reads the full history, so `continuum_record_progress`
   and `continuum_record_plan` keep working on a compacted run (#1133).**
   `_project_candidate` folded only the live tail; once compaction moved
