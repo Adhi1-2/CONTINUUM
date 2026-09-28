@@ -172,6 +172,15 @@ All notable changes to this project are documented here. The format follows
   settles against. Callers passing an explicit `key` are unaffected: no drift is
   possible and the derived key is the stored key.
 
+### Added
+
+- **Wired ActionLedger.compensate to MCP and sidecar transports (#1096).**
+  `ActionLedger.compensate` records compensating transactions and emits
+  `EventType.ACTION_COMPENSATED`, but had no transport. The verb is now
+  exposed as `continuum_compensate_action` over MCP and `compensate_action`
+  over the sidecar RPC server. Both mark the action `COMPENSATED`, append
+  the compensating event to the log, and surface in recovery summary briefings.
+
 ### Removed
 
 - **Dead `backoff_delay` export (#1095).** The exponential-with-cap pacing
