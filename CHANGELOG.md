@@ -47,6 +47,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Path canonicalization in idempotency hashing is now platform-independent (#1437).**
+  `_canonicalize_paths` previously used `os.path.normpath`, which converted separators
+  to backslashes on Windows while leaving forward slashes on POSIX. Because `stable_hash`
+  hashes canonical JSON strings, equivalent path arguments hashed differently on Windows
+  versus Linux, causing shared ledgers or cross-platform replays to generate mismatched
+  idempotency keys and fail deduplication. Normalization now standardizes Windows path
+  separators to forward slashes using `posixpath.normpath` across all operating systems,
+  while preserving backslashes in POSIX filenames and regex-like strings. Note that
+  existing ledger entries recorded on Windows with backslash paths will compute new
+  idempotency keys under the normalized representation.
+
 - **Agent adapters now check archived history so compaction does not inject a duplicate `RUN_STARTED` (#1453).**
   `LangChainAgentAdapter.start_run`, `LangGraphAgentAdapter.start_run`, and `OpenAIAgentAdapter._ensure_run_exists`
   checked `read_events(run_id, upto=1)` to decide whether a run needed its genesis event recorded. On a compacted run,
