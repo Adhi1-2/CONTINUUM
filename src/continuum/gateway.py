@@ -566,9 +566,17 @@ class GatewayServer:
                         resp = conn.getresponse()
                         resp_body = resp.read()
                         status = resp.status
-                    except OSError as exc:
+                    except (OSError, http_client.HTTPException) as exc:
+                        # A dropped connection (OSError) or a malformed/truncated
+                        # upstream response (http.client.HTTPException: IncompleteRead,
+                        # BadStatusLine, ...) is an *uncertain* outcome: the request may
+                        # already have reached the upstream and fired the effect. Settle
+                        # the claim UNKNOWN so recovery forces reconciliation. Catching
+                        # only OSError let HTTPException escape with the claim still
+                        # STARTED, and a retry then re-fired the effect the gateway
+                        # exists to make exactly-once.
                         ledger = ActionLedger(storage, run_id)
-                        ledger.fail(decision.key, f"network error: {exc}", certain=False)
+                        ledger.fail(decision.key, f"upstream I/O error: {exc}", certain=False)
                         self._respond(
                             502, {"error": "upstream unreachable", "detail": str(exc)[:200]}
                         )

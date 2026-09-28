@@ -148,6 +148,52 @@ def test_claimed_request_is_forwarded_settled_and_recorded(db: str, gateway: str
     assert action.status is ActionStatus.UNKNOWN
 
 
+def test_a_truncated_upstream_reply_settles_the_claim_uncertain(
+    db: str, gateway: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed/truncated upstream response must not leave a live STARTED claim.
+
+    ``conn.getresponse()``/``resp.read()`` can raise ``http.client.HTTPException``
+    subclasses (``IncompleteRead``, ``BadStatusLine``, ...) that are *not*
+    ``OSError``. A catch of only ``OSError`` let them escape ``_handle`` with the
+    claim still STARTED; a retry then saw a live claim and forwarded the effect a
+    second time -- the double-fire the gateway exists to prevent. The request may
+    already have reached the upstream and fired the effect, so the honest
+    settlement is UNKNOWN (uncertain), exactly as for a dropped connection.
+    """
+
+    class _TruncatedResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            raise http.client.IncompleteRead(b"partial", 512)
+
+    class _TruncatedConn:
+        def __init__(self, netloc: str, timeout: int | None = None) -> None:
+            pass
+
+        def request(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def getresponse(self) -> _TruncatedResponse:
+            return _TruncatedResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _TruncatedConn)
+
+    key = claim(db, "invoice:I-read")
+    status, _ = post(gateway, "/v1/invoices", {"id": "I-read"})
+    assert status == 502
+    with SQLiteStorage(db) as store:
+        from continuum.actions.ledger import fold_action_events
+
+        action = fold_action_events(store.read_events("run_1"))[key]
+    assert action.status is ActionStatus.UNKNOWN
+    assert action.side_effect_uncertain is True
+
+
 def test_completed_effect_blocks_the_duplicate(db: str, gateway: str) -> None:
     key = claim(db, "invoice:I-3")
     with SQLiteStorage(db) as store:
