@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The gateway now enforces tenant-scoped namespace boundaries on external memory claims (#1415).**
+  External memory mutation claims now support the standardized structured key convention
+  `memory:<store_id>:<tenant_id>:<namespace>:<record_key>` alongside `mem:<store_id>:<tenant>:<record_key>`.
+  `continuum gateway` binds the authorized tenant identity from server configuration, request headers
+  (`X-Continuum-Tenant`), or run context metadata (`tenant_id`, `tenant`),
+  and denies cross-tenant write attempts with HTTP 403 before outbound requests reach external stores.
+  The gateway CLI command also exposes `--tenant` to allow operators to pin the tenant boundary at proxy startup.
+
 - **Registered `ActionReconciler` plugins are now dispatched during reconciliation (#765).**
   The `ActionReconciler` seam in `continuum.plugins.seams` was declared in Phase 7
   with no consumer: `docs/ARCHITECTURE_EVOLUTION.md` listed it among the plugin
