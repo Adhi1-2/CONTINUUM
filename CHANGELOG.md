@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Per-dependency human gate budgets are now wired into the recovery boundary (#1459).**
+  The per-dependency recovery attempt tracking introduced in #1428 is now enforced
+  across the recovery lifecycle:
+  `RecoveryEngine.assess` and `assess_scoped` accept a `ledger` and `dependency_budgets`
+  mapping (auto-loading `.continuum/budgets.json` by default), evaluate ceilings for
+  every relevant external dependency and uncertain action, and escalate only exhausted
+  dependencies to `REQUEST_HUMAN` while letting untouched, healthy dependencies recover
+  automatically (`REPAIR_AND_RESUME` or `RESUME`).
+  `plan_repairs` flags repair steps as `requires_human` when the target dependency or
+  action has exhausted its recovery budget.
+  `build_contract` withholds automatic machine-executable steps as `next_allowed_action`
+  under `REQUIRES_HUMAN`, ensuring automation cannot proceed until human intervention
+  clears the gate.
+  `GenericAgentAdapter` exposes `ledger` configuration and forwards scoping and
+  per-dependency budgets to `resume()`, `record_attempt()`, and `requires_human()`.
+
+- **`RecoveryLedger` now evaluates the human gate per external dependency, not
+  only for the run as a whole (#1428).** A single flaky upstream (a
+  rate-limited sandbox, a weather API) failed repeatedly and drained the run's
+  one global attempt budget, and once that pool was empty every later recovery,
+  including unrelated and highly reliable core tasks, escalated to a person.
+  `record_attempt` accepts a `dependency` and tags the attempt with it;
+  `requires_human` accepts the same `dependency` and counts only that
+  dependency's attempts against its own ceiling. Escalation writes a
+  namespaced, anchored `human_required:<dependency>` gate entry rather than the
+  run-wide marker, so exhausting one dependency escalates only that dependency,
+  and the marker survives compaction the same way the global one does.
+  Dependency ceilings come from an optional `dependency_budgets` section in
+  `.continuum/budgets.json` (`{"dependency_budgets": {"ext:weather-api": 2}}`),
+  validated on load like every other integer in the registry: a positive
+  integer, with a boolean or a float rejected rather than silently read as a cap
+  of 1. A dependency the section does not name falls back to
+  `default_max_attempts`, then to the caller's own threshold, so a registry
+  never has to list every dependency to govern all of them. The change is
+  additive: entries written before the field existed load with no dependency tag
+  and behave exactly as before.
+
 ### Fixed
 
 - **The MCP candidate fold now reads the full history, so `continuum_record_progress`
@@ -1154,7 +1193,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,501 collected, ~2,423 passed, ~28 skipped on a minimal env).
+  (~2,533 collected, ~2,423 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
