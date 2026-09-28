@@ -45,6 +45,37 @@ All notable changes to this project are documented here. The format follows
   timeline makes the repair agree with the incremental writer, so the
   completion stands and the claim still hits the cache. This subsumes the
   separate fold-only change that was open for #1054.
+- **The MCP candidate fold now reads the full history, so `continuum_record_progress`
+  and `continuum_record_plan` keep working on a compacted run (#1133).**
+  `_project_candidate` folded only the live tail; once compaction moved
+  `RUN_STARTED` into `events_archive`, the goal no longer projected and both
+  write tools refused every payload as "unprojectable" -- exactly the
+  long-running runs they exist for. It now folds `read_all_events`, so the goal
+  still projects and the head sequence it validates against is unchanged. The
+  original fix (PR #1219) was dropped in a merge-of-main and never landed.
+
+- **`DependencyGraph.impacted_by` now cascades taint along finding-to-finding
+  citation edges to a fixpoint (#1475).** Findings may cite other findings
+  (blessed by `SemanticState.dangling_evidence`), and `StateValidator._propagate`
+  iterated to a fixpoint so stale findings cascade down the derivation graph.
+  `impacted_by` previously only checked citations against the initial evidence
+  set in a single pass, missing findings and decisions that depended on tainted
+  findings. `DependencyGraph.impacted_by` now repeats until no new findings are
+  tainted, restoring parity with the validator and preventing stale downstream
+  findings and decisions from surviving localized repair plans.
+
+- **The edit-precondition gate now raises the exception subclass matching the
+  edit type it refused (#1114).** The gate picked `ForkPreconditionError` for
+  forks but the plain `EditPreconditionError` for every other edit type, so
+  `MergePreconditionError` and `RestorePreconditionError` -- both exported
+  through `recovery/__init__.py` -- were never raised anywhere and a caller
+  could not distinguish a merge refusal from a restore refusal by exception
+  type. `check_preconditions` now maps `edit_type` to its subclass, and the
+  two-sided `check_merge_preconditions` path raises `MergePreconditionError`
+  as well. The three subclasses are defined once in `gate.py` and re-exported
+  by `fork.py`, `merge.py` and `restore.py` as before, so existing imports and
+  `except EditPreconditionError` handlers are unaffected; only `type(exc)`
+  becomes observable.
 
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
