@@ -239,9 +239,16 @@ def langgraph_protected_node(
             if key_fields:
                 basis = {k: state.get(k) for k in key_fields}
             else:
-                basis = {
-                    k: v for k, v in sorted(state.items()) if isinstance(v, (str, int, float, bool))
-                }
+                # The whole state is the identity, not just its scalar fields.
+                # Filtering to str/int/float/bool silently dropped list/dict
+                # values, so two invocations differing only in a non-scalar
+                # field (the common LangGraph case, e.g. ``{"messages": [...]}``,
+                # which has no scalar fields at all) hashed to the same key and
+                # every call after the first was skipped as a duplicate --
+                # memoised output returned in place of a genuine execution.
+                # ``json.dumps(..., default=str)`` already serialises non-scalars
+                # deterministically, so include them.
+                basis = dict(sorted(state.items()))
             blob = json.dumps(basis, sort_keys=True, default=str)
             digest = hashlib.sha256(blob.encode()).hexdigest()[:16]
             return f"node:{node_name}:{digest}"
