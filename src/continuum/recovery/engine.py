@@ -144,7 +144,7 @@ class RecoveryDecision:
         the library will intervene. If you need the verdict *enforced*, that is
         a separate seam and none of them is on by default:
 
-        * the host gate (``continuum gate``, :mod:`continuum.recovery.gate`)
+        * the host gate (``continuum gate``, :mod:`continuum.gate`)
         * the HTTP gateway (``continuum gateway``, :mod:`continuum.gateway`)
         * the replay guard (:mod:`continuum.replayguard`)
         * observation hooks (``continuum hooks install``,
