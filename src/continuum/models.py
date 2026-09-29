@@ -786,6 +786,11 @@ class TrajectoryReport(BaseModel):
 
         The older basis is reproducible because the run id is the one piece the
         stored payload does not carry, and the caller auditing a run knows it.
+        It is also exact: that writer derived the id before a budget loop that
+        shed trailing list entries to fit 2048 bytes without recomputing it, but
+        the field validators bound both lists to five 128-character entries
+        beforehand, so a maximally-sized report still fits the budget and the
+        stored lists are always the ones the id was hashed from.
         """
         return stable_hash(
             {

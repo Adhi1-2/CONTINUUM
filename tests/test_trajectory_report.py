@@ -10,6 +10,7 @@ import tempfile
 from typing import Any
 
 from continuum.analysis.trajectory_report import (
+    TRAJECTORY_REPORT_CAP_BYTES,
     analyze_trajectory,
     build_trajectory_report,
     health_maybe_generate_trajectory_report,
@@ -681,6 +682,42 @@ def test_a_pre_1462_report_id_is_rerecognised_not_treated_as_tampering() -> None
     tampered = legacy.model_copy(update={"scar_rate": 0.0})
     assert tampered.legacy_digest_matches("run_1") is False
     assert tampered.digest_matches() is False
+
+
+def test_the_byte_cap_cannot_strip_the_lists_the_legacy_id_was_derived_from() -> None:
+    """The pre-#1461 cap loop cannot change what a stored report's id names.
+
+    That writer derived the id, then shed trailing list entries in a 2048-byte
+    budget loop without recomputing it. The loop is unreachable: the model's own
+    field validators bound both lists to five 128-character entries *before* the
+    id is computed, so a maximally-sized report still fits the budget with room
+    to spare, and the stored lists are always the ones the id was derived from.
+    A report at that ceiling still verifies against the older basis.
+    """
+    biggest = "x" * 128
+    ceiling = TrajectoryReport(
+        report_id="pending",
+        window_start=0,
+        window_end=999_999,
+        compaction_seq=999_999,
+        attempts=1000,
+        scar_rate=0.9999,
+        stall_sites=[biggest] * 5,
+        top_failure_action_types=[biggest] * 5,
+        derived_origin="deterministic",
+    )
+    # The budget the pre-#1461 writer measured, over the fields it carried.
+    legacy_payload = {
+        k: v
+        for k, v in ceiling.model_dump(mode="json").items()
+        if k not in ("total_attempts", "uncertain_count")
+    }
+    assert len(json.dumps(legacy_payload, sort_keys=True).encode()) < TRAJECTORY_REPORT_CAP_BYTES
+
+    # The lists the id was derived from are the lists the report stores.
+    expected_id = ceiling.legacy_digest("run_1")[:16]
+    ceiling = ceiling.model_copy(update={"report_id": expected_id})
+    assert ceiling.legacy_digest_matches("run_1") is True
 
 
 def test_old_report_payload_without_the_new_counts_still_loads() -> None:
