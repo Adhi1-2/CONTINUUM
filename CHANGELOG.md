@@ -206,7 +206,21 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
-- **Re-sync shared counts and repair integration seams opened by the #1400s
+- **File-derived progress no longer bloats the log on a compacted run.**
+  `record_file_progress` gates its mirror on a projection of the log, but folded
+  the live tail (`read_events`) alone. Once a run has been compacted the
+  goal-bearing prefix, `RUN_STARTED` included, lives in `events_archive`, so the
+  fold raised `ProjectionError` and the except branch fell through to "changed",
+  appending a redundant `TASK_UPDATED` and a duplicate-evidence tail on every call
+  over an unchanged file — the documented no-op contract was silently void. The
+  fold now reads the full history (`read_all_events`); a run with no goal yet
+  still raises against the merged history, so the "not yet projectable" behaviour
+  is unchanged. The reproject inside `GenericAgentAdapter.capture_state`'s auto
+  branch had the same live-tail read and rejected the checkpoint outright with
+  `TASK_UPDATED before the run was started` — the mirror's own appended event
+  could not fold against the archived start. It now reads the archive too.
+
+
   merges.** Several branches each synced the documented collected total on its
   own base, so once merged the tree collected more tests than every doc stated
   and the docs-count guard failed; README, the translated READMEs, CHANGELOG,
