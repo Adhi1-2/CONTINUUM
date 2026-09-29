@@ -4236,15 +4236,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="distil claims, uncertain side effects, scar rate and stall sites "
         "from the archive and the active log.",
     )
-    # Subparser default SUPPRESS: accepts a trailing --json without shadowing
-    # the global flag (#677), so `continuum report --trajectory RUN --json`
-    # parses the way the synopsis reads.
-    report.add_argument(
-        "--json",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="emit machine-readable JSON (same as the global flag).",
-    )
+    # ``--json`` reaches this subparser through ``json_parent`` like every
+    # other one; the #677 SUPPRESS default it needed already lives there, so
+    # re-adding it here raised a conflicting-option error.
 
     resume = with_env(add("resume", cmd_resume, "Decide how a run may resume."))
     resume.add_argument(
