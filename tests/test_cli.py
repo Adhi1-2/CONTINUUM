@@ -1613,6 +1613,22 @@ def test_json_flag_is_discoverable_on_every_subcommand() -> None:
     assert missing == []
 
 
+def test_report_does_not_redeclare_the_inherited_json_flag() -> None:
+    """``build_parser`` must not raise a conflicting-option error (#328).
+
+    ``report`` predates the inherited ``--json`` and carried its own SUPPRESS
+    copy (#677). When #328 hung the flag off a parent every subcommand
+    inherits, the leftover declaration made argparse reject the duplicate
+    ``--json`` and every ``build_parser()`` call -- including this suite's own
+    doc guards -- died. ``report`` must parse a trailing ``--json`` through the
+    inherited flag alone.
+    """
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["report", "--trajectory", "run_1", "--json"]).json is True
+
+
 def test_trailing_json_works_on_a_command_that_never_declared_it(db: str) -> None:
     """``runs --json`` is accepted and equals ``--json runs`` (#328).
 
