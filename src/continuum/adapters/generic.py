@@ -125,11 +125,15 @@ class GenericAgentAdapter(AgentAdapter):
         # Projecting prior declarations is an optimization (skip re-pinning the
         # same version). If the run has no goal yet, projection is impossible, so
         # fall back to declaring everything; project folds duplicates later.
+        # The fold reads the full history: once a run has been compacted the
+        # goal-bearing prefix (and with it any earlier declaration) lives only in
+        # the archive, so a live-tail read raises ProjectionError and the fallback
+        # below would re-pin every resource on every checkpoint.
         try:
             declared = {
                 dependency.resource: dependency.version
                 for dependency in project(
-                    run_id, self.storage.read_events(run_id)
+                    run_id, self.storage.read_all_events(run_id)
                 ).external_dependencies
             }
         except ProjectionError:
