@@ -489,6 +489,22 @@ All notable changes to this project are documented here. The format follows
   flows through it. No callers, not exported through `__all__`; recoverable
   from history (355ba76) if a future surface needs that exact rendering.
 
+- **Dead `restore_to_anchor` and `merge_to_anchor` wrappers (#1094).** Both
+  were exported in their modules' `__all__` from the #408 precondition-gate
+  work and neither ever gained a caller in `src/`, a script, or the CLI: the
+  live paths (`approve_restore` and `approve_merge`, reached from the restore
+  and merge commands) call the shared `check_preconditions` /
+  `check_merge_preconditions` gate directly, and `recovery/__init__.py`
+  re-exports only the `approve_*` entry points. `restore_to_anchor` was
+  additionally dishonest about its own signature: it declared a keyword-only
+  `reason` and never read it, so a caller passing an audit reason would have
+  it silently dropped rather than recorded on the `RUN_RESTORED` event the way
+  `approve_restore` records it. Both wrappers removed with their `__all__`
+  entries; the three merge tests that exercised the wrapper now call
+  `check_merge_preconditions` directly, so the gate's union behaviour stays
+  covered. Recoverable from history if a one-call "check then approve"
+  convenience ever earns a caller.
+
 ### Fixed
 
 - **The pin-marker surface no longer contradicts itself (#1099).** The docs
