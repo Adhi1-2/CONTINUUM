@@ -436,6 +436,33 @@ def test_an_empty_database_says_so(tmp_path: Path) -> None:
     assert "No runs recorded" in out
 
 
+def test_runs_refuses_a_zero_limit_instead_of_looking_empty(db: str) -> None:
+    """Issue #1354: --limit 0 must not misreport a populated store as empty.
+
+    SQLite reads LIMIT 0 as an empty listing, so passing it straight through
+    printed "No runs recorded." (exit 0) for a store that has runs. Mirror the
+    tree/provenance/impact contract and refuse limit < 1.
+    """
+    code, out, err = run("--db", db, "runs", "--limit", "0")
+    assert code == ExitCode.ERROR
+    assert "--limit must be 1 or more (got 0)" in err
+    assert "No runs recorded" not in out
+
+
+def test_runs_refuses_a_negative_limit_instead_of_ignoring_it(db: str) -> None:
+    """SQLite treats LIMIT -1 as unlimited, so a negative --limit was silently
+    ignored and listed everything; it must be rejected (issue #1354)."""
+    code, _, err = run("--db", db, "runs", "--limit", "-1")
+    assert code == ExitCode.ERROR
+    assert "--limit must be 1 or more (got -1)" in err
+
+
+def test_runs_still_honours_a_valid_limit(db: str) -> None:
+    code, out, _ = run("--db", db, "runs", "--limit", "5")
+    assert code == ExitCode.OK
+    assert "run_1" in out
+
+
 def test_init_reports_where_storage_lives(tmp_path: Path) -> None:
     path = str(tmp_path / "new.db")
     code, out, _ = run("--db", path, "init")
@@ -1567,3 +1594,50 @@ def test_json_flag_works_after_the_subcommand(db: str) -> None:
     code, out, _ = run("--db", db, "watch", "run_1", "--max-silence", "1h", "--json")
     assert code == ExitCode.OK, out
     assert json.loads(out)["breached"] is False
+
+
+def test_json_flag_is_discoverable_on_every_subcommand() -> None:
+    """--json appears in each subcommand's own help, not just the top parser (#328).
+
+    Newcomers check ``continuum <command> --help`` and used to see no ``--json``
+    there, so JSON output was invisible to them. Every subcommand inherits the
+    flag now, so its help must advertise it.
+    """
+    import argparse
+
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    subs = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    missing = [name for name, sp in subs.choices.items() if "--json" not in sp.format_help()]
+    assert missing == []
+
+
+def test_report_does_not_redeclare_the_inherited_json_flag() -> None:
+    """``build_parser`` must not raise a conflicting-option error (#328).
+
+    ``report`` predates the inherited ``--json`` and carried its own SUPPRESS
+    copy (#677). When #328 hung the flag off a parent every subcommand
+    inherits, the leftover declaration made argparse reject the duplicate
+    ``--json`` and every ``build_parser()`` call -- including this suite's own
+    doc guards -- died. ``report`` must parse a trailing ``--json`` through the
+    inherited flag alone.
+    """
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["report", "--trajectory", "run_1", "--json"]).json is True
+
+
+def test_trailing_json_works_on_a_command_that_never_declared_it(db: str) -> None:
+    """``runs --json`` is accepted and equals ``--json runs`` (#328).
+
+    ``runs`` never declared its own ``--json``; before #328 a trailing flag was
+    rejected as unrecognised. The inherited flag must produce identical JSON in
+    either position and must not clobber the global flag back to text.
+    """
+    trailing_code, trailing_out, _ = run("--db", db, "runs", "--json")
+    global_code, global_out, _ = run("--db", db, "--json", "runs")
+    assert trailing_code == ExitCode.OK, trailing_out
+    assert global_code == ExitCode.OK, global_out
+    assert json.loads(trailing_out) == json.loads(global_out)
