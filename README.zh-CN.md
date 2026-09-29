@@ -94,7 +94,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI 入口
 continuum-mcp --help             # MCP 服务器入口（需要 [mcp] 或 [dev]）
-pytest -q                        # 最小环境中约 2,843 个收集，约 2,363 个通过，约 41 个跳过（具体数量因环境而异）
+pytest -q                        # 最小环境中约 2,887 个收集，约 2,363 个通过，约 41 个跳过（具体数量因环境而异）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI 强制的三扇门禁
 ```
@@ -165,7 +165,7 @@ CONTINUUM 将 **LLM 上下文**（临时）与 **持久任务状态**（永久�
 
 ### 崩溃恢复，真实发生
 
-下面的图片不是模型图。它是 `python demo-run/generate_crash_visual.py` 的输出，该脚本让 `demo-run/worker.py` 运行至第 399 篇文档时执行 `os._exit(9)`，调用 `continuum resume --env dataset=v4` 并展示拒绝路径（`REQUEST_HUMAN`、`safe:false`、exit 20），用探针调和不确定的副作用，然后从同一数据库恢复并在无重复工作的情况下完成。转录也保存为 `docs/assets/crash-recovery.txt` 供审计。
+下面的图片不是模型图。它是 `python demo-run/generate_crash_visual.py` 的输出，该脚本让 `demo-run/worker.py` 运行至第 399 篇文档时执行 `os._exit(9)`，调用 `continuum resume --env dataset=v4` 并展示拒绝路径（`REQUEST_HUMAN`、`safe:false`、exit 21），用探针调和不确定的副作用，然后从同一数据库恢复并在无重复工作的情况下完成。转录也保存为 `docs/assets/crash-recovery.txt` 供审计。
 
 重新生成：
 

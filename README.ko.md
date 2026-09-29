@@ -95,7 +95,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI 진입점
 continuum-mcp --help             # MCP 서버 진입점 ([mcp] 또는 [dev] 필요)
-pytest -q                        # 최소 환경에서 약 2,843개 수집, 약 2,363개 통과, 약 41개 스킵 (정확한 수는 환경에 따라 다름)
+pytest -q                        # 최소 환경에서 약 2,887개 수집, 약 2,363개 통과, 약 41개 스킵 (정확한 수는 환경에 따라 다름)
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI가 강제하는 세 가지 게이트
 ```
@@ -166,7 +166,7 @@ CONTINUUM은 **LLM 컨텍스트**(일시적)와 **지속적인 작업 상태**(�
 
 ### 크래시 복구, 실제로
 
-아래 이미지는 목업이 아니다. `python demo-run/generate_crash_visual.py`의 출력이며, `demo-run/worker.py`를 문서 399에서 `os._exit(9)`까지 실행하고, `continuum resume --env dataset=v4`를 호출하여 거부 경로(`REQUEST_HUMAN`, `safe:false`, exit 20)를 보여주고, 불확실한 사이드 이펙트를 프로브로 조정하며, 동일한 데이터베이스에서 재개하여 중복 작업 없이 완료한다. 트랜스크립트는 감사를 위해 `docs/assets/crash-recovery.txt`로도 저장된다.
+아래 이미지는 목업이 아니다. `python demo-run/generate_crash_visual.py`의 출력이며, `demo-run/worker.py`를 문서 399에서 `os._exit(9)`까지 실행하고, `continuum resume --env dataset=v4`를 호출하여 거부 경로(`REQUEST_HUMAN`, `safe:false`, exit 21)를 보여주고, 불확실한 사이드 이펙트를 프로브로 조정하며, 동일한 데이터베이스에서 재개하여 중복 작업 없이 완료한다. 트랜스크립트는 감사를 위해 `docs/assets/crash-recovery.txt`로도 저장된다.
 
 재생성:
 

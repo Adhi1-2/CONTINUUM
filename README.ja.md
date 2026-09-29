@@ -95,7 +95,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI エントリーポイント
 continuum-mcp --help             # MCP サーバーエントリーポイント（[mcp] または [dev] が必要）
-pytest -q                        # 最小環境で約 2,843 件収集、約 2,363 件通過、約 41 件スキップ（正確な数は異なる）
+pytest -q                        # 最小環境で約 2,887 件収集、約 2,363 件通過、約 41 件スキップ（正確な数は異なる）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI が強制する三つのゲート
 ```
@@ -166,7 +166,7 @@ CONTINUUM は **LLM コンテキスト**（一時的）と **永続的なタス�
 
 ### クラッシュリカバリ、実際に
 
-下の画像はモックではない。`python demo-run/generate_crash_visual.py` の出力であり、`demo-run/worker.py` をドキュメント 399 で `os._exit(9)` まで実行し、`continuum resume --env dataset=v4` を呼び出して拒否パス（`REQUEST_HUMAN`、`safe:false`、exit 20）を示し、不確かな副作用を探査で調停し、同じデータベースから再開して重複作業なしで完了する。トランスクリプトは監査用に `docs/assets/crash-recovery.txt` としても保存される。
+下の画像はモックではない。`python demo-run/generate_crash_visual.py` の出力であり、`demo-run/worker.py` をドキュメント 399 で `os._exit(9)` まで実行し、`continuum resume --env dataset=v4` を呼び出して拒否パス（`REQUEST_HUMAN`、`safe:false`、exit 21）を示し、不確かな副作用を探査で調停し、同じデータベースから再開して重複作業なしで完了する。トランスクリプトは監査用に `docs/assets/crash-recovery.txt` としても保存される。
 
 再生成：
 

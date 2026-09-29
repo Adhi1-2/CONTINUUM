@@ -1211,10 +1211,12 @@ def cmd_watch(args: argparse.Namespace, storage: Storage, out: Any, err: Any) ->
         stream=out,
         palette=getattr(args, "_palette", None),
     )
-    # Exit code: breached maps to WAIT which is REQUIRES_HUMAN (20), otherwise OK
+    # Exit code: a breach proposes WAIT (never ROLLBACK, per #302), which is
+    # its own code (20) so a script can tell "hold and retry" apart from
+    # REQUEST_HUMAN; a clean read exits OK (issue #1170).
     if breached:
-        return 20
-    return 0
+        return ExitCode.WAIT
+    return ExitCode.OK
 
 
 def cmd_health(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
@@ -1380,6 +1382,26 @@ def cmd_notify_test(args: argparse.Namespace, storage: None, out: Any, err: Any)
     return ExitCode.OK
 
 
+def cmd_policy_review(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Advisory per-action-type report over recovery history (issue #743).
+
+    Aggregates repair attempts, human-gate outcomes, compaction survival and
+    reconciliation outcomes by action type, for periodic maintainer review.
+    Read-only, deterministic, live and archived history. The report is
+    evidence for a human decision, never a policy engine: nothing here feeds
+    ``plan_repairs`` or changes a recovery verdict, and a high human-required
+    rate means the probes or the workflow deserve investigation - not a
+    lower safety bar.
+    """
+    from continuum.recovery.policy_review import build_policy_review, render_policy_review
+
+    run_id = getattr(args, "run_id", None)
+    report = build_policy_review(storage, run_id)
+    text = "\n".join(render_policy_review(report))
+    _emit(report, text, as_json=args.json, stream=out, palette=getattr(args, "_palette", None))
+    return ExitCode.OK
+
+
 def _anchor_on_recovery(
     storage: Storage, run_id: str, decision: RecoveryDecision, err: Any
 ) -> None:
@@ -1437,7 +1459,7 @@ def cmd_resume(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         }
         # Machine JSON on stdout (same as every other resume _emit); text stays human-readable.
         _emit(payload, msg, as_json=args.json, stream=out)
-        # UNSAFE (30): run exists but resuming is not safe (distinct from NOT_FOUND / 2).
+        # UNSAFE (31): run exists but resuming is not safe (distinct from NOT_FOUND / 2).
         return ExitCode.UNSAFE
     engine = RecoveryEngine(storage, strict_unknown=not args.tolerate_unknown)
     decision = engine.assess(
@@ -2547,10 +2569,12 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
 
     # Diagnostic path (issue #742): the raw agent summary stays reachable,
     # verbatim, for an operator debugging the curation. Explicit opt-in, so
-    # the default briefing is the curated one.
+    # the default briefing is the curated one. Reads full history so a summary
+    # archived by compaction is still recoverable here, not just when the run
+    # is small enough to keep it in the live tail (issue #1128).
     if getattr(args, "raw_summary", False):
         summaries = [
-            e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY
+            e for e in storage.read_all_events(run_id) if e.type is EventType.REASONING_SUMMARY
         ]
         if not summaries:
             print(f"No reasoning summary recorded for {run_id}.", file=out)
@@ -4224,6 +4248,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     with_run(add("health", cmd_health, "Advisory prefix-trust health check. Read-only."))
+    policy_review = add(
+        "policy-review",
+        cmd_policy_review,
+        "Advisory per-action-type report over recovery history. Read-only.",
+    )
+    policy_review.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        help="limit the report to one run; omit to review every run.",
+    )
     # health is advisory only; it never gates, never moves mode, never changes exit code
     # (issue #401). It reports trust_score with per-dimension breakdown.
 
