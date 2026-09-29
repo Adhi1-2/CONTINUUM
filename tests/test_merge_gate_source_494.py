@@ -16,7 +16,7 @@ from continuum.actions.idempotency import idempotency_key
 from continuum.events import EventType
 from continuum.models import Run
 from continuum.recovery.gate import EditPreconditionError, check_merge_preconditions
-from continuum.recovery.merge import approve_merge, merge_to_anchor
+from continuum.recovery.merge import approve_merge
 from continuum.storage import SQLiteStorage
 
 
@@ -137,13 +137,13 @@ def test_clean_merge_of_two_branches_passes_and_stamps_both_summaries() -> None:
         assert lineage.payload["preconditions"]["depended_results"] == []
         assert lineage.payload["preconditions"]["uncertain_slots"] == []
         assert lineage.payload["source_run_id"] == "source"
-        # Also check merge_to_anchor stamps similarly when source given
+        # Also check the merge gate stamps similarly when source given
         storage2 = SQLiteStorage(":memory:")
         try:
             _make_run(storage2, "t2")
             _make_run(storage2, "s2")
-            derivation, carry_set, summary = merge_to_anchor(
-                storage2, "t2", 0, reason="clean2", source_run_id="s2"
+            derivation, carry_set, summary, _t2, _s2 = check_merge_preconditions(
+                storage2, target_run_id="t2", target_anchor=0, source_run_id="s2"
             )
             assert summary["unsettled_authorizations"] == []
             assert summary["depended_results"] == []
@@ -327,7 +327,7 @@ def test_source_side_each_kind_blocks_and_carry_by_key_action_sequence(kind: str
         storage.close()
 
 
-def test_merge_to_anchor_with_source_union() -> None:
+def test_merge_gate_with_source_union() -> None:
     storage = SQLiteStorage(":memory:")
     try:
         _make_run(storage, "target")
@@ -335,10 +335,16 @@ def test_merge_to_anchor_with_source_union() -> None:
         ledger = ActionLedger(storage, "source")
         out = ledger.claim("slack.notify", {"channel": "#ops"}, key="k1")
         with pytest.raises(EditPreconditionError):
-            merge_to_anchor(storage, "target", 0, reason="block", source_run_id="source")
+            check_merge_preconditions(
+                storage, target_run_id="target", target_anchor=0, source_run_id="source"
+            )
         # carry by source key passes
-        _, _, summary = merge_to_anchor(
-            storage, "target", 0, reason="carry", source_run_id="source", carry_forward=[out.key]
+        _, _, summary, _t, _s = check_merge_preconditions(
+            storage,
+            target_run_id="target",
+            target_anchor=0,
+            source_run_id="source",
+            carry_forward=[out.key],
         )
         assert summary is not None
     finally:
