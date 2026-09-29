@@ -32,9 +32,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from heapq import merge
+from pathlib import Path
 from types import TracebackType
 from typing import Any, ClassVar
 
+from continuum.environment.snapshot import EnvironmentSnapshot
 from continuum.events import Event, EventType, IntegrityReport
 from continuum.models import Action, Origin, Run, SemanticState, StateCheckpoint
 
@@ -112,13 +114,64 @@ class Storage(ABC):
     #: catching NotImplementedError, mirroring :attr:`supports_action_index`.
     supports_compaction: ClassVar[bool] = False
 
-    def compact_run(self, run_id: str, *, through_sequence: int | None = None) -> dict[str, int]:
+    @property
+    def storage_dir(self) -> Path:
+        """Directory used for auxiliary files (such as blobs)."""
+        return Path(".continuum")
+
+    @property
+    def blob_dir(self) -> Path:
+        """Directory used for content-addressed blob storage."""
+        return self.storage_dir / "blobs"
+
+    @property
+    def payload_offload_bytes(self) -> int:
+        """Configured payload offload threshold in bytes (0 = disabled)."""
+        from continuum.storage.blob import get_payload_offload_threshold
+
+        return get_payload_offload_threshold()
+
+    def compact_run(
+        self,
+        run_id: str,
+        *,
+        through_sequence: int | None = None,
+        environment: EnvironmentSnapshot | None = None,
+    ) -> dict[str, int]:
         """Archive the pre-anchor prefix of a run's log (issue #239).
 
         Only meaningful on engines with ``events_archive``; callers check
         :attr:`supports_compaction` first, which is the capability contract.
+
+        The forced anchor the compaction mints carries ``environment`` when the
+        caller supplies one. Without it the anchor would record no snapshot, and
+        an environment-blind checkpoint makes every pinned dependency
+        ``UNKNOWN`` at the next assessment, silently downgrading a clean run to
+        ``REQUEST_HUMAN`` (#1049). A caller that supplies nothing inherits the
+        environment the run's newest checkpoint already recorded: compaction
+        observes the world, it does not change it, so the last verified
+        environment is the one the anchor represents.
+
+        Content-addressed blobs referenced by archived events remain preserved
+        in the blob directory without modification (issues #254, #1419).
         """
         raise NotImplementedError
+
+    def _anchor_environment(
+        self, run_id: str, environment: EnvironmentSnapshot | None
+    ) -> EnvironmentSnapshot | None:
+        """The environment a forced anchor should record (#1049).
+
+        A caller-supplied snapshot wins. Without one the newest checkpoint's
+        recorded environment is carried forward: compaction observes the world,
+        it does not change it, so the last verified environment is the one the
+        boundary represents. ``None`` only survives when the run has no
+        checkpoint to inherit from, in which case there is nothing to carry.
+        """
+        if environment is not None:
+            return environment
+        prior = self.latest_checkpoint(run_id)
+        return prior.environment if prior is not None else None
 
     def _validate_compaction_bound(
         self, through_sequence: int | None, anchor_sequence: int
@@ -139,7 +192,12 @@ class Storage(ABC):
                 f" at sequence {anchor_sequence}: the live log must retain its anchor"
             )
 
-    def read_archived_events(self, run_id: str) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Read events moved into ``events_archive``, oldest first.
 
         Engines without an archive return an empty sequence, so a caller that
@@ -148,10 +206,15 @@ class Storage(ABC):
         action claims (and any other fold over history) intact across
         compaction: an archived fact is still a recorded fact.
         """
-        del run_id
+        del run_id, rehydrate
         return []
 
-    def read_all_events(self, run_id: str) -> Sequence[Event]:
+    def read_all_events(
+        self,
+        run_id: str,
+        *,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Full history including archived prefix, sorted by sequence.
 
         After compaction the live log holds only the anchor and tail; any
@@ -170,8 +233,14 @@ class Storage(ABC):
         sequence within that operation instead of rescanning the archive.
         Sorted to keep hash chain order stable.
         """
-        archived = list(self.read_archived_events(run_id))
-        live = list(self.read_events(run_id))
+        try:
+            archived = list(self.read_archived_events(run_id, rehydrate=rehydrate))
+        except TypeError:
+            archived = list(self.read_archived_events(run_id))
+        try:
+            live = list(self.read_events(run_id, rehydrate=rehydrate))
+        except TypeError:
+            live = list(self.read_events(run_id))
         if not archived:
             return live
         if not live:
@@ -318,6 +387,7 @@ class Storage(ABC):
         *,
         after_sequence: int = 0,
         upto: int | None = None,
+        rehydrate: bool = True,
     ) -> Sequence[Event]:
         """Live (unarchived) events in sequence order, windowed by ``after_sequence``/``upto``."""
         ...
@@ -328,7 +398,7 @@ class Storage(ABC):
         ...
 
     @abstractmethod
-    def verify_events(self, run_id: str) -> IntegrityReport:
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
         """Recompute the hash chain and report whether it is intact."""
         ...
 
