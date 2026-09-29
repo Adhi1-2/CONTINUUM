@@ -407,6 +407,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **`approve_restore` target resolution and input validation are now covered
+  branch by branch (#1292).** `tests/test_restore_target_resolution.py`
+  previously had one entry point, `approve_restore(..., anchor_sequence=0)`,
+  so every branch of `_anchor_for` and every guard in front of it was
+  uncovered and a change to any of them would have shipped green. The new
+  tests drive each rung directly and pin the exact error messages. Two are
+  load-bearing rather than redundant: the no-target case writes checkpoints
+  out of order so the highest version is not the highest `source_sequence`,
+  which catches a resolver returning the wrong field, and the cross-run case
+  pins that a checkpoint id belonging to another run is not a valid target.
+  `restore.py` is unchanged. Three lines stay uncovered: the `CorruptedRecord`
+  rung is already covered by `tests/test_checkpoint_corruption.py`, and the
+  trailing `checkpoint_id` ladder at `restore.py:76-78` is unreachable,
+  since a real id resolves in `get_checkpoint` before that loop runs.
+
 - **The `__all__` guard now walks the installed package instead of five
   hand-listed modules (#1228).** `tests/test_module_all_exports.py` asserted
   that names in `__all__` resolve by importing five modules by name, so a
@@ -1600,7 +1615,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,887 collected, ~2,849 passed, ~36 skipped on a minimal env).
+  (~2,906 collected, ~2,870 passed, ~36 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
