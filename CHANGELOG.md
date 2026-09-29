@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The architecture map is now guarded against silent drift (#1108).**
+  `references/architecture-data.md` is the source-verified map of the system,
+  but every countable claim in it had drifted: CLI commands were documented as
+  14 while the parser built 47, the MCP tool table listed 11 of 13 tools with a
+  read-only/mutating split that contradicted the diagram four sections later,
+  action states read 7 against an enum of 8, and `SemanticState` was missing
+  five of its fifteen fields. The refresh re-measures every figure against the
+  tree, and `tests/test_architecture_data_doc.py` keeps it honest: the CLI
+  command count, MCP tool total and read-only/mutating split, event types,
+  action states, checkpoint policies, recovery modes, and semantic-state field
+  count are each re-read from the live code, so a stale number fails CI instead
+  of misleading the next reader. Line numbers still move with every refactor,
+  so the durable citations are symbols, not offsets. The same rot had reached
+  the README's own module map (`130 modules` against a tree of 132, `182 test
+  files` against 186); it is now pinned the same way, and the collected-test
+  figure is re-synced across the READMEs, the onboarding doc, the references,
+  and the translated READMEs.
+
+
 - **The escalation policy that budgets human attention (#1409).** Every action
   the ledger cannot settle on its own becomes `REQUIRES_REVIEW` and interrupts
   a human at once, and on a weeks-long run that floods the reviewer into
@@ -1525,7 +1544,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,781 collected, ~2,745 passed, ~36 skipped on a minimal env).
+  (~2,809 collected, ~2,775 passed, ~34 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
