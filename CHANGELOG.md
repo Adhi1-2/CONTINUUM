@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`continuum policy-review` reports recovery history by action type (#743).**
+  A read-only, deterministic aggregate of repair attempts, human-gate
+  outcomes, compaction survival and reconciliation outcomes per action type,
+  over live and archived history alike, for periodic maintainer review. The
+  report is evidence for a human decision and never a policy engine: nothing
+  it computes feeds `plan_repairs` or changes a recovery verdict, and a high
+  human-required rate means the probes or the workflow deserve investigation,
+  not a lower safety bar. Without a `run_id` it spans every run.
+
 - **The escalation policy that budgets human attention (#1409).** Every action
   the ledger cannot settle on its own becomes `REQUIRES_REVIEW` and interrupts
   a human at once, and on a weeks-long run that floods the reviewer into
@@ -205,6 +214,20 @@ All notable changes to this project are documented here. The format follows
   additive: entries written before the field existed load with no dependency tag
   and behave exactly as before.
 ### Fixed
+
+- **`policy-review` no longer reports an uncertain side effect as absent.**
+  The `side_effect_actions` rows folded every `ACTION_RECONCILED` event that was
+  not `completed` into `reconciled_absent`, but only `reconcile(occurred=False)`
+  is a confirmation of absence. `ActionLedger.claim` also writes that event type
+  for whatever a caller-supplied `on_unknown` resolver returns, and such a
+  resolver can legitimately resolve to `UNKNOWN` ("the probe could not tell") or
+  `REQUIRES_REVIEW` ("a human has to judge"). Both were counted as confirmed
+  absence, so the report answered "was the effect absent?" with "yes" when the
+  truth was "nobody knows", which is the one claim a maintainer reading it must
+  not be able to make by mistake. Only `failed` counts as absent now; the other
+  two land in a new `reconciled_uncertain` bucket that the text render shows
+  alongside the other two, so the open question stays visible instead of being
+  reported as a finding.
 
 - **File-derived progress no longer bloats the log on a compacted run.**
   `record_file_progress` gates its mirror on a projection of the log, but folded
@@ -1597,7 +1620,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,887 collected, ~2,849 passed, ~34 skipped on a minimal env).
+  (~2,914 collected, ~2,877 passed, ~35 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
