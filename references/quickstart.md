@@ -9,9 +9,14 @@ continuum --help                     # the CLI entrypoint
 continuum-mcp --help                 # the MCP server entrypoint
 ```
 
-Registration with an MCP host, for example the project `.mcp.json` Claude Code
-reads, is documented in [docs/api/mcp.md](../docs/api/mcp.md#registration); the
-committed `.mcp.json` at the repo root is this repository's own registration.
+Registration with an MCP host is documented in
+[docs/api/mcp.md](../docs/api/mcp.md#registration): a PyPI install registers the
+bare `continuum-mcp` command, resolved from `PATH`. The committed `.mcp.json` at
+the repo root is this repository's own registration, and points at
+`${CLAUDE_PROJECT_DIR:-.}/.venv/bin/continuum-mcp` — that path exists only for a
+POSIX contributor who ran `uv venv` below (Windows installs the server as
+`.venv\Scripts\continuum-mcp.exe`), so it is not a registration a PyPI-only
+install should copy.
 
 Contributors and pre-release users work from a clone instead:
 
