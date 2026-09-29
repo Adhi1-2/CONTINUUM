@@ -296,6 +296,29 @@ def test_langgraph_node_fires_once_across_resume(db: str) -> None:
     assert len(counter) == 1, "protected node re-fired on resume"
 
 
+def test_langgraph_node_distinguishes_nonscalar_state(db: str) -> None:
+    """Two states differing only in a list/dict field are distinct identities.
+
+    The default identity basis used to filter the state to its scalar fields
+    (``str``/``int``/``float``/``bool``), silently dropping every ``list``/``dict``
+    value. A LangGraph state like ``{"messages": [...]}`` has no scalar fields at
+    all, so the basis was ``{}`` for every invocation: the first node call
+    executed and journalled, and every later call -- regardless of content -- was
+    skipped as a duplicate and handed the first call's memoised output. The
+    identity has to cover the non-scalar state, or genuinely different inputs
+    collide onto one execution.
+    """
+    counter: list[int] = []
+    node = langgraph_protected_node(SQLiteStorage(db), "run_1")(
+        lambda state: (counter.append(1), {"value": len(counter)})[1]
+    )
+
+    node({"messages": ["a"]})  # first identity -> executes
+    node({"messages": ["a", "b"]})  # different content -> must also execute
+
+    assert len(counter) == 2, "distinct non-scalar states collided onto one identity"
+
+
 def test_chaos_matrix_crash_points(db: str) -> None:
     """Zylos crash-point matrix, encoded: each point leaves the ledger in a
     state whose recovery story is deterministic."""
