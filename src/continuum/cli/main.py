@@ -2657,25 +2657,48 @@ def cmd_report(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
 
     # The quiet-time path persists its own TRAJECTORY_REPORT events. Each is
     # auditable on its own terms: its id must be the prefix of the digest its
-    # stored fields recompute. One that is not was edited after it was built, or
-    # written by a version that hashed different fields; either way it cannot be
-    # traced back to the events it summarises, which is an integrity failure
-    # rather than a stylistic difference. The fresh fold is checked the same way.
+    # stored fields recompute. One that is not was edited after it was built,
+    # or written by a version that hashed different fields. The two are not the
+    # same thing: a tampered report cannot be traced to anything, while a
+    # pre-#1461 report still hashes to its own id under the older basis. That
+    # basis is reproducible here because the run id is the one input the stored
+    # payload does not carry and the auditor knows it, so an existing database
+    # reads as authentic instead of corrupt (#1462). The fresh fold is checked
+    # the same way.
     stored_reports = _stored_trajectory_reports(storage, args.run_id)
-    unverified = [r for r in stored_reports if not r.digest_matches()]
+    verified: list[TrajectoryReport] = []
+    legacy: list[TrajectoryReport] = []
+    unverified: list[TrajectoryReport] = []
+    for stored in stored_reports:
+        if stored.digest_matches():
+            verified.append(stored)
+        elif stored.legacy_digest_matches(args.run_id):
+            legacy.append(stored)
+        else:
+            unverified.append(stored)
 
     lines = render_trajectory_report(report)
     if not stored_reports:
         lines.append(f"  digest {report.digest()} (no stored report to audit)")
     elif not unverified:
-        lines.append(
-            f"  digest {report.digest()} ({len(stored_reports)} stored report(s) all verify)"
-        )
+        if legacy:
+            lines.append(
+                f"  digest {report.digest()} ({len(verified)} stored report(s) verify, "
+                f"{len(legacy)} written before #1461 carry the older id: authentic, "
+                "but not auditable against this digest)"
+            )
+        else:
+            lines.append(
+                f"  digest {report.digest()} ({len(stored_reports)} stored report(s) all verify)"
+            )
     else:
-        lines.append(
-            f"  digest {report.digest()} ({len(unverified)} of {len(stored_reports)} stored "
-            "report(s) fail their own digest check)"
+        detail = (
+            f"{len(unverified)} of {len(stored_reports)} stored "
+            "report(s) fail their own digest check"
         )
+        if legacy:
+            detail += f", {len(legacy)} older report(s) verify against the pre-#1461 id"
+        lines.append(f"  digest {report.digest()} ({detail})")
 
     _emit(
         {
@@ -2683,6 +2706,7 @@ def cmd_report(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             "digest": report.digest(),
             "stored_report_ids": [r.report_id for r in stored_reports],
             "unverified_stored_report_ids": [r.report_id for r in unverified],
+            "legacy_stored_report_ids": [r.report_id for r in legacy],
         },
         "\n".join(lines),
         as_json=args.json,
