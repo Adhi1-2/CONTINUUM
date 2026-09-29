@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from continuum.events import EventType
-from continuum.gate import is_memory_key, normalize_key_value
+from continuum.gate import is_memory_key, is_memory_template, normalize_key_value
 from continuum.models import Origin
 
 __all__ = [
@@ -119,13 +119,31 @@ def load_gateway_config(path: Path) -> list[Route]:
         raise GatewayConfigError(f"{location}: expected {{'upstreams': [...]}}")
     for entry in entries:
         try:
+            kt = str(entry["key_template"])
+            if is_memory_template(kt):
+                import string as _string
+
+                fields = {name for _, name, _, _ in _string.Formatter().parse(kt) if name}
+                has_tenant = "tenant" in fields or "tenant_id" in fields
+                required = (
+                    ("store_id", "namespace", "record_key")
+                    if kt.startswith("memory:")
+                    else ("store_id", "record_key")
+                )
+                missing = [f for f in required if f not in fields]
+                if not has_tenant:
+                    missing.append("tenant")
+                if missing:
+                    raise GatewayConfigError(
+                        f"{location}: upstream key template {kt!r} missing required placeholder(s): {', '.join(missing)}"
+                    )
             routes.append(
                 Route(
                     host=str(entry["host"]),
                     methods=tuple(m.upper() for m in entry.get("methods", ("POST",))),
                     prefix=str(entry.get("prefix", "/")),
                     action_type=str(entry["action_type"]),
-                    key_template=str(entry["key_template"]),
+                    key_template=kt,
                 )
             )
         except KeyError as exc:
@@ -136,11 +154,11 @@ def load_gateway_config(path: Path) -> list[Route]:
 def load_gateway_tenant(path: Path) -> str | None:
     """Read optional bound tenant from gateway config.
 
-    When present, memory-store routes (``mem:``) are tenant-scoped: a
-    request whose ``tenant`` field does not match the bound identity is
+    When present, memory-store routes (``mem:`` or ``memory:``) are tenant-scoped: a
+    request whose tenant field does not match the bound identity is
     denied at the gateway rather than surfacing later as a breach. This
     is configuration and a check, not new infrastructure (issue #566,
-    parent #304).
+    parent #304, issue #1415).
     """
     if not path.exists():
         return None
@@ -150,7 +168,7 @@ def load_gateway_tenant(path: Path) -> str | None:
         return None
     if not isinstance(raw, dict):
         return None
-    bound = raw.get("bound_tenant") or raw.get("tenant")
+    bound = raw.get("bound_tenant") or raw.get("tenant") or raw.get("tenant_id")
     if isinstance(bound, str) and bound.strip():
         return bound.strip()
     return None
@@ -163,6 +181,17 @@ def render_key(template: str, body: dict[str, Any]) -> str:
     (:func:`continuum.gate.normalize_key_value`): the proxy and the hook must
     derive the same key for the same operation, or a call claimed through one
     seam looks unclaimed at the other.
+
+    A memory template's segments are colon-delimited
+    (``mem:{store_id}:{tenant}:{record_key}``), so a placeholder value that
+    itself contains a colon shifts the segments and defeats the positional
+    tenant check in :func:`match_route` -- a caller controlling ``store_id``
+    could make ``parts[2]`` read as the bound tenant while the real ``tenant``
+    was something else (#1149). Such a value is rejected at the boundary so the
+    flattened key can only ever be re-parsed one way. Only the placeholders
+    before the terminal segment are guarded: a colon in the last field cannot
+    move ``parts[2]`` and is re-parsed downstream as ``":".join(parts[3:])``,
+    so a record key like ``doc:section:1`` stays valid.
     """
     import string
 
@@ -170,7 +199,21 @@ def render_key(template: str, body: dict[str, Any]) -> str:
     missing = [f for f in fields if f not in body]
     if missing:
         raise GatewayConfigError(f"key template {template!r} needs body field(s) {missing}")
-    return template.format(**{f: normalize_key_value(body[f]) for f in fields})
+    values = {f: normalize_key_value(body[f]) for f in fields}
+    if is_memory_template(template):
+        # Only the placeholders before the terminal segment can shift the
+        # positions, and the check reads the formatted value rather than only
+        # ``str`` ones: ``str.format`` renders a non-string such as
+        # ``["x:acme:"]`` as ``['x:acme:']``, which carries the same shifting
+        # colon without ever being a string.
+        guarded = set(fields[:-1])
+        for field, value in values.items():
+            if field in guarded and ":" in str(value):
+                raise GatewayConfigError(
+                    f"memory template {template!r} field {field!r} must not contain ':' "
+                    f"(it would shift the key's colon-delimited segments), got {value!r}"
+                )
+    return template.format(**values)
 
 
 def _normalize_path(raw: str) -> str:
@@ -280,33 +323,64 @@ def match_route(
             f"methods {[m.lower() for m in scoped[0].methods]}",
         )
 
+    # A memory key's segments are colon-delimited, so a colon in a placeholder
+    # value before the terminal segment shifts them and defeats the positional
+    # tenant check below (#1415). Deny as malformed here, before rendering, so
+    # ``render_key``'s boundary check is never the seam that answers a proxy
+    # request: the hook raises ``GateConfigError`` and the proxy answers
+    # "malformed memory key", and each test targets its own seam. Only the
+    # fields before the terminal one are checked -- a colon in the last segment
+    # cannot move the tenant position and is re-parsed downstream as
+    # ``":".join(parts[3:])``, so a record key such as ``doc:section:1`` stays
+    # a valid write (#1149 review). The two seams must agree on which colons
+    # are allowed, or a call denied at the proxy would render and claim at the
+    # hook.
+    if is_memory_template(route.key_template):
+        import string as _fields_string
+
+        _fields = [f for _, f, _, _ in _fields_string.Formatter().parse(route.key_template) if f]
+        for _field in _fields[:-1]:
+            _value = body.get(_field, "")
+            if ":" in str(normalize_key_value(_value)):
+                return Decision(
+                    False,
+                    f"malformed memory key: template {route.key_template!r} field {_field!r} "
+                    f"must not contain ':' (it would shift the key's colon-delimited "
+                    f"segments), got {_value!r}",
+                    route=route,
+                )
+
     try:
         rendered = render_key(route.key_template, body)
     except GatewayConfigError as exc:
         return Decision(False, f"gateway configuration error: {exc}")
 
-    # Tenant deny (issue #566): memory keys carry tenant in the
-    # rendered identity. When a bound tenant is configured, a claim
-    # whose tenant prefix does not match is denied at the gate rather
-    # than surfacing later as a breach.
-    if is_memory_key(rendered) and bound_tenant is not None:
-        # Extract tenant from rendered mem key: mem:store:tenant:record
+    # Tenant boundary enforcement (issue #566, issue #1415): memory keys carry
+    # tenant in the rendered identity. When a bound tenant is configured or
+    # present in the run context, a claim whose tenant namespace does not match
+    # is denied at the gate rather than surfacing later as a breach.
+    if bound_tenant is None and storage is not None and hasattr(storage, "get_run"):
         try:
-            parts = rendered.split(":")
-            # mem:{store_id}:{tenant}:{record_key} -> tenant is third segment
-            if len(parts) >= 4:
-                tenant_in_key = parts[2]
-                if tenant_in_key != bound_tenant:
-                    return Decision(
-                        False,
-                        f"tenant mismatch: bound {bound_tenant!r} but key {rendered!r} carries tenant {tenant_in_key!r}",
-                        route=route,
-                    )
-            else:
-                # Malformed mem key but already rendered; deny closed
-                return Decision(False, f"malformed memory key {rendered!r}", route=route)
+            run_obj = storage.get_run(run_id)
+            if run_obj and getattr(run_obj, "metadata", None):
+                meta_tenant = run_obj.metadata.get("tenant_id") or run_obj.metadata.get("tenant")
+                if meta_tenant and str(meta_tenant).strip():
+                    bound_tenant = str(meta_tenant).strip()
         except Exception:
-            return Decision(False, f"tenant check failed for {rendered!r}", route=route)
+            pass
+
+    if is_memory_key(rendered) and bound_tenant is not None:
+        import string as _string
+
+        fields = [f for _, f, _, _ in _string.Formatter().parse(route.key_template) if f]
+        tenant_field = "tenant_id" if "tenant_id" in fields else "tenant"
+        tenant_in_key = str(normalize_key_value(body.get(tenant_field, "")))
+        if tenant_in_key != bound_tenant:
+            return Decision(
+                False,
+                f"tenant mismatch: bound {bound_tenant!r} but key {rendered!r} carries tenant {tenant_in_key!r}",
+                route=route,
+            )
 
     # Memory keys are global to the store, not the run, so use scope=None
     # to let the action_index catch cross-run double-writes.
@@ -322,11 +396,51 @@ def match_route(
             if getattr(storage, "supports_action_index", False):
                 foreign_action = storage.foreign_action(key, exclude_run=run_id)
                 if foreign_action is not None:
+                    # Mirror gate.decide's status table for a foreign record
+                    # (the docstring promises this) instead of one blanket
+                    # "reconcile it first": reconcile only fits UNKNOWN, and
+                    # a terminal foreign record (FAILED/COMPENSATED) left no
+                    # live effect, so the way forward is a fresh claim, not a
+                    # reconcile that has nothing to settle (#765e4bc). A
+                    # foreign STARTED is still denied here: a live claim in
+                    # another run must not authorise a parallel write to the
+                    # same global key.
+                    fstatus = foreign_action.status
+                    if fstatus is ActionStatus.COMPLETED:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} "
+                            f"was already completed in another run"
+                            + (
+                                f" (external id {foreign_action.external_id!r})"
+                                if foreign_action.external_id
+                                else ""
+                            )
+                            + "; do not repeat it",
+                            route=route,
+                        )
+                    if fstatus is ActionStatus.UNKNOWN:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} has an "
+                            f"unknown outcome in another run; reconcile it first "
+                            f"(continuum_reconcile_action)",
+                            route=route,
+                        )
+                    if fstatus is ActionStatus.STARTED:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} is "
+                            f"claimed live in another run; it must settle before this "
+                            f"run can claim it",
+                            route=route,
+                        )
                     return Decision(
                         False,
-                        f"side effect {route.action_type!r} key {rendered!r} "
-                        f"already has a claim in another run "
-                        f"({foreign_action.status.value}); reconcile it first",
+                        f"the previous attempt of {route.action_type!r} with key "
+                        f"{rendered!r} in another run is closed (status "
+                        f"{fstatus.value}); claim it again through "
+                        f"continuum_intercept_action before retrying",
                         route=route,
                     )
         except Exception:
@@ -518,6 +632,48 @@ class GatewayServer:
                     if run_id is None:
                         self._respond(403, {"error": "no active CONTINUUM run"})
                         return
+                    bound_tenant = getattr(server, "_bound_tenant", None)
+                    header_tenant = self.headers.get("X-Continuum-Tenant")
+                    if header_tenant:
+                        header_tenant = str(header_tenant).strip()
+
+                    try:
+                        run_obj = storage.get_run(run_id) if hasattr(storage, "get_run") else None
+                    except Exception:
+                        run_obj = None
+                    run_metadata = getattr(run_obj, "metadata", {}) or {}
+                    run_tenant = run_metadata.get("tenant_id") or run_metadata.get("tenant")
+                    if run_tenant:
+                        run_tenant = str(run_tenant).strip()
+
+                    if bound_tenant and header_tenant and bound_tenant != header_tenant:
+                        self._respond(
+                            403,
+                            {
+                                "error": "denied by CONTINUUM gateway",
+                                "reason": (
+                                    f"tenant mismatch: header {header_tenant!r} "
+                                    f"does not match bound tenant {bound_tenant!r}"
+                                ),
+                            },
+                        )
+                        return
+
+                    if run_tenant and header_tenant and run_tenant != header_tenant:
+                        self._respond(
+                            403,
+                            {
+                                "error": "denied by CONTINUUM gateway",
+                                "reason": (
+                                    f"tenant mismatch: header {header_tenant!r} "
+                                    f"does not match run tenant {run_tenant!r}"
+                                ),
+                            },
+                        )
+                        return
+
+                    effective_tenant = bound_tenant or header_tenant or run_tenant
+
                     from continuum.actions.ledger import fold_action_events
 
                     history = storage.read_all_events(run_id)
@@ -525,6 +681,7 @@ class GatewayServer:
                     from continuum.gate import collect_consumed_authorities
 
                     consumed = collect_consumed_authorities(history)
+
                     decision = match_route(
                         server._routes,
                         host=host.split(":")[0],
@@ -533,7 +690,7 @@ class GatewayServer:
                         body=body,
                         actions_by_key=actions,
                         run_id=run_id,
-                        bound_tenant=getattr(server, "_bound_tenant", None),
+                        bound_tenant=effective_tenant,
                         storage=storage,
                         consumed_authorities=consumed,
                     )
@@ -566,9 +723,17 @@ class GatewayServer:
                         resp = conn.getresponse()
                         resp_body = resp.read()
                         status = resp.status
-                    except OSError as exc:
+                    except (OSError, http_client.HTTPException) as exc:
+                        # A dropped connection (OSError) or a malformed/truncated
+                        # upstream response (http.client.HTTPException: IncompleteRead,
+                        # BadStatusLine, ...) is an *uncertain* outcome: the request may
+                        # already have reached the upstream and fired the effect. Settle
+                        # the claim UNKNOWN so recovery forces reconciliation. Catching
+                        # only OSError let HTTPException escape with the claim still
+                        # STARTED, and a retry then re-fired the effect the gateway
+                        # exists to make exactly-once.
                         ledger = ActionLedger(storage, run_id)
-                        ledger.fail(decision.key, f"network error: {exc}", certain=False)
+                        ledger.fail(decision.key, f"upstream I/O error: {exc}", certain=False)
                         self._respond(
                             502, {"error": "upstream unreachable", "detail": str(exc)[:200]}
                         )
