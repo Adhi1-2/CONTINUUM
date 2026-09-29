@@ -190,3 +190,20 @@ def test_raw_summary_diagnostic_reads_the_archive_after_compaction(db: str) -> N
     assert code == ExitCode.OK, err
     assert "No reasoning summary recorded" not in out
     assert json.loads(out)["summary"]["plan_stack"] == ["settle outstanding amount for INV-001"]
+
+
+def test_briefing_names_the_risks_behind_the_verdict(db: str) -> None:
+    """Issue #1424: the verified contract section lists the RISK_OBSERVED ids
+    that produced the verdict, so a resumed session knows which observation to
+    explain rather than only the mode it ended in."""
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1",
+            EventType.RISK_OBSERVED,
+            {"risk_id": "risk-1", "trigger": "meltdown"},
+            source=Origin.EXTERNAL_MONITOR,
+        )
+    code, out, err = run("--db", db, "briefing")
+    assert code == ExitCode.OK, err
+    assert "recovery verdict:" in out
+    assert "triggering risks:" in out

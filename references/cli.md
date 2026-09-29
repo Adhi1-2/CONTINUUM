@@ -27,6 +27,7 @@ continuum tree <run_id> [--limit N]              # show parent run and child run
 continuum fork <run_id> --reason "..."           # approve divergent child continuation. mutates
 continuum merge <run_id> --reason "..."          # merge child run into parent at anchor. mutates
 continuum restore <run_id> --reason "..."        # restore run to anchor checkpoint. mutates
+                                                 #   [--to <id|version|seq> | --anchor N | --to-recovery-anchor]
 continuum compact <run_id>                       # archive pre-anchor log prefix. mutates
 continuum precompact <run_id>                    # checkpoint before context compaction. mutates
 continuum rewind <run_id> --to <checkpoint>      # revert workspace and projection [--force] [--dry-run]
@@ -39,6 +40,7 @@ continuum hooks install <client> [--with-gate]   # wire a coding CLI (claude-cod
 continuum health <run_id>                        # advisory prefix-trust health check
 continuum impact <run_id> --evidence <id>        # downstream impact of an evidence item
 continuum provenance <run_id>                    # show provenance DAG
+continuum report --trajectory <run_id>           # claims, uncertain side effects, scar rate, stall sites
 continuum record-plan <run_id> --plan-id <id>    # record structured plan upsert. mutates
 continuum export-evidence <run_id>               # export evidence as JSON lines
 continuum forget --tenant <id> [--dry-run]       # tombstone memory records for a tenant. mutates
@@ -52,12 +54,14 @@ continuum attest-verify <run_id> --attest <file> # verify signed attestation aga
 continuum benchmark [--total N]                  # run CONTINUUM-Bench harness
 ```
 
-Most commands accept global `--json` **before** the subcommand (e.g. `continuum --json resume RUN`). Read-only commands (`inspect`, `status`, `history`, `events`,
+Most commands accept global `--json` **before** the subcommand (e.g. `continuum --json resume RUN`), not after it; `continuum resume RUN --json` exits 2 with an argument error. Read-only commands (`inspect`, `status`, `history`, `events`,
 `diff`, `validate`, `resume`, `verify`, `actions`, `show-contract`, `replay`, `budget`, `tree`,
 `gate`, `briefing`, `health`, `impact`, `provenance`, `export-evidence`, `watch`) do not mutate
 run state or checkpoints. **Exception:** plain `resume` (without `--repair`) may still append
 `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` events when `.continuum/webhooks.json` is configured
-for a blocked decision — the recovery decision itself remains non-mutating. Mutating commands (`start`,
+for a blocked decision — the recovery decision itself remains non-mutating. With `--repair`, `resume`
+also records a `RECOVERY` anchor (`checkpoint_on_recovery`) after a non-RESUME verdict, which
+`restore --to-recovery-anchor` rolls back to. Mutating commands (`start`,
 `checkpoint`, `confirm`, `complete`, `fork`, `merge`, `restore`, `compact`, `precompact`, `rewind`,
 `observe`, `reconcile`, `gateway`, `record-plan`, `forget`) say so in their help.
 
@@ -107,7 +111,7 @@ $ echo $?
 ### State Diff
 
 ```bash
-continuum diff checkpoint_a checkpoint_b
+continuum diff run_42 1 2
 ```
 
 ```diff
