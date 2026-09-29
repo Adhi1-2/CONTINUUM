@@ -27,11 +27,16 @@ so it runs for real in CI against a Postgres service.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
+from continuum.environment.snapshot import EnvironmentSnapshot
 from continuum.events import CAUSED_BY_TYPES, Event, EventType, IntegrityReport, IntegrityViolation
 from continuum.models import (
     Action,
@@ -51,6 +56,13 @@ from continuum.storage.base import (
     CorruptedRecord,
     RunNotFound,
     Storage,
+)
+from continuum.storage.blob import (
+    audit_blob_descriptor,
+    get_payload_offload_threshold,
+    is_offload_descriptor,
+    load_blob_payload,
+    maybe_offload_payload,
 )
 
 __all__ = [
@@ -185,7 +197,14 @@ class PostgresStorage(Storage):
     supports_action_index = True
     supports_compaction = True
 
-    def __init__(self, url: str | Any, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str | Any,
+        *,
+        timeout: float = 30.0,
+        storage_dir: str | Path | None = None,
+        payload_offload_bytes: int | None = None,
+    ) -> None:
         psycopg = _require_psycopg()
         self._psycopg = psycopg
         from psycopg.rows import dict_row
@@ -197,9 +216,29 @@ class PostgresStorage(Storage):
             )
         except Exception as exc:  # connection refused, auth, missing driver, etc.
             raise RuntimeError(f"could not connect to PostgreSQL at {dsn!r}: {exc}") from exc
+        self._storage_dir = Path(storage_dir) if storage_dir is not None else None
+        self._payload_offload_bytes = (
+            max(int(payload_offload_bytes), 0) if payload_offload_bytes is not None else None
+        )
         self._lock = threading.RLock()
         self._configure()
         self._create_schema()
+
+    @property
+    def storage_dir(self) -> Path:
+        """Directory used for auxiliary files (such as blobs)."""
+        if self._storage_dir is not None:
+            return self._storage_dir
+        if os.environ.get("CONTINUUM_STORAGE_DIR"):
+            return Path(os.environ["CONTINUUM_STORAGE_DIR"])
+        return Path(".continuum")
+
+    @property
+    def payload_offload_bytes(self) -> int:
+        """Payload offload threshold in bytes (0 = disabled)."""
+        if self._payload_offload_bytes is not None:
+            return self._payload_offload_bytes
+        return get_payload_offload_threshold()
 
     @staticmethod
     def _normalize_dsn(url: str) -> str:
@@ -471,18 +510,27 @@ class PostgresStorage(Storage):
                 f"run {run_id!r} is at sequence {current}, caller expected {expected_sequence}"
             )
 
+        raw_payload = payload
+        effective_payload: Mapping[str, Any] = dict(payload or {})
+        if self.payload_offload_bytes > 0:
+            effective_payload, _ = maybe_offload_payload(
+                effective_payload,
+                storage_dir=self.storage_dir,
+                threshold=self.payload_offload_bytes,
+            )
+
         event = Event(
             event_id=make_id("event"),
             run_id=run_id,
             sequence=current + 1,
             type=type,
             timestamp=utcnow(),
-            payload=dict(payload or {}),
+            payload=effective_payload,
             causer_event_id=causer_event_id,
             source=source,
             prev_hash=head["hash"] if head else None,
         ).sealed()
-        self._insert_event(event)
+        self._insert_event(event, raw_payload=raw_payload)
         return event
 
     def append_sealed(self, event: Event) -> Event:
@@ -534,7 +582,7 @@ class PostgresStorage(Storage):
             self._insert_event(event)
         return event
 
-    def _insert_event(self, event: Event) -> None:
+    def _insert_event(self, event: Event, raw_payload: Mapping[str, Any] | None = None) -> None:
         try:
             self._connection.execute(
                 "INSERT INTO events(run_id, sequence, event_id, type, timestamp, payload, "
@@ -557,15 +605,18 @@ class PostgresStorage(Storage):
             raise ConcurrentWriteError(
                 f"run {event.run_id!r} sequence {event.sequence} was taken by another writer"
             ) from exc
-        self._maintain_action_index(event)
+        self._maintain_action_index(event, payload=raw_payload)
 
-    def _maintain_action_index(self, event: Event) -> None:
+    def _maintain_action_index(
+        self, event: Event, payload: Mapping[str, Any] | None = None
+    ) -> None:
         """Upsert the projection row for an ACTION_* event, same txn (#216).
 
         updated_seq comes from a sequence so recency is global insertion
         order, matching the global last-write-per-key fold.
         """
-        entry = index_entry_from_payload(event.type, dict(event.payload))
+        target_payload = dict(payload if payload is not None else event.payload)
+        entry = index_entry_from_payload(event.type, target_payload)
         if entry is None:
             return
         key, run_id, action_id, status, action_json = entry
@@ -587,7 +638,13 @@ class PostgresStorage(Storage):
         row = self._connection.execute("SELECT nextval('action_index_ord_seq') AS v").fetchone()
         return int(row["v"])
 
-    def compact_run(self, run_id: str, *, through_sequence: int | None = None) -> dict[str, int]:
+    def compact_run(
+        self,
+        run_id: str,
+        *,
+        through_sequence: int | None = None,
+        environment: EnvironmentSnapshot | None = None,
+    ) -> dict[str, int]:
         """Archive the pre-anchor prefix of a run's log (issue #239).
 
         A forced anchor checkpoint first records state at the boundary (its
@@ -607,12 +664,31 @@ class PostgresStorage(Storage):
         genesis and fork the hash chain away from the archive. The check is
         shared with the SQLite backend so the two cannot drift apart again
         (issue #1078).
+
+        Content-addressed blobs referenced by archived events remain preserved
+        in the blob directory without modification (issues #254, #1419).
+
+        The anchor carries ``environment`` when supplied, else the environment
+        the run's newest checkpoint already recorded (#1049): an
+        environment-blind anchor makes every pinned dependency UNKNOWN at the
+        next assessment and silently downgrades a clean run.
         """
         from continuum.checkpoint.manager import CheckpointManager
 
         lv = self.latest_version(run_id)
         head = self.last_sequence(run_id)
-        needs_fresh_anchor = lv is None or through_sequence is not None or lv.source_sequence < head
+        # A caller-supplied environment has to land on a checkpoint, so it
+        # forces the fresh-anchor path whatever the log state. In practice the
+        # other terms already cover every reachable state (a version's
+        # STATE_CHECKPOINTED annotation sits one past its source_sequence, so
+        # head always outruns it); this term keeps the caller's request from
+        # depending on that invariant (#1049).
+        needs_fresh_anchor = (
+            lv is None
+            or through_sequence is not None
+            or lv.source_sequence < head
+            or environment is not None
+        )
         if needs_fresh_anchor:
             try:
                 manager = CheckpointManager(self)
@@ -622,7 +698,16 @@ class PostgresStorage(Storage):
                 # never started (issue #648). Per-turn checkpoint evaluation
                 # deliberately keeps the cheaper live-tail read.
                 state = manager.project_current(run_id, full_history=True)
-                manager.checkpoint(run_id, state=state, force_version=True)
+                manager.checkpoint(
+                    run_id,
+                    state=state,
+                    force_version=True,
+                    # The anchor carries the environment the run's newest
+                    # checkpoint already recorded when none is supplied
+                    # (#1049): an environment-blind anchor makes every pinned
+                    # dependency UNKNOWN at the next assessment.
+                    environment=self._anchor_environment(run_id, environment),
+                )
             except Exception as exc:
                 raise ValueError(f"run {run_id!r} could not be anchored: {exc}") from exc
             lv = self.latest_version(run_id)
@@ -670,13 +755,18 @@ class PostgresStorage(Storage):
 
         return {"archived": max(archived, 0)}
 
-    def read_archived_events(self, run_id: str) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Compacted events from the archive, oldest first."""
         with self._read():
             rows = self._connection.execute(
                 "SELECT * FROM events_archive WHERE run_id = %s ORDER BY sequence ASC", (run_id,)
             ).fetchall()
-        return [self._row_to_event(row) for row in rows]
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
 
     def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
         """Indexed cross-run ledger lookup (issue #216)."""
@@ -791,9 +881,16 @@ class PostgresStorage(Storage):
         canonical: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}
         order = 0
         for row in [*archived, *rows]:
-            payload = (
-                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            )
+            raw = row["payload"]
+            if not isinstance(raw, dict):
+                try:
+                    raw = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            payload = raw
+            if is_offload_descriptor(payload):
+                with suppress(Exception):
+                    payload = load_blob_payload(self.storage_dir, payload)
             entry = index_entry_from_payload(EventType(row["type"]), payload)
             if entry is None:
                 continue  # consumed no nextval, so it advances no position
@@ -813,6 +910,7 @@ class PostgresStorage(Storage):
         *,
         after_sequence: int = 0,
         upto: int | None = None,
+        rehydrate: bool = True,
     ) -> Sequence[Event]:
         """Live events in sequence order, windowed by ``after_sequence``/``upto``."""
         query = "SELECT * FROM events WHERE run_id = %s AND sequence > %s"
@@ -823,7 +921,7 @@ class PostgresStorage(Storage):
         query += " ORDER BY sequence ASC"
         with self._read():
             rows = self._connection.execute(query, params).fetchall()
-        return [self._row_to_event(row) for row in rows]
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
 
     def last_sequence(self, run_id: str) -> int:
         """Highest live sequence number; 0 when the run has no events yet."""
@@ -833,20 +931,10 @@ class PostgresStorage(Storage):
             ).fetchone()
         return int(row["seq"]) if row and row["seq"] is not None else 0
 
-    @staticmethod
-    def _row_to_event(row: Any) -> Event:
+    def _row_to_event(self, row: Any, *, rehydrate: bool = True) -> Event:
         try:
-            return Event(
-                event_id=row["event_id"],
-                run_id=row["run_id"],
-                sequence=int(row["sequence"]),
-                type=row["type"],
-                timestamp=row["timestamp"],
-                payload=json.loads(row["payload"]),
-                causer_event_id=row["causer_event_id"],
-                source=row["source"],
-                prev_hash=row["prev_hash"],
-                hash=row["hash"],
+            raw_payload = (
+                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
             )
         except (ValueError, json.JSONDecodeError, TypeError) as exc:
             raise CorruptedRecord(
@@ -854,7 +942,38 @@ class PostgresStorage(Storage):
                 f"failed to load: {exc}"
             ) from exc
 
-    def verify_events(self, run_id: str) -> IntegrityReport:
+        if rehydrate and is_offload_descriptor(raw_payload):
+            sha256_hex = raw_payload.get("__offloaded")
+            seq = int(row["sequence"])
+            try:
+                effective_payload = load_blob_payload(self.storage_dir, raw_payload)
+            except CorruptedRecord as exc:
+                raise CorruptedRecord(
+                    f"event sequence {seq} (run {row['run_id']!r}) missing or corrupt blob {sha256_hex!r}: {exc}"
+                ) from exc
+        else:
+            effective_payload = raw_payload
+
+        try:
+            return Event(
+                event_id=row["event_id"],
+                run_id=row["run_id"],
+                sequence=int(row["sequence"]),
+                type=row["type"],
+                timestamp=row["timestamp"],
+                payload=effective_payload,
+                causer_event_id=row["causer_event_id"],
+                source=row["source"],
+                prev_hash=row["prev_hash"],
+                hash=row["hash"],
+            )
+        except (ValueError, ValidationError, TypeError) as exc:
+            raise CorruptedRecord(
+                f"event {row['event_id']!r} (run {row['run_id']!r}, seq {row['sequence']}) "
+                f"failed to load: {exc}"
+            ) from exc
+
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
         """Re-audit a persisted chain without loading it into an EventLog.
 
         For a compacted run (#239) the walk resumes at the archive boundary:
@@ -864,6 +983,9 @@ class PostgresStorage(Storage):
         only while its archived prefix is intact; removing the boundary
         events or editing history in the archive fails here instead of
         minting a fresh genesis out of whatever live rows survive.
+
+        When deep=True, also audits all referenced out-of-band blobs across
+        both live and archived events.
         """
         violations: list[IntegrityViolation] = []
         checked = 0
@@ -887,7 +1009,7 @@ class PostgresStorage(Storage):
                 is not None
             )
             if has_archive or any(r["type"] == "EVENT_LOG_ANCHORED" for r in rows):
-                archive_violations, archive_edge = self._audit_archive(run_id)
+                archive_violations, archive_edge = self._audit_archive(run_id, deep=deep)
                 violations.extend(archive_violations)
                 if archive_violations:
                     intact = False
@@ -901,7 +1023,7 @@ class PostgresStorage(Storage):
             checked += 1
             healthy = True
             try:
-                event = self._row_to_event(row)
+                event = self._row_to_event(row, rehydrate=False)
             except CorruptedRecord as exc:
                 violations.append(
                     IntegrityViolation(
@@ -955,6 +1077,18 @@ class PostgresStorage(Storage):
                     )
                 )
 
+            if deep:
+                blob_violation = audit_blob_descriptor(
+                    self.storage_dir,
+                    event.payload,
+                    run_id=run_id,
+                    sequence=event.sequence,
+                    event_id=event.event_id,
+                )
+                if blob_violation is not None:
+                    healthy = False
+                    violations.append(blob_violation)
+
             if healthy and intact:
                 last_good = event.sequence
             else:
@@ -970,7 +1104,7 @@ class PostgresStorage(Storage):
         )
 
     def _audit_archive(
-        self, run_id: str
+        self, run_id: str, *, deep: bool = False
     ) -> tuple[list[IntegrityViolation], tuple[int, str] | None]:
         """Deep-audit one run's archived prefix (issue #239).
 
@@ -991,7 +1125,7 @@ class PostgresStorage(Storage):
         ).fetchall()
         for row in rows:
             try:
-                event = self._row_to_event(row)
+                event = self._row_to_event(row, rehydrate=False)
             except CorruptedRecord as exc:
                 violations.append(
                     IntegrityViolation(
@@ -1040,6 +1174,19 @@ class PostgresStorage(Storage):
                         ),
                     )
                 )
+
+            if deep:
+                blob_violation = audit_blob_descriptor(
+                    self.storage_dir,
+                    event.payload,
+                    run_id=run_id,
+                    sequence=event.sequence,
+                    event_id=event.event_id,
+                    prefix="archived",
+                )
+                if blob_violation is not None:
+                    violations.append(blob_violation)
+
             prev_hash = event.hash
             expected_sequence = event.sequence + 1
             edge = (event.sequence, event.hash) if event.hash is not None else None

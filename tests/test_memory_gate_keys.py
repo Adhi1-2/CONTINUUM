@@ -111,6 +111,38 @@ def test_load_gate_config_accepts_documented_example(tmp_path: Path) -> None:
     assert loaded["pgvector.upsert"]["key_template"] == "mem:{store_id}:{tenant}:{record_key}"
 
 
+def test_load_gate_config_accepts_tenant_id_memory_template(tmp_path: Path) -> None:
+    """Accept memory template using 'tenant_id' and structured namespace (#1415)."""
+    cfg = tmp_path / "gate.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "tools": {
+                    "vector.upsert": {
+                        "key_template": "memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+                        "action_type": "memory_write",
+                    }
+                }
+            }
+        )
+    )
+    loaded = load_gate_config(cfg)
+    assert loaded is not None
+    assert "vector.upsert" in loaded
+    assert loaded["vector.upsert"]["key_template"] == (
+        "memory:{store_id}:{tenant_id}:{namespace}:{record_key}"
+    )
+
+
+def test_is_memory_helpers_recognize_memory_prefix() -> None:
+    """is_memory_template and is_memory_key accept both 'mem:' and 'memory:' prefixes (#1415)."""
+    from continuum.gate import MEMORY_KEY_PREFIXES, is_memory_key, is_memory_template
+
+    assert "memory:" in MEMORY_KEY_PREFIXES
+    assert is_memory_template("memory:{store_id}:{tenant_id}:{namespace}:{record_key}") is True
+    assert is_memory_key("memory:pgvector:tenant_1:kb:doc_10") is True
+
+
 # --- ledger: cross-run dedup via action_index ------------------------------ #
 
 
@@ -179,6 +211,85 @@ def test_same_record_same_tenant_dedupes_cross_run_via_index(tmp_path: Path) -> 
         )
         assert with_store.allow is False
         assert "already completed" in with_store.reason
+
+
+def test_foreign_started_claim_is_denied_matching_the_gateway(tmp_path: Path) -> None:
+    """A STARTED claim in another run for a global mem key must be denied, not
+    adopted as this run's live claim. gate.decide used to return "live claim"
+    on a foreign STARTED while gateway.match_route denied any foreign action --
+    the two enforcers diverging exactly on the concurrent double-write the
+    foreign lookup exists to catch (issue #1375). They must agree: both deny.
+    """
+    from continuum.gateway import Route, match_route
+
+    path = str(tmp_path / "mem.db")
+    with SQLiteStorage(path) as store:
+        for rid in ("run_1", "run_2"):
+            store.create_run(Run(run_id=rid, goal="g"))
+            store.append_event(rid, EventType.RUN_STARTED, {"goal": "g"})
+        # Run_1 opens a claim on the global mem key and leaves it in flight.
+        a = ActionLedger(store, "run_1")
+        rendered = "mem:pgvector_main:acme:rec-42"
+        started = a.claim("mem_write", {}, key=rendered, scoped_to_run=False)
+        assert started.action.status is ActionStatus.STARTED
+        # Run_2's local log is empty; only the foreign index sees run_1's claim.
+        folded2 = fold_action_events(store.read_events("run_2"))
+        assert folded2 == {}
+        body = {"store_id": "pgvector_main", "tenant": "acme", "record_key": "rec-42"}
+
+        gate_dec = gate_decide(
+            CONFIG["tools"],
+            "pgvector.upsert",
+            body,
+            run_id="run_2",
+            actions_by_key=folded2,
+            storage=store,
+        )
+        route = Route(
+            host="h",
+            methods=("POST",),
+            prefix="/v",
+            action_type="mem_write",
+            key_template="mem:{store_id}:{tenant}:{record_key}",
+        )
+        gw_dec = match_route(
+            [route],
+            host="h",
+            method="POST",
+            path="/v/x",
+            body=body,
+            actions_by_key=folded2,
+            run_id="run_2",
+            storage=store,
+        )
+        # Same store state, same verdict: both deny the foreign STARTED.
+        assert gate_dec.allow is False
+        assert gw_dec.allow is False
+        assert "another run (started)" in gate_dec.reason
+        assert "another run (started)" in gw_dec.reason
+
+
+def test_a_local_started_claim_is_still_a_live_claim(tmp_path: Path) -> None:
+    """The fix must not touch the ordinary case: a STARTED claim in *this* run
+    is still a live claim the gate allows to proceed."""
+    path = str(tmp_path / "mem.db")
+    with SQLiteStorage(path) as store:
+        store.create_run(Run(run_id="run_1", goal="g"))
+        store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+        ledger = ActionLedger(store, "run_1")
+        rendered = "mem:pgvector_main:acme:rec-42"
+        ledger.claim("mem_write", {}, key=rendered, scoped_to_run=False)
+        folded = fold_action_events(store.read_events("run_1"))
+        decision = gate_decide(
+            CONFIG["tools"],
+            "pgvector.upsert",
+            {"store_id": "pgvector_main", "tenant": "acme", "record_key": "rec-42"},
+            run_id="run_1",
+            actions_by_key=folded,
+            storage=store,
+        )
+        assert decision.allow is True
+        assert "live claim" in decision.reason
 
 
 def test_ledger_cross_run_dedup_without_gate(tmp_path: Path) -> None:
@@ -309,3 +420,73 @@ def test_scoped_non_memory_keys_do_not_cross_run_dedupe(tmp_path: Path) -> None:
         b = ActionLedger(store, "run_2")
         second = b.claim("send_invoice", {}, key="invoice:7", scoped_to_run=True)
         assert second.fresh is True
+
+
+def test_load_gate_config_requires_namespace_for_memory_template(tmp_path: Path) -> None:
+    """memory: templates must include {namespace} placeholder (#1415)."""
+    bad = tmp_path / "bad_gate.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "tools": {
+                    "vector.upsert": {
+                        "key_template": "memory:{store_id}:{tenant_id}:{record_key}",
+                        "action_type": "memory_write",
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(GateConfigError, match="must include placeholders"):
+        load_gate_config(bad)
+
+
+def test_cmd_forget_supports_structured_memory_keys(tmp_path: Path) -> None:
+    """cmd_forget enumerates and filters both mem: and memory: prefix records (#1415)."""
+    import argparse
+    import io
+
+    from continuum.cli.main import cmd_forget
+
+    db_path = str(tmp_path / "forget.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_f", goal="g"))
+        store.append_event("run_f", EventType.RUN_STARTED, {"goal": "g"})
+        store.append_event(
+            "run_f",
+            EventType.ACTION_RECORDED,
+            {
+                "rendered_key": "mem:pgvector:acme:doc_1",
+                "action_type": "memory_write",
+            },
+        )
+        store.append_event(
+            "run_f",
+            EventType.ACTION_RECORDED,
+            {
+                "rendered_key": "memory:pgvector:acme:kb:doc_2",
+                "action_type": "memory_write",
+            },
+        )
+        store.append_event(
+            "run_f",
+            EventType.ACTION_RECORDED,
+            {
+                "rendered_key": "memory:pgvector:globex:kb:doc_3",
+                "action_type": "memory_write",
+            },
+        )
+
+        out = io.StringIO()
+        err = io.StringIO()
+        args = argparse.Namespace(
+            tenant="acme",
+            dry_run=True,
+            run_id="run_f",
+            reason="GDPR",
+            json=False,
+        )
+        code = cmd_forget(args, store, out, err)
+        assert code == 0
+        output = out.getvalue()
+        assert "2 record(s) found" in output
