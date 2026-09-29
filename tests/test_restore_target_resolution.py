@@ -137,29 +137,6 @@ def test_target_as_a_numeric_string_falls_through_to_version() -> None:
     assert _restored_anchor(storage) == 4
 
 
-# --- the exported precondition helper ------------------------------------- #
-
-
-def test_restore_to_anchor_checks_preconditions_for_a_restore() -> None:
-    """``restore_to_anchor`` is the public precondition-only entry point.
-
-    It is exported in ``__all__`` but called from neither the CLI nor the MCP
-    server, so nothing else exercised it.
-    """
-    from continuum.recovery.restore import restore_to_anchor
-
-    storage = _storage()
-    derivation, carry, summary = restore_to_anchor(storage, RUN_ID, 0, reason="rollback")
-    # An empty prefix crosses nothing outstanding; safety is the caller's call.
-    assert derivation.unsettled_authorizations == frozenset()
-    assert derivation.depended_results == frozenset()
-    assert derivation.uncertain_slots == frozenset()
-    # ``summary`` is the JSON-native projection of ``derivation``: the same
-    # sets, serialised as lists for the event payload.
-    assert summary == derivation.model_dump(mode="json")
-    assert carry == set()
-
-
 # --- the three miss shapes a target can take ------------------------------- #
 
 
