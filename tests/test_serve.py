@@ -613,3 +613,43 @@ def test_serve_ensure_run_recognises_archived_run_started_after_compaction(tmp_p
 
     state = project("run_sc", events)
     assert state.goal.constraints == ["fragile", "same-day"]
+
+
+def test_serve_checkpoint_projects_full_history_after_compaction(tmp_path: Path) -> None:
+    """_h_checkpoint must fold the archive, not just the live tail.
+
+    ``_ensure_run`` already accepts a compacted run (#1452), but the checkpoint
+    handler projected the live tail alone, so a run whose ``RUN_STARTED`` had
+    been archived raised "no goal" instead of checkpointing -- on exactly the
+    long-running runs the endpoint exists for.
+    """
+    from continuum.events import EventType
+    from continuum.models import Origin, Run
+    from continuum.state.semantic import project
+    from continuum.storage.sqlite import SQLiteStorage
+
+    storage = SQLiteStorage(str(tmp_path / "serve_compacted_checkpoint.db"))
+    storage.create_run(Run(run_id="run_sc", goal="deliver package"))
+    storage.append_event(
+        "run_sc",
+        EventType.RUN_STARTED,
+        {"goal": "deliver package", "constraints": ["fragile", "same-day"], "total": 5},
+        source=Origin.HUMAN,
+    )
+    storage.append_event(
+        "run_sc",
+        EventType.WORK_ADDED,
+        {"task_id": "w1", "description": "pack item"},
+        source=Origin.HUMAN,
+    )
+    storage.compact_run("run_sc")
+    assert not any(e.type is EventType.RUN_STARTED for e in storage.read_events("run_sc"))
+
+    srv = SidecarServer(storage=storage)
+    response = srv.dispatch("checkpoint", {"run_id": "run_sc", "reason": "post-compaction"})
+
+    assert response["run_id"] == "run_sc"
+    # The checkpoint was taken over a state that still sees the archived goal.
+    state = project("run_sc", storage.read_all_events("run_sc"))
+    assert state.goal is not None
+    assert state.goal.constraints == ["fragile", "same-day"]

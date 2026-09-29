@@ -206,7 +206,20 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
-- **Re-sync shared counts and repair integration seams opened by the #1400s
+- **`continuum_checkpoint` and the sidecar `checkpoint` method work on a compacted run.**
+  The two checkpoint surfaces projected the live tail (`read_events`) alone. Once a run
+  has been compacted the goal-bearing prefix, `RUN_STARTED` included, resides in
+  `events_archive`, so the fold saw a log with no goal and `project` raised
+  `ProjectionError`, refusing every checkpoint on precisely the long-running runs the
+  tools exist for. `ensure_run` had already learned to accept a compacted run (#1436),
+  which made the checkpoint the broken link immediately after it. The checkpoint
+  projection, and the `_declare_model` / `_declare_dependencies` helpers it calls, now
+  fold the full history (`read_all_events`). `GenericAgentAdapter._declare_dependencies`
+  had the same live-tail read with a `ProjectionError` fallback to "declare everything",
+  so a compacted run additionally re-pinned every unchanged dependency on each checkpoint;
+  it now reads the archive too and the fallback still covers a run with no goal yet.
+
+
   merges.** Several branches each synced the documented collected total on its
   own base, so once merged the tree collected more tests than every doc stated
   and the docs-count guard failed; README, the translated READMEs, CHANGELOG,

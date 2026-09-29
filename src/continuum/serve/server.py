@@ -724,7 +724,12 @@ def _h_checkpoint(server: SidecarServer, params: dict[str, Any]) -> dict[str, An
     run_id = _require(params, "run_id")
     server._ensure_run(run_id)
     _declare_dependencies(server, run_id, params.get("env"))
-    state = project(run_id, server.storage.read_events(run_id))
+    # Full history (read_all_events) so compaction cannot make the checkpoint
+    # itself unprojectable: after compaction the live log holds only the anchor
+    # and the tail, with RUN_STARTED in the archive, and ``project`` refuses a
+    # log with no goal. _ensure_run above already accepts a compacted run, so a
+    # live-only read here made the checkpoint endpoint the broken link.
+    state = project(run_id, server.storage.read_all_events(run_id))
     checkpoint = server.adapter.capture_state(
         run_id,
         state,
