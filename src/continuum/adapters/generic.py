@@ -96,8 +96,12 @@ class GenericAgentAdapter(AgentAdapter):
             from continuum.hooks import record_file_progress
 
             record_file_progress(self.manager, run_id, self.auto_file, self.auto_total)
-            # Reproject so the checkpoint captures the derived progress
-            state = project(run_id, self.storage.read_events(run_id))
+            # Reproject so the checkpoint captures the derived progress. The fold
+            # needs the archive too: on a compacted run the live tail holds no
+            # RUN_STARTED, so a live-only read here would reject the checkpoint
+            # (and the appended TASK_UPDATED would not fold against the archived
+            # start).
+            state = project(run_id, self.storage.read_all_events(run_id))
         return self.manager.checkpoint(
             run_id,
             state=state,

@@ -162,7 +162,7 @@ class RecoveryDecision:
         the library will intervene. If you need the verdict *enforced*, that is
         a separate seam and none of them is on by default:
 
-        * the host gate (``continuum gate``, :mod:`continuum.recovery.gate`)
+        * the host gate (``continuum gate``, :mod:`continuum.gate`)
         * the HTTP gateway (``continuum gateway``, :mod:`continuum.gateway`)
         * the replay guard (:mod:`continuum.replayguard`)
         * observation hooks (``continuum hooks install``,
@@ -595,7 +595,15 @@ class RecoveryEngine:
                 f"consumed authority blocks resume: {sorted(consumed_authorities)}",
             )
         elif consumed_authorities is None:
-            mode = RecoveryMode.REQUEST_HUMAN
+            # Same floor-not-overwrite rule as the readable branch above: an
+            # unreadable ledger raises the verdict to REQUEST_HUMAN, but a risk
+            # policy that already proposed ROLLBACK or ABORT is strictly more
+            # cautious and must survive. A bare assignment here downgraded a
+            # risk-driven ABORT/ROLLBACK to REQUEST_HUMAN, so a degraded log
+            # softened the decision instead of hardening it -- the opposite of
+            # this branch's stated purpose (issue #1356; #1146 escalated the
+            # sibling branch but left this one, added by #1066, unfixed).
+            mode = max((mode, RecoveryMode.REQUEST_HUMAN), key=lambda m: SEVERITY[m])
             rationale = (
                 *rationale,
                 "consumed authority ledger unreadable: cannot clear the resume block",
