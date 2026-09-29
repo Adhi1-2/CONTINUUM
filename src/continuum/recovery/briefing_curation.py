@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from continuum.events import EventType
 from continuum.models import StateStatus
+from continuum.recovery.derived import is_derived_unverified
 
 if TYPE_CHECKING:
     from continuum.recovery.engine import RecoveryDecision
@@ -73,8 +74,17 @@ def _latest_agent_summary(
     Unpinned summaries carry no world to contradict, so they pass.
 
     Returns ``(summary, pins_hold)`` or ``None`` when the run has no summary.
+
+    Folds the full history, not just the live tail: compaction moves the
+    pre-anchor prefix (summaries included) into ``events_archive``, so a
+    live-only read would miss the newest summary on a compacted run and the
+    agent section would silently vanish from the briefing - exactly when the
+    long-running session it exists for has run long enough to be compacted
+    (issue #1128).
     """
-    summaries = [e for e in storage.read_events(run_id) if e.type is EventType.REASONING_SUMMARY]
+    summaries = [
+        e for e in storage.read_all_events(run_id) if e.type is EventType.REASONING_SUMMARY
+    ]
     if not summaries:
         return None
     payload = dict(summaries[-1].payload)
@@ -152,6 +162,10 @@ def curate_briefing(storage: Storage, run_id: str, decision: RecoveryDecision) -
         verified_lines.append(f"why: {contract.reason}")
     if contract.next_allowed_action:
         verified_lines.append(f"next permitted action: {contract.next_allowed_action}")
+    # The RISK_OBSERVED ids behind the verdict, so a resumed session knows which
+    # observation to explain rather than only the mode it produced (#1424).
+    if contract.triggering_risks:
+        verified_lines.append(f"triggering risks: {', '.join(contract.triggering_risks)}")
     sections.append(
         {
             "title": "recovery verdict (verified, sealed contract)",
@@ -196,14 +210,27 @@ def curate_briefing(storage: Storage, run_id: str, decision: RecoveryDecision) -
     if getattr(state, "trajectory_reports", None):
         from continuum.analysis.trajectory_report import render_trajectory_report
 
+        reports = list(state.trajectory_reports)
         trajectory_lines: list[str] = []
-        for report in state.trajectory_reports:
+        for report in reports:
             trajectory_lines += render_trajectory_report(report)
+        # A report distilled from agent-asserted events inherits that trust
+        # level: #392's non-amplification invariant has to show up in the tier
+        # the briefing advertises, not only in the rendered provenance label.
+        trajectory_unverified = any(
+            is_derived_unverified(report.model_dump(mode="json")) for report in reports
+        )
         sections.append(
             {
-                "title": "trajectory reports (sleep-time, system-derived)",
-                "provenance": _PROVENANCE_SYSTEM,
-                "reason": "distilled from archived history between sessions (issue #393)",
+                "title": "trajectory reports (sleep-time, system-derived)"
+                + (", unverified provenance" if trajectory_unverified else ""),
+                "provenance": (_PROVENANCE_AGENT if trajectory_unverified else _PROVENANCE_SYSTEM),
+                "reason": (
+                    "derived from agent-asserted events: only as trustworthy as its "
+                    "least-verified source (issue #392)"
+                    if trajectory_unverified
+                    else "distilled from archived history between sessions (issue #393)"
+                ),
                 "lines": trajectory_lines,
             }
         )
@@ -213,12 +240,22 @@ def curate_briefing(storage: Storage, run_id: str, decision: RecoveryDecision) -
         from continuum.recovery.summary import render_informed_retry
 
         retry_lines = render_informed_retry(decision.informed_retry)
+        # Same invariant as the trajectory section above: a block derived from
+        # unverified events is surfaced as unverified material, never as trusted
+        # system output.
+        retry_unverified = is_derived_unverified(decision.informed_retry)
         if retry_lines:
             sections.append(
                 {
-                    "title": "what previous attempts changed (engine-recorded)",
-                    "provenance": _PROVENANCE_SYSTEM,
-                    "reason": "derived from the engine's own ledger of attempts (issue #265)",
+                    "title": "what previous attempts changed (engine-recorded)"
+                    + (", unverified provenance" if retry_unverified else ""),
+                    "provenance": (_PROVENANCE_AGENT if retry_unverified else _PROVENANCE_SYSTEM),
+                    "reason": (
+                        "derived from agent-asserted events: only as trustworthy as its "
+                        "least-verified source (issue #392)"
+                        if retry_unverified
+                        else "derived from the engine's own ledger of attempts (issue #265)"
+                    ),
                     "lines": retry_lines,
                 }
             )

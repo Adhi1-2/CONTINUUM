@@ -144,22 +144,27 @@ When a run is bound to a tenant identity, only keys whose `tenant` field matches
 
 ## Poisoning forensics and erasure
 
-Every memory write is a ledger row recorded under the `mem_write` action type. The
-rendered `mem:` identity is the ledger key, not a field on the action record, so
-enumeration filters on the registered `action_type`:
+Every memory write is a ledger row whose identity is the rendered key -- the
+`mem:` or `memory:` string the gate or gateway builds from the store, tenant and
+record key. That key is not a field on the action record `continuum actions`
+prints, and `action_type` is not a reliable selector either: the gate defaults it
+to the tool name, so a memory write recorded through a tool that did not set
+`action_type` carries the tool name instead. Enumerate the same way erasure does,
+over the rendered key the event payload carries:
 
 ```bash
-continuum actions <run> --json | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if a['action_type'] == 'mem_write'])"
+# --json is a global flag: it goes before the subcommand, not after it
+continuum --json events <run> | python -c "import json,sys; data=json.load(sys.stdin); print([e['payload']['rendered_key'] for e in data['events'] if e['type'] == 'ACTION_RECORDED' and str(e['payload'].get('rendered_key', '')).startswith(('mem:', 'memory:'))])"
 ```
 
 `continuum forget --tenant X` builds on this enumeration to list exactly what to delete externally and to append a tombstone event:
 
 ```bash
 # Dry run: list what would be tombstoned
-continuum forget --tenant acme --dry-run --json | python -m json.tool
+continuum --json forget --tenant acme --dry-run | python -m json.tool
 
 # Tombstone and keep audit trail
-continuum forget --tenant acme --reason "gdpr request" --json
+continuum --json forget --tenant acme --reason "gdpr request"
 continuum verify <run_id>  # still passes, chain keeps hashes
 ```
 
@@ -184,8 +189,8 @@ Chain verification keeps hashes, so logical deletion does not break `verify()`. 
 
 ```bash
 pytest tests/test_memory_gate_keys.py -q
-ruff check src/ tests/ examples/
-ruff format --check src/ tests/ examples/
+ruff check src/ tests/ examples/ benchmarks/ scripts/ demo-run/
+ruff format --check src/ tests/ examples/ benchmarks/ scripts/ demo-run/
 mypy src/continuum --ignore-missing-imports
 # also verify no em dashes in changed files
 rg -n "$(printf '\\u2014')" src/ tests/ docs/ examples/ benchmarks/

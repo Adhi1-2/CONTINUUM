@@ -48,7 +48,7 @@ Core invariant: every fact carries its origin, and trust is earned, never assume
 Five integration seams, all funneling into `GenericAgentAdapter`:
 
 * Seam 1: in-process adapters (generic, LangChain, LangGraph, OpenAI)
-* Seam 2: MCP server (12 tools over stdio, 3 read-only, 9 mutating)
+* Seam 2: MCP server (13 tools over stdio, 3 read-only, 10 mutating)
 * Seam 3: CLI lifecycle hooks (`continuum hooks install`, `continuum observe`, `continuum gate`, `continuum briefing`)
 * Seam 4: enforcing HTTP gateway (`continuum gateway`)
 * Seam 5: OpenTelemetry bridge (`make_span_processor`)
@@ -206,7 +206,7 @@ Every layer is additive, backward compatible, and leaves `events.py verify()`, t
 * `state/semantic.py project()`: merge by `plan_id:unit_id`, latest write wins, full history retained. `SemanticState.plan: list[PlanStep]` uses existing `PlanStep` model, no new model.
 * New tool `continuum_record_plan` in `mcp/server.py` (mutating, allowlisted) and CLI `continuum record-plan <run_id> --file <json> --plan-id <id>`. Origin handling like `record_progress`: MCP writes become `EXTERNAL_AGENT` and `REQUIRES_REVIEW` until confirmed.
 * `state/validator.py`: walk `depends_on` plus existing `dependency -> evidence -> finding -> decision`. Stale unit invalidates downstream. Cycle detection reports `CONFLICTED` with diagnostic.
-* `state/diff.py`, `recovery/contract.py`, `recovery/guidance.py`, `cli/main.py inspect`, `continuum resume --json`, `interchange`: render plan and diff.
+* `state/diff.py`, `recovery/contract.py`, `recovery/guidance.py`, `cli/main.py inspect`, `continuum --json resume`, `interchange`: render plan and diff.
 
 **Storage:** No migration. Events table stores typed events. Missing plan means `plan=[]`.
 
@@ -239,7 +239,7 @@ Every layer is additive, backward compatible, and leaves `events.py verify()`, t
 
 **Changes:**
 
-* `SessionStart` hook that runs `continuum resume --json` out of band and injects a pre-rendered banner when an interrupted run exists, else silent. Uses existing `hooks.py make_auto_checkpoint_hook` pattern.
+* `SessionStart` hook that runs `continuum --json resume` out of band and injects a pre-rendered banner when an interrupted run exists, else silent. Uses existing `hooks.py make_auto_checkpoint_hook` pattern.
 * Precomputed `.continuum/resume.json` written on every checkpoint (next recovery decision, goal, progress, contract next step) for instant reads without starting Python, per `instant_detection.md`.
 * Wrapper `continuum-resume-banner` for clients without hooks.
 * Scoped confirm `continuum confirm --scope self` that only clears `REQUIRES_REVIEW` due to `Origin.EXTERNAL_AGENT`, not env drift, per `confirm_tax.md`. Keeps the human gate for real staleness while removing the tax. Same-client auto-confirm can layer later with audit.
@@ -424,7 +424,7 @@ Reviewers: check that no section invents a number that is not cited, that every 
 
 ## 19. Appendix C: file inventory for reviewers
 
-Core: 60 files in `src/continuum` as listed in section 3.2. Entry points: `continuum.cli.main:main`, `continuum.mcp.server:main`. Tests: 99 files. Examples: `crash_recovery_agent.py`, `context_compaction.py`, `model_switch.py`, `recovery_walkthrough.py`, plus real-LLM crash harnesses. Docs: `README.md` (12 tools, 33 commands, 5 seams), `docs/*` research notes, `references/*` specs.
+Core: 60 files in `src/continuum` as listed in section 3.2. Entry points: `continuum.cli.main:main`, `continuum.mcp.server:main`. Tests: 99 files. Examples: `crash_recovery_agent.py`, `context_compaction.py`, `model_switch.py`, `recovery_walkthrough.py`, plus real-LLM crash harnesses. Docs: `README.md` (13 tools, 33 commands, 5 seams), `docs/*` research notes, `references/*` specs.
 
 ---
 
