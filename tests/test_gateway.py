@@ -1040,7 +1040,8 @@ def test_load_gateway_config_validates_memory_templates(tmp_path: Path) -> None:
 
 
 def test_match_route_rejects_colon_in_body_fields() -> None:
-    """Colon in body values is rejected as malformed memory key (#1415)."""
+    """A colon in a non-terminal body field shifts the key's colon-delimited
+    segments, so it is rejected at the render boundary (#1415, then #1149)."""
     route = Route(
         host="vector.internal",
         methods=("POST",),
@@ -1065,7 +1066,47 @@ def test_match_route_rejects_colon_in_body_fields() -> None:
         bound_tenant="acme",
     )
     assert decision.allow is False
-    assert "malformed memory key" in decision.reason
+    # #1149 moved the rejection into render_key, so the decision carries that
+    # boundary message naming the field rather than the #1415-era wording.
+    assert "field 'store_id' must not contain ':'" in decision.reason
+
+
+def test_match_route_allows_a_colon_in_the_terminal_field() -> None:
+    """A colon in the terminal field cannot shift the tenant segment, so a
+    record key like ``doc:section:1`` still routes (#1149 follow-up).
+
+    ``render_key`` guards only the placeholders before the terminal one, but
+    match_route re-checked every field and rejected the same key it had just
+    rendered, so the supported write the #1149 test describes never reached
+    the claim. The two seams must read the same line.
+    """
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+    )
+    body = {
+        "store_id": "vstore",
+        "tenant_id": "acme",
+        "namespace": "kb",
+        "record_key": "doc:section:1",
+    }
+    decision = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body,
+        actions_by_key={},
+        run_id="run_1",
+        bound_tenant="acme",
+    )
+    # No claim exists for the rendered key, so the honest verdict is
+    # "unknown effect", not "malformed key".
+    assert decision.allow is False
+    assert "malformed memory key" not in decision.reason
 
 
 def test_match_route_supports_flexible_placeholder_order() -> None:

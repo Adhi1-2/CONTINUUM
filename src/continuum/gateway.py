@@ -346,7 +346,15 @@ def match_route(
         import string as _string
 
         fields = [f for _, f, _, _ in _string.Formatter().parse(route.key_template) if f]
-        if any(":" in str(normalize_key_value(body.get(f, ""))) for f in fields):
+        # Only the placeholders before the terminal segment can shift the
+        # colon-delimited positions the tenant check below reads (#1149): a
+        # colon in the last field stays inside it and is re-parsed downstream
+        # as ":".join(parts[3:]), so record keys like "doc:section:1" keep
+        # routing. ``render_key`` rejects shifting colons at the boundary
+        # already, so this guard mirrors the same line rather than repeating
+        # the wider #1415-era rejection that also caught terminal colons.
+        guarded = set(fields[:-1])
+        if any(":" in str(normalize_key_value(body.get(f, ""))) for f in guarded):
             return Decision(False, f"malformed memory key {rendered!r}", route=route)
         tenant_field = "tenant_id" if "tenant_id" in fields else "tenant"
         tenant_in_key = str(normalize_key_value(body.get(tenant_field, "")))
