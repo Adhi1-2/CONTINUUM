@@ -226,7 +226,14 @@ All notable changes to this project are documented here. The format follows
   epoch microseconds of the event's own timestamp rather than a row position
   or a sequence value. The incremental writer, both backfills, and both folds
   share one helper, `continuum.storage.actionindex.index_order_for`, so the
-  three cannot drift apart in what number they assign.
+  three cannot drift apart in what number they assign. Both engines also carry
+  the fleet that shipped the old numbering across the upgrade: SQLite gains a
+  v7 migration that renumbers the rows in place, because a store already past
+  v3 never re-runs that backfill and would otherwise keep `rowid`-scale numbers
+  forever, and Postgres recognises counter-scale rows on open and renumbers
+  them in one transaction, since it carries no stamped schema version to key a
+  migration on. Either way an upgraded store opens with `action_index_drift`
+  reading zero.
 
 - **The Postgres action index backfill uses jsonb accessors instead of
   SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
@@ -240,9 +247,11 @@ All notable changes to this project are documented here. The format follows
   (SQLSTATE 42883), out of `_create_schema` on connection. No test covered the
   case, which is why CI saw nothing: the backfill short-circuits unless
   `ACTION_*` events exist and the index is empty, and every test database
-  starts empty in both senses. The `WHERE` clause now reads
-  `e.payload::jsonb->>'key' IS NOT NULL` and
-  `e.payload::jsonb->'action' IS NOT NULL`, matching the `SELECT` list.
+  starts empty in both senses. The backfill now seeds from the same merged
+  archive+live stream the canonical fold reads, folded through the shared
+  `index_order_for` helper and written in one transaction, so it also reseeds
+  keys whose owners were archived and an interrupted open cannot leave a
+  partial projection the non-empty guard would then skip past.
 
   The same statement had also dropped SQLite's `INSERT OR REPLACE`, so a key
   that was claimed and later completed, appearing in two `ACTION_*` events,
@@ -1650,7 +1659,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,906 collected, ~2,870 passed, ~36 skipped on a minimal env).
+  (~2,933 collected, ~2,870 passed, ~36 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
