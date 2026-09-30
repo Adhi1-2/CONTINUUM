@@ -144,11 +144,17 @@ When a run is bound to a tenant identity, only keys whose `tenant` field matches
 
 ## Poisoning forensics and erasure
 
-Every memory write is a ledger row keyed by tenant namespace. Enumeration is therefore a filter:
+Every memory write is a ledger row whose identity is the rendered key -- the
+`mem:` or `memory:` string the gate or gateway builds from the store, tenant and
+record key. That key is not a field on the action record `continuum actions`
+prints, and `action_type` is not a reliable selector either: the gate defaults it
+to the tool name, so a memory write recorded through a tool that did not set
+`action_type` carries the tool name instead. Enumerate the same way erasure does,
+over the rendered key the event payload carries:
 
 ```bash
 # --json is a global flag: it goes before the subcommand, not after it
-continuum --json actions <run> | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if 'mem:' in a['action_id']])"
+continuum --json events <run> | python -c "import json,sys; data=json.load(sys.stdin); print([e['payload']['rendered_key'] for e in data['events'] if e['type'] == 'ACTION_RECORDED' and str(e['payload'].get('rendered_key', '')).startswith(('mem:', 'memory:'))])"
 ```
 
 `continuum forget --tenant X` builds on this enumeration to list exactly what to delete externally and to append a tombstone event:

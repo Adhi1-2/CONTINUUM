@@ -215,6 +215,28 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
+- **The Postgres action index backfill uses jsonb accessors instead of
+  SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
+  seeds the `action_index` projection from existing `ACTION_*` events when the
+  index is empty, which is the recovery path for a database that predates the
+  index (#216) or one that lost its rows. Its `INSERT ... SELECT` was ported
+  from the SQLite v3 migration, but the two `WHERE` predicates were left as
+  `json_extract(e.payload, '$.key')` while the rest of the statement had been
+  translated to jsonb. Postgres has no `json_extract`, so whenever the backfill
+  actually fired the store failed to open outright with `UndefinedFunction`
+  (SQLSTATE 42883), out of `_create_schema` on connection. No test covered the
+  case, which is why CI saw nothing: the backfill short-circuits unless
+  `ACTION_*` events exist and the index is empty, and every test database
+  starts empty in both senses. The `WHERE` clause now reads
+  `e.payload::jsonb->>'key' IS NOT NULL` and
+  `e.payload::jsonb->'action' IS NOT NULL`, matching the `SELECT` list.
+
+  The same statement had also dropped SQLite's `INSERT OR REPLACE`, so a key
+  that was claimed and later completed, appearing in two `ACTION_*` events,
+  proposed a duplicate primary key. The port now selects
+  `DISTINCT ON (key) ... ORDER BY key, ord DESC`, keeping the last event per
+  key, with `ON CONFLICT (key) DO NOTHING` as a second guard.
+
 - **`policy-review` no longer reports an uncertain side effect as absent.**
   The `side_effect_actions` rows folded every `ACTION_RECONCILED` event that was
   not `completed` into `reconciled_absent`, but only `reconcile(occurred=False)`
@@ -406,6 +428,21 @@ All notable changes to this project are documented here. The format follows
   clears.
 
 ### Changed
+
+- **`approve_restore` target resolution and input validation are now covered
+  branch by branch (#1292).** `tests/test_restore_target_resolution.py`
+  previously had one entry point, `approve_restore(..., anchor_sequence=0)`,
+  so every branch of `_anchor_for` and every guard in front of it was
+  uncovered and a change to any of them would have shipped green. The new
+  tests drive each rung directly and pin the exact error messages. Two are
+  load-bearing rather than redundant: the no-target case writes checkpoints
+  out of order so the highest version is not the highest `source_sequence`,
+  which catches a resolver returning the wrong field, and the cross-run case
+  pins that a checkpoint id belonging to another run is not a valid target.
+  `restore.py` is unchanged. Three lines stay uncovered: the `CorruptedRecord`
+  rung is already covered by `tests/test_checkpoint_corruption.py`, and the
+  trailing `checkpoint_id` ladder at `restore.py:76-78` is unreachable,
+  since a real id resolves in `get_checkpoint` before that loop runs.
 
 - **The `__all__` guard now walks the installed package instead of five
   hand-listed modules (#1228).** `tests/test_module_all_exports.py` asserted
@@ -1600,7 +1637,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,887 collected, ~2,849 passed, ~36 skipped on a minimal env).
+  (~2,906 collected, ~2,870 passed, ~36 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses

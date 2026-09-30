@@ -817,6 +817,10 @@ def test_path_canonicalization_is_platform_independent() -> None:
     assert idempotency_key("file_write", {"path": "data\\output\\report.txt"}) == idempotency_key(
         "file_write", {"path": "data/output/report.txt"}
     )
+    # A ``..`` segment collapses under canonicalization too; no other case in
+    # this module exercises dot-dot removal through the canonicalizer.
+    assert _canonicalize_paths("C:\\foo\\..\\bar") == "C:/bar"
+    assert arguments_hash({"path": "C:\\foo\\..\\bar"}) == arguments_hash({"path": "C:/bar"})
 
 
 def test_path_canonicalization_preserves_posix_backslashes() -> None:
