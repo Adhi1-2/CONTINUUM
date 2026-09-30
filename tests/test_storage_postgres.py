@@ -19,7 +19,7 @@ from continuum.actions import ActionLedger
 from continuum.checkpoint import CheckpointManager
 from continuum.events import EventType
 from continuum.models import ActionStatus, Origin, Run, RunStatus
-from continuum.storage.base import ConcurrentWriteError, RunNotFound
+from continuum.storage.base import ConcurrentWriteError, CorruptedRecord, RunNotFound
 from continuum.storage.postgres import PostgresStorage
 
 DSN = os.environ.get("CONTINUUM_TEST_POSTGRES_DSN")
@@ -195,6 +195,37 @@ def test_action_status_enum_round_trip(storage: PostgresStorage) -> None:
     ledger.fail(outcome.key, "boom", certain=True)
     statuses = {a.action_type: a.status for a in ledger.all()}
     assert statuses["deploy"] is ActionStatus.FAILED
+
+
+def test_pg_backfill_reseeds_the_index_when_empty_with_existing_actions() -> None:
+    # A database that predates the index (issue #216) or lost its rows has
+    # ACTION_* events but an empty action_index. Reopening must reseed the
+    # projection from the log, not raise: the backfill query has to speak
+    # Postgres JSON (``::jsonb->>``), never SQLite's ``json_extract``.
+    seed = PostgresStorage(DSN)
+    try:
+        a = ActionLedger(seed, "pg_bf")
+        make_run(seed, "pg_bf", "backfill")
+        first = a.claim("send_invoice", {}, key="invoice:BF-1", scoped_to_run=False)
+        a.complete(first.key, external_id="INV-BF")
+        # Simulate the lost/absent projection (autocommit commits immediately).
+        seed._connection.execute("DELETE FROM action_index")
+        assert seed._connection.execute("SELECT 1 FROM action_index LIMIT 1").fetchone() is None
+    finally:
+        seed.close()
+
+    reopened = PostgresStorage(DSN)
+    try:
+        # Reopening ran _backfill_action_index over the existing ACTION_* events;
+        # the reseeded row is functional, so a cross-run claim on the same key
+        # deduplicates through the index.
+        b = ActionLedger(reopened, "pg_bf2")
+        make_run(reopened, "pg_bf2", "b")
+        again = b.claim("send_invoice", {}, key="invoice:BF-1", scoped_to_run=False)
+        assert again.fresh is False
+        assert again.action.external_id == "INV-BF"
+    finally:
+        reopened.close()
 
 
 # --- langgraph tables exist (schema v4 baseline) ---------------------------------- #
@@ -495,6 +526,45 @@ def test_pg_action_index_drift_skips_malformed_json_payload(
     assert isinstance(rebuilt, int)
 
 
+def test_backfill_recovers_an_emptied_action_index(
+    isolated_storage: PostgresStorage,
+) -> None:
+    """An empty index over existing ACTION_* events rebuilds on open (#1441).
+
+    ``_backfill_action_index`` runs on every open and short-circuits unless
+    ACTION_* events exist and the index is empty, so it fires only in the
+    recovery case the method exists for: a database that predates the index,
+    or one that lost its rows. That is why the defect went unnoticed. The
+    WHERE clause used SQLite's ``json_extract()``, which Postgres does not
+    have, so opening such a store raised ``UndefinedFunction`` (SQLSTATE
+    42883) and the recovery path was dead.
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    storage = isolated_storage
+    make_run(storage, "pg_bf", "recovery target")
+    ledger = ActionLedger(storage, "pg_bf")
+    outcome = ledger.claim("process_doc", {}, key="doc:bf")
+    ledger.complete(outcome.key, external_id="doc:bf")
+    assert storage.foreign_action(outcome.key, exclude_run="other") is not None
+
+    # A database that predates the index, or one whose index rows were lost.
+    storage._connection.execute("DELETE FROM action_index")
+    assert storage.foreign_action(outcome.key, exclude_run="other") is None
+
+    # Reopening runs the backfill inside _create_schema. On the broken query
+    # this is where the store failed to open; nothing was recovered.
+    params = conninfo_to_dict(DSN)
+    params["dbname"] = storage._connection.info.dbname
+    with PostgresStorage(make_conninfo(**params)) as fresh:
+        recovered = fresh.foreign_action(outcome.key, exclude_run="other")
+
+    # The completion is the last write for the key, so that is the live state.
+    assert recovered is not None
+    assert recovered.status is ActionStatus.COMPLETED
+    assert recovered.external_id == "doc:bf"
+
+
 def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
     """A parentless run must load back as parentless, not as a corrupt row."""
     make_run(storage, "pg_solo", "solo")
@@ -522,6 +592,43 @@ def test_pg_child_run_keeps_its_parent_after_the_round_trip(
 
     assert [run.run_id for run in children_of(storage, "pg_par")] == ["pg_kid"]
     assert children_of(storage, "pg_kid") == []
+
+
+def test_pg_append_rolls_back_the_event_when_the_index_upsert_fails(
+    isolated_storage: PostgresStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The event and its action_index row must commit atomically (#1371).
+
+    The connection is autocommit, so the ``events`` INSERT and the
+    ``action_index`` upsert used to land in two separate durable commits: a
+    crash (or the ``CorruptedRecord`` the upsert can raise) between them left
+    the ACTION event durably in the log with no matching index row, and
+    ``foreign_action`` then reports a committed claim as un-recorded, so the
+    idempotency gate re-fires the effect. Wrapping the append in an explicit
+    ``transaction()`` makes the two writes atomic, matching SQLite. When the
+    index upsert fails, the event must not be durably present either.
+    """
+    storage = isolated_storage
+    make_run(storage, "pg_atomic", "atomicity")
+    ledger = ActionLedger(storage, "pg_atomic")
+
+    def boom(_event: object, payload: object = None) -> None:
+        raise CorruptedRecord("injected action-index failure")
+
+    monkeypatch.setattr(storage, "_maintain_action_index", boom)
+    before = storage.last_sequence("pg_atomic")
+    with pytest.raises(CorruptedRecord):
+        ledger.claim("process_doc", {}, key="doc:atomic")
+
+    # The failed append rolled back: no orphan event past the last good one.
+    monkeypatch.undo()
+    assert storage.last_sequence("pg_atomic") == before
+    action_rows = storage._connection.execute(
+        "SELECT count(*) AS c FROM events WHERE run_id = %s AND type ILIKE 'action_%%'",
+        ("pg_atomic",),
+    ).fetchone()
+    assert action_rows["c"] == 0
 
 
 def test_pg_payload_offload(storage: PostgresStorage, tmp_path: Path) -> None:

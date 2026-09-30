@@ -751,6 +751,85 @@ def test_a_route_without_a_prefix_keeps_the_whole_host(tmp_path: Path) -> None:
     assert decision.allow is True
 
 
+def _mem_scenario(final: str) -> Decision:
+    """Seed a foreign run holding a global memory key in ``final`` state, then
+    return the gateway's verdict for a second run that has no local claim."""
+    from continuum.actions.ledger import fold_action_events
+
+    memkey = "mem:store1:tenantA:rec1"
+    atype = "mem_write"
+    store = SQLiteStorage(":memory:")
+    for rid in ("runA", "runB"):
+        store.create_run(Run(run_id=rid, goal="g"))
+        store.append_event(rid, EventType.RUN_STARTED, {"goal": "g"})
+    other = ActionLedger(store, "runA")
+    oc = other.claim(atype, {"k": "rec1"}, key=memkey, scoped_to_run=False)
+    if final == "failed":
+        other.fail(oc.key, "rejected upstream", certain=True)
+    elif final == "unknown":
+        other.fail(oc.key, "connection dropped", certain=False)
+    elif final == "compensated":
+        other.complete(oc.key)
+        other.compensate(oc.key, note="rolled back")
+    elif final == "completed":
+        other.complete(oc.key, external_id="EXT1")
+    # "started" leaves the foreign claim live.
+    route = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/mem",
+        action_type=atype,
+        key_template=memkey,
+    )
+    actions_b = fold_action_events(store.read_events("runB"))
+    return match_route(
+        [route],
+        host="api.example.com",
+        method="POST",
+        path="/v1/mem",
+        body={"k": "rec1"},
+        actions_by_key=actions_b,
+        run_id="runB",
+        storage=store,
+    )
+
+
+def test_foreign_memory_record_gets_a_status_specific_verdict() -> None:
+    """A foreign claim on a global memory key is denied with guidance that
+    matches its status, mirroring gate.decide rather than telling the caller
+    to "reconcile" a record that cannot be reconciled.
+
+    Regression for the blanket "reconcile it first" message: reconcile only
+    fits an UNKNOWN outcome. A terminal foreign record (failed/compensated)
+    left no live effect, so the way forward is a fresh claim (#765e4bc); a
+    completed one must not be repeated. Every foreign status is still denied.
+    """
+    started = _mem_scenario("started")
+    assert started.allow is False
+    assert "claimed live in another run" in started.reason
+
+    completed = _mem_scenario("completed")
+    assert completed.allow is False
+    assert "already completed in another run" in completed.reason
+    assert "do not repeat" in completed.reason
+    assert "EXT1" in completed.reason
+
+    unknown = _mem_scenario("unknown")
+    assert unknown.allow is False
+    assert "unknown outcome in another run" in unknown.reason
+    assert "reconcile it first (continuum_reconcile_action)" in unknown.reason
+
+    failed = _mem_scenario("failed")
+    assert failed.allow is False
+    assert "claim it again through continuum_intercept_action" in failed.reason
+    assert "closed (status failed)" in failed.reason
+
+    compensated = _mem_scenario("compensated")
+    assert compensated.allow is False
+    assert "closed (status compensated)" in compensated.reason
+    assert "reconcile it first" not in compensated.reason
+
+
 def test_gateway_enforces_tenant_scoped_memory_boundary_and_header(tmp_path: Path) -> None:
     """Enforce tenant-scoped namespace boundaries on external memory claims (#1415)."""
     from continuum.actions.ledger import fold_action_events
@@ -1065,7 +1144,7 @@ def test_match_route_rejects_colon_in_body_fields() -> None:
         bound_tenant="acme",
     )
     assert decision.allow is False
-    assert "malformed memory key" in decision.reason
+    assert "must not contain ':'" in decision.reason
 
 
 def test_match_route_supports_flexible_placeholder_order() -> None:
@@ -1368,3 +1447,466 @@ def test_match_route_with_run_metadata_missing_tenant(tmp_path: Path) -> None:
         storage=store,
     )
     assert "tenant mismatch" not in decision.reason
+
+
+def test_a_port_bound_route_is_reachable_through_the_live_gateway(db: str, tmp_path: Path) -> None:
+    """The live server hands the raw Host header, port included, to match_route.
+
+    The first pass at #1342 had the server strip the port before calling
+    ``match_route``, so the matcher could never see one: every route had to be
+    registered without a port or it was dead, and the fix lived only in the
+    unit tests. This exercises the seam that actually broke -- the header the
+    socket sees, not the argument a test passes.
+    """
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com:8443",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    server = GatewayServer(lambda: SQLiteStorage(db), "run_1", load_gateway_config(cfg), port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        # Unclaimed, so the refusal is a claim instruction -- which is only
+        # reachable at all when the route matched, rather than "no upstream".
+        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com:8443")
+        assert status == 403
+        assert "no upstream registered" not in body["reason"]
+
+        # The default port is a different destination and must not reach the
+        # port-bound route.
+        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com")
+        assert status == 403
+        assert "no upstream registered" in body["reason"]
+    finally:
+        server.shutdown()
+
+
+def test_the_most_specific_prefix_wins_regardless_of_registry_order(tmp_path: Path) -> None:
+    """A broad route must not shadow a narrower one that also admits the path.
+
+    ``match_route`` narrowed a host's routes by prefix and then took the first
+    survivor in registry order (issue #1341). A route with a broad prefix
+    therefore shadowed a route with a narrower one that also admitted the path,
+    so two configs identical but for the order of their ``upstreams`` array
+    rendered different keys and consulted, or spent, a different claim. The
+    winner is now the longest matching prefix, whichever order the list is in.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    broad = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    specific = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices/archive",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:archived",
+    )
+    body = {"store_id": "pg", "tenant": "acme"}
+
+    def decide(routes: list[Route]) -> Decision:
+        store = SQLiteStorage(":memory:")
+        store.create_run(Run(run_id="run_1", goal="g"))
+        store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+        ledger = ActionLedger(store, "run_1")
+        ledger.claim("mem_write", {}, key="mem:pg:acme:archived", scoped_to_run=False)
+        actions = fold_action_events(store.read_events("run_1"))
+        return match_route(
+            routes,
+            host="api.example.com",
+            method="POST",
+            path="/v1/invoices/archive/2024",
+            body=body,
+            actions_by_key=actions,
+            run_id="run_1",
+            bound_tenant="acme",
+        )
+
+    # The caller claimed the key the archive endpoint renders; the request is
+    # allowed and lands on the specific route no matter how the list is ordered.
+    for routes in ([broad, specific], [specific, broad]):
+        decision = decide(routes)
+        assert decision.allow is True, decision.reason
+        assert decision.route is not None
+        assert decision.route.prefix == "/v1/invoices/archive"
+
+
+def test_a_claim_for_the_broad_route_no_longer_spends_on_the_specific_path(
+    tmp_path: Path,
+) -> None:
+    """The mirror of #1341: the broad key must not settle the specific request.
+
+    Before the fix a claim for the broad prefix was spendable on the narrower
+    endpoint whenever the broad route happened to be listed first, so the run's
+    evidence said the broad operation ran while the upstream served the
+    specific one. The specific route now wins, and a request that carries only
+    the broad claim is refused, naming the key the specific route renders.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    broad = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    specific = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices/archive",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:archived",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ledger = ActionLedger(store, "run_1")
+    ledger.claim("mem_write", {}, key="mem:pg:acme:invoice", scoped_to_run=False)
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [broad, specific],
+        host="api.example.com",
+        method="POST",
+        path="/v1/invoices/archive/2024",
+        body={"store_id": "pg", "tenant": "acme"},
+        actions_by_key=actions,
+        run_id="run_1",
+        bound_tenant="acme",
+    )
+    assert decision.allow is False
+    assert "mem:pg:acme:archived" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("route_host", "request_host"),
+    [
+        ("api.example.com", "API.EXAMPLE.COM"),  # client upper-cased the header
+        ("API.EXAMPLE.COM", "api.example.com"),  # config upper-cased the host
+        ("Api.Example.Com", "api.example.COM"),  # mixed on both sides
+    ],
+)
+def test_host_matching_is_case_insensitive(
+    route_host: str, request_host: str, tmp_path: Path
+) -> None:
+    """HTTP host names are case-insensitive (RFC 7230 §5.4), issue #1342.
+
+    A client sending ``Host: API.EXAMPLE.COM`` against a route registered as
+    ``api.example.com`` was refused with "no upstream registered for host",
+    for a spelling the protocol says is not a difference.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    route = Route(
+        host=route_host,
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ActionLedger(store, "run_1").claim("send_invoice", {"id": "I-9"}, key="invoice:I-9")
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [route],
+        host=request_host,
+        method="POST",
+        path="/v1/invoices/49",
+        body={"id": "I-9"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert decision.allow is True, decision.reason
+
+
+def test_a_port_bound_route_is_reachable_when_the_request_carries_the_port(
+    tmp_path: Path,
+) -> None:
+    """A route registered with a port must match a request that names it (#1342).
+
+    The server used to hand ``host.split(":")[0]`` to ``match_route``, so a
+    route registered as ``api.example.com:8443`` never matched anything and was
+    silently dead. It now passes the raw header; the port is part of the
+    destination, so it has to reach the matcher. The route keeps its ``host``
+    verbatim for the upstream connection.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    route = Route(
+        host="api.example.com:8443",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ActionLedger(store, "run_1").claim("send_invoice", {"id": "I-9"}, key="invoice:I-9")
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [route],
+        host="api.example.com:8443",
+        method="POST",
+        path="/v1/invoices/49",
+        body={"id": "I-9"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert decision.allow is True, decision.reason
+    # The route keeps its port for the upstream connection.
+    assert decision.route is not None
+    assert decision.route.host == "api.example.com:8443"
+
+
+def test_a_request_without_a_port_does_not_reach_a_port_bound_route(tmp_path: Path) -> None:
+    """The port is part of the destination, so it cannot be dropped (#1342).
+
+    The first pass at this fix dropped the port on both sides, which let a
+    request on the listener's default port reach a route registered for
+    ``:8443`` -- a different upstream. Case still folds: only the port has to
+    agree exactly.
+    """
+    route = Route(
+        host="api.example.com:8443",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+
+    decision = match_route(
+        [route],
+        host="API.EXAMPLE.COM",  # no port, so not the :8443 destination
+        method="POST",
+        path="/v1/invoices/49",
+        body={"id": "I-9"},
+        actions_by_key={},
+        run_id="run_1",
+    )
+    assert decision.allow is False
+    assert "no upstream registered" in decision.reason
+
+
+def test_same_host_different_ports_do_not_merge(tmp_path: Path) -> None:
+    """Port-bound routes must not collapse into one candidate list.
+
+    Dropping the route-side port merged ``a.com:8443`` into ``a.com``: both
+    survived host selection, the prefix sort could not separate them when the
+    prefixes agreed, and registry order picked the winner -- the selection bug
+    #1341 closed, reintroduced with a different name. Each request must now
+    reach the route its own port names.
+    """
+    default_port = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    other_port = Route(
+        host="api.example.com:8443",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    routes = [default_port, other_port]
+
+    for request_host, expected in (
+        ("api.example.com", "api.example.com"),
+        ("api.example.com:8443", "api.example.com:8443"),
+    ):
+        decision = match_route(
+            routes,
+            host=request_host,
+            method="POST",
+            path="/v1/invoices/49",
+            body={"id": "I-9"},
+            actions_by_key={},
+            run_id="run_1",
+        )
+        # No claim is live, so the verdict is a claim refusal, not a routing
+        # one: the route it names is the routing decision.
+        assert decision.allow is False
+        assert decision.route is not None
+        assert decision.route.host == expected
+
+
+def test_a_broad_route_cannot_settle_a_path_a_specific_route_owns_for_another_method(
+    tmp_path: Path,
+) -> None:
+    """Method selection stays inside the most specific prefix.
+
+    The prefix sort puts the narrower route first, but the method filter used to
+    keep scanning: a narrower route that admitted the path but not the method
+    was skipped, and a broader route's claim authorised the request. The
+    narrower route governs the path once it wins the prefix race, so the
+    request is refused with its methods rather than falling through to a claim
+    less specific than the scope that now owns the path.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    broad = Route(
+        host="api.example.com",
+        methods=("GET",),
+        prefix="",  # whole host
+        action_type="read_invoice",
+        key_template="invoice:{id}",
+    )
+    specific = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ActionLedger(store, "run_1").claim("read_invoice", {"id": "I-9"}, key="invoice:I-9")
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [broad, specific],
+        host="api.example.com",
+        method="GET",
+        path="/v1/invoices/49",
+        body={"id": "I-9"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert decision.allow is False
+    # Named for the route that owns the path, not the broad one it skipped to.
+    assert "not among its allowed methods" in decision.reason
+
+
+def test_two_routes_sharing_a_prefix_split_by_method_still_resolve(tmp_path: Path) -> None:
+    """One route per method on the same prefix is one scope, not a collision.
+
+    That is the natural way to express a resource family, and restricting
+    method selection to the most specific prefix has to keep it working.
+    """
+    from continuum.actions.ledger import fold_action_events
+
+    reader = Route(
+        host="api.example.com",
+        methods=("GET",),
+        prefix="/v1/invoices",
+        action_type="read_invoice",
+        key_template="invoice:{id}",
+    )
+    writer = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ActionLedger(store, "run_1").claim("read_invoice", {"id": "I-9"}, key="invoice:I-9")
+    actions = fold_action_events(store.read_events("run_1"))
+
+    decision = match_route(
+        [reader, writer],
+        host="api.example.com",
+        method="GET",
+        path="/v1/invoices/49",
+        body={"id": "I-9"},
+        actions_by_key=actions,
+        run_id="run_1",
+    )
+    assert decision.allow is True, decision.reason
+    assert decision.route is not None
+    assert decision.route.methods == ("GET",)
+
+
+def test_colliding_upstreams_are_refused_at_config_load(tmp_path: Path) -> None:
+    """Two routes the matcher cannot tell apart fail at load, not at request time."""
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    },
+                    {
+                        "host": "API.example.com:443",  # folds to the same name/port
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices/",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    },
+                ]
+            }
+        )
+    )
+    with pytest.raises(GatewayConfigError) as excinfo:
+        load_gateway_config(cfg)
+    assert "repeats POST on prefix" in str(excinfo.value)
+
+
+def test_method_refusal_names_every_method_in_the_winning_scope() -> None:
+    """The refusal lists the winning prefix scope's methods, not one route's.
+
+    Method selection covers every route sharing the winning prefix, so the
+    refusal must name their union: with a GET route and a POST route on the
+    same prefix, a PUT refusal naming only one of them depends on registry
+    order, the dependence #1341 set out to remove.
+    """
+    get_route = Route(
+        host="api.example.com",
+        methods=("GET",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    post_route = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    for routes in ([get_route, post_route], [post_route, get_route]):
+        decision = match_route(
+            routes,
+            host="api.example.com",
+            method="PUT",
+            path="/v1/invoices/9",
+            body={},
+            actions_by_key={},
+            run_id="run_1",
+        )
+        assert decision.allow is False
+        assert "'get'" in decision.reason and "'post'" in decision.reason
