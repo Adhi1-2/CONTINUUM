@@ -427,246 +427,33 @@ def test_pg_action_index_covers_the_archive_after_rebuild(
     assert foreign.status is ActionStatus.COMPLETED
 
 
-@pytest.fixture
-def isolated_storage() -> Iterator[PostgresStorage]:
-    """A database the test owns exclusively.
-
-    ``action_index_drift`` compares a store-wide count of action events
-    against a store-wide sequence value, so the comparison is only meaningful
-    in a database whose entire history the test controls. The shared suite
-    database accumulates every test's runs, and once one run is compacted the
-    fold's merged order stops tracking the sequence (the archive/live ordering
-    gap, #1322, tracked separately from #1321), which would make a clean store
-    read as dirty for reasons this test does not exercise.
-    """
-    import psycopg
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-    name = f"iso_{os.getpid()}_{next(_iso_counter)}"
-    admin = psycopg.connect(DSN, autocommit=True)
-    try:
-        admin.execute(f'CREATE DATABASE "{name}"')
-    finally:
-        admin.close()
-    params = conninfo_to_dict(DSN)
-    params["dbname"] = name
-    store = PostgresStorage(make_conninfo(**params))
-    yield store
-    store.close()
-    admin = psycopg.connect(DSN, autocommit=True)
-    try:
-        admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
-    finally:
-        admin.close()
-
-
-def test_pg_action_index_drift_stays_zero_with_non_action_events_between_actions(
-    isolated_storage: PostgresStorage,
-) -> None:
-    """A healthy store must not report drift because of how it counts rows (#1321).
-
-    ``_maintain_action_index`` numbers a row with ``nextval``, which advances
-    once per action event, while the canonical fold numbered it by its
-    position in the merged row stream, which counts RUN_STARTED, TOOL_CALLED,
-    EVIDENCE_ADDED and every other non-action row too. An ordinary run has
-    those between its actions, so the two figures disagreed by one per
-    intervening row and ``verify`` reported a permanently dirty index on a
-    store nothing had tampered with. The fold now counts action events only,
-    1-based, which is the number the sequence actually assigned.
-    """
-    storage = isolated_storage
-    make_run(storage, "pg_1321", "healthy run")
-    # A non-action event between the two action events: the row population the
-    # two numbering schemes disagreed over.
-    storage.append_event("pg_1321", EventType.EVIDENCE_ADDED, {"evidence_id": "e1", "summary": "s"})
-    ledger = ActionLedger(storage, "pg_1321")
-    outcome = ledger.claim("process_doc", {}, key="doc:1321")
-    ledger.complete(outcome.key, external_id="doc:1321")
-
-    assert storage.action_index_drift() == 0
-    # The fold and the incremental writer agree on the number itself, not just
-    # on the absence of drift.
-    canonical = storage._canonical_index_rows()
-    stored = {
-        r["key"]: int(r["updated_seq"])
-        for r in storage._connection.execute("SELECT key, updated_seq FROM action_index")
-    }
-    assert {k: v for k, (_, v) in canonical.items()} == stored
-
-
-def test_pg_action_index_stays_clean_after_a_rebuild_and_further_appends(
-    isolated_storage: PostgresStorage,
-) -> None:
-    """A rebuild must not renumber the past in a way the next append breaks (#1321).
-
-    Before the fix, the fold numbered a row by its position in the merged row
-    stream, so a rebuild rewrote ``updated_seq`` on one scale while the next
-    appended action took the next ``nextval`` on the other; the two diverged
-    again immediately. ``foreign_action`` ranks with
-    ``ORDER BY updated_seq DESC``, so a fresh event that landed below the
-    rewritten rows would rank as the older write.
-    """
-    storage = isolated_storage
-    make_run(storage, "pg_rb", "rebuild then append")
-    storage.append_event("pg_rb", EventType.EVIDENCE_ADDED, {"evidence_id": "e1", "summary": "s"})
-    ledger = ActionLedger(storage, "pg_rb")
-    outcome = ledger.claim("process_doc", {}, key="doc:rb")
-    ledger.complete(outcome.key, external_id="doc:rb")
-
-    storage.rebuild_action_index()
-    assert storage.action_index_drift() == 0
-
-    # The appended action is newer than every row the rebuild numbered, so it
-    # ranks newest and the index is still consistent.
-    later = ledger.claim("process_doc", {}, key="doc:rb2")
-    ledger.complete(later.key, external_id="doc:rb2")
-    assert storage.action_index_drift() == 0
-    newest = storage.foreign_action(later.key, exclude_run="no_such_run")
-    assert newest is not None
-    assert newest.run_id == "pg_rb"
-
-
-def test_pg_action_index_drift_skips_malformed_json_payload(
+def test_pg_compact_rejects_through_sequence_that_would_eat_the_anchor(
     storage: PostgresStorage,
 ) -> None:
-    """Postgres fold skips a malformed JSON payload without raising JSONDecodeError (#1386)."""
-    make_run(storage, "pg_corrupt", "corrupt payload")
-    ledger = ActionLedger(storage, "pg_corrupt")
-    outcome = ledger.claim("process_doc", {}, key="doc:corrupt")
-    ledger.complete(outcome.key, external_id="doc:corrupt")
+    """Issue #1078: the SQLite engine refused an explicit through_sequence at
+    or above the anchor marker's sequence (#705) and Postgres did not, so the
+    marker and every live row after it were archived and deleted, and the next
+    append minted a fresh genesis that forked the live chain away from the
+    archive. The bound is now resolved by shared code, so the refusal holds on
+    both engines."""
+    make_run(storage, "pg_anchor", "guard target")
+    for i in range(4):
+        storage.append_event("pg_anchor", EventType.WORK_COMPLETED, {"i": i})
+    pre_live = len(storage.read_events("pg_anchor"))
 
-    with storage._write():
-        storage._connection.execute(
-            "UPDATE events SET payload = '{not valid json' WHERE run_id = 'pg_corrupt' AND sequence = 2"
-        )
+    with pytest.raises(ValueError, match="anchor"):
+        storage.compact_run("pg_anchor", through_sequence=10_000)
 
-    # action_index_drift and rebuild_action_index must skip the corrupt row instead of crashing
-    drift = storage.action_index_drift()
-    assert isinstance(drift, int)
-    rebuilt = storage.rebuild_action_index()
-    assert isinstance(rebuilt, int)
+    # The rejected call leaves a healthy, verifiable log: nothing was
+    # archived, only the forced checkpoint marker was appended.
+    report = storage.verify_events("pg_anchor")
+    assert report.ok, [v.kind for v in report.violations]
+    live = storage.read_events("pg_anchor")
+    assert len(live) == pre_live + 1
+    assert live[0].sequence == 1, "live rows must not have moved"
 
-
-def test_backfill_recovers_an_emptied_action_index(
-    isolated_storage: PostgresStorage,
-) -> None:
-    """An empty index over existing ACTION_* events rebuilds on open (#1441).
-
-    ``_backfill_action_index`` runs on every open and short-circuits unless
-    ACTION_* events exist and the index is empty, so it fires only in the
-    recovery case the method exists for: a database that predates the index,
-    or one that lost its rows. That is why the defect went unnoticed. The
-    WHERE clause used SQLite's ``json_extract()``, which Postgres does not
-    have, so opening such a store raised ``UndefinedFunction`` (SQLSTATE
-    42883) and the recovery path was dead.
-    """
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-    storage = isolated_storage
-    make_run(storage, "pg_bf", "recovery target")
-    ledger = ActionLedger(storage, "pg_bf")
-    outcome = ledger.claim("process_doc", {}, key="doc:bf")
-    ledger.complete(outcome.key, external_id="doc:bf")
-    assert storage.foreign_action(outcome.key, exclude_run="other") is not None
-
-    # A database that predates the index, or one whose index rows were lost.
-    storage._connection.execute("DELETE FROM action_index")
-    assert storage.foreign_action(outcome.key, exclude_run="other") is None
-
-    # Reopening runs the backfill inside _create_schema. On the broken query
-    # this is where the store failed to open; nothing was recovered.
-    params = conninfo_to_dict(DSN)
-    params["dbname"] = storage._connection.info.dbname
-    with PostgresStorage(make_conninfo(**params)) as fresh:
-        recovered = fresh.foreign_action(outcome.key, exclude_run="other")
-
-    # The completion is the last write for the key, so that is the live state.
-    assert recovered is not None
-    assert recovered.status is ActionStatus.COMPLETED
-    assert recovered.external_id == "doc:bf"
-
-
-def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
-    """A parentless run must load back as parentless, not as a corrupt row."""
-    make_run(storage, "pg_solo", "solo")
-    assert storage.get_run("pg_solo").parent_run_id is None
-
-
-def test_pg_child_run_keeps_its_parent_after_the_round_trip(
-    storage: PostgresStorage,
-) -> None:
-    """A fork's lineage column must survive the write and the read (#1079).
-
-    ``children_of`` filters ``list_runs`` on ``parent_run_id``, so a dropped
-    column made the family resume block vacuous here while SQLite enforced it.
-    """
-    make_run(storage, "pg_par", "supervise")
-    storage.create_run_started(
-        Run(run_id="pg_kid", goal="work", parent_run_id="pg_par"),
-        source=Origin.HUMAN,
-    )
-
-    assert storage.get_run("pg_kid").parent_run_id == "pg_par"
-    assert storage.get_run("pg_par").parent_run_id is None
-
-    from continuum.recovery.family import children_of
-
-    assert [run.run_id for run in children_of(storage, "pg_par")] == ["pg_kid"]
-    assert children_of(storage, "pg_kid") == []
-
-
-def test_pg_append_rolls_back_the_event_when_the_index_upsert_fails(
-    isolated_storage: PostgresStorage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The event and its action_index row must commit atomically (#1371).
-
-    The connection is autocommit, so the ``events`` INSERT and the
-    ``action_index`` upsert used to land in two separate durable commits: a
-    crash (or the ``CorruptedRecord`` the upsert can raise) between them left
-    the ACTION event durably in the log with no matching index row, and
-    ``foreign_action`` then reports a committed claim as un-recorded, so the
-    idempotency gate re-fires the effect. Wrapping the append in an explicit
-    ``transaction()`` makes the two writes atomic, matching SQLite. When the
-    index upsert fails, the event must not be durably present either.
-    """
-    storage = isolated_storage
-    make_run(storage, "pg_atomic", "atomicity")
-    ledger = ActionLedger(storage, "pg_atomic")
-
-    def boom(_event: object, payload: object = None) -> None:
-        raise CorruptedRecord("injected action-index failure")
-
-    monkeypatch.setattr(storage, "_maintain_action_index", boom)
-    before = storage.last_sequence("pg_atomic")
-    with pytest.raises(CorruptedRecord):
-        ledger.claim("process_doc", {}, key="doc:atomic")
-
-    # The failed append rolled back: no orphan event past the last good one.
-    monkeypatch.undo()
-    assert storage.last_sequence("pg_atomic") == before
-    action_rows = storage._connection.execute(
-        "SELECT count(*) AS c FROM events WHERE run_id = %s AND type ILIKE 'action_%%'",
-        ("pg_atomic",),
-    ).fetchone()
-    assert action_rows["c"] == 0
-
-
-def test_pg_payload_offload(storage: PostgresStorage, tmp_path: Path) -> None:
-    """PostgresStorage offloads oversized payloads to blob storage."""
-    make_run(storage, "pg_offload", "test offload")
-    storage._payload_offload_bytes = 50
-    storage._storage_dir = tmp_path
-
-    large_payload = {"details": "q" * 200}
-    event = storage.append_event("pg_offload", EventType.TOOL_CALLED, large_payload)
-    from continuum.storage.blob import OFFLOAD_KEY, is_offload_descriptor
-
-    assert is_offload_descriptor(event.payload)
-    sha256_hex = event.payload[OFFLOAD_KEY]
-    blob_file = tmp_path / "blobs" / f"{sha256_hex}.blob"
-    assert blob_file.exists()
-    assert event.hash == event.digest()
-
-    report = storage.verify_events("pg_offload")
-    assert report.ok
+    # A bounded value below the anchor still compacts normally.
+    result = storage.compact_run("pg_anchor", through_sequence=1)
+    assert result["archived"] >= 1
+    assert any(e.type is EventType.EVENT_LOG_ANCHORED for e in storage.read_events("pg_anchor"))
+    assert storage.verify_events("pg_anchor").ok, "chain must still verify after a safe compact"

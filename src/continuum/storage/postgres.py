@@ -57,13 +57,7 @@ from continuum.storage.base import (
     RunNotFound,
     Storage,
 )
-from continuum.storage.blob import (
-    audit_blob_descriptor,
-    get_payload_offload_threshold,
-    is_offload_descriptor,
-    load_blob_payload,
-    maybe_offload_payload,
-)
+from continuum.storage.compaction import resolve_compaction_bound
 
 __all__ = [
     "PostgresStorage",
@@ -688,77 +682,12 @@ class PostgresStorage(Storage):
         earned. The connection runs in autocommit mode, so the explicit
         ``transaction()`` block is what makes the three writes atomic.
 
-        ``through_sequence`` must stay below the anchor marker's sequence:
-        the live log always retains its anchor, so a value at or above it is
-        rejected (issue #705) instead of silently deleting the anchor and
-        every live row, which would leave the next append minting a fresh
-        genesis and fork the hash chain away from the archive. The check is
-        shared with the SQLite backend so the two cannot drift apart again
-        (issue #1078).
-
-        Content-addressed blobs referenced by archived events remain preserved
-        in the blob directory without modification (issues #254, #1419).
-
-        The anchor carries ``environment`` when supplied, else the environment
-        the run's newest checkpoint already recorded (#1049): an
-        environment-blind anchor makes every pinned dependency UNKNOWN at the
-        next assessment and silently downgrades a clean run.
+        The bound is resolved by :func:`continuum.storage.compaction.
+        resolve_compaction_bound`, shared with the SQLite engine, so an
+        explicit ``through_sequence`` at or above the anchor marker is
+        rejected here too instead of archiving and deleting it (issue #1078).
         """
-        from continuum.checkpoint.manager import CheckpointManager
-
-        lv = self.latest_version(run_id)
-        head = self.last_sequence(run_id)
-        # A caller-supplied environment has to land on a checkpoint, so it
-        # forces the fresh-anchor path whatever the log state. In practice the
-        # other terms already cover every reachable state (a version's
-        # STATE_CHECKPOINTED annotation sits one past its source_sequence, so
-        # head always outruns it); this term keeps the caller's request from
-        # depending on that invariant (#1049).
-        needs_fresh_anchor = (
-            lv is None
-            or through_sequence is not None
-            or lv.source_sequence < head
-            or environment is not None
-        )
-        if needs_fresh_anchor:
-            try:
-                manager = CheckpointManager(self)
-                # The anchor must project over full history: after an earlier
-                # compaction the live tail begins at the anchor markers with
-                # no RUN_STARTED, so a live-only fold would conclude the run
-                # never started (issue #648). Per-turn checkpoint evaluation
-                # deliberately keeps the cheaper live-tail read.
-                state = manager.project_current(run_id, full_history=True)
-                manager.checkpoint(
-                    run_id,
-                    state=state,
-                    force_version=True,
-                    # The anchor carries the environment the run's newest
-                    # checkpoint already recorded when none is supplied
-                    # (#1049): an environment-blind anchor makes every pinned
-                    # dependency UNKNOWN at the next assessment.
-                    environment=self._anchor_environment(run_id, environment),
-                )
-            except Exception as exc:
-                raise ValueError(f"run {run_id!r} could not be anchored: {exc}") from exc
-            lv = self.latest_version(run_id)
-        storage_version = lv
-        if storage_version is None:
-            raise ValueError(f"run {run_id!r} could not be anchored: no projectable state")
-        # The anchor marker is appended at the head of the log in the
-        # transaction below, so its sequence is the current head + 1. Without
-        # this bound the DELETE below would take the marker and every live
-        # row after it, and the next append would mint a fresh genesis that
-        # forks the live chain from the archive.
-        anchor_sequence = self.last_sequence(run_id) + 1
-        self._validate_compaction_bound(through_sequence, anchor_sequence)
-        through = (
-            through_sequence
-            if through_sequence is not None
-            else min(storage_version.source_sequence, self.last_sequence(run_id))
-        )
-        if through < 1:
-            raise ValueError("nothing to compact: anchor would be empty")
+        storage_version, through = resolve_compaction_bound(self, run_id, through_sequence)
 
         with self._write(), self._connection.transaction():
             self._append_chained(

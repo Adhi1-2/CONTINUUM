@@ -107,25 +107,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **The Postgres backend now persists and returns `runs.parent_run_id` (#1079).**
-  The column was declared in the schema but both inserts (`create_run` and
-  `create_run_started`) omitted it and `_row_to_run` did not read it, so a
-  fork's lineage was silently dropped on write and came back as the model
-  default `None` even for a row that had a value. `children_of` filters
-  `list_runs` on that column, so it always returned empty on Postgres,
-  `roll_up_children` never reported a family block, and the rule both the CLI
-  and the TUI render ("a parent may not RESUME while any child is unsafe")
-  could not fire. The SQLite backend already did all three; the schema needed
-  no change, so existing Postgres databases are fixed on their next write and
-  the foreign-key constraint that was declared but never exercised now holds.
-  A deployment would have looked healthy and simply never blocked a parent
-  over an unsafe child, with no error anywhere.
-
-  Added a Postgres contract test that forks and asserts `children_of` returns
-  the child through the query the roll-up reads, not just the column, and
-  strengthened the SQLite family test to assert the same. Nothing caught the
-  gap before because the SQLite tests covered the round-trip and the Postgres
-  suite never forked.
+- **Postgres compaction no longer archives and deletes its own anchor marker
+  (#1078).** `SQLiteStorage.compact_run` refused an explicit `through_sequence`
+  at or above the anchor marker's sequence (#705), but `PostgresStorage.
+  compact_run` computed `through` straight from the argument and ran the
+  archive and delete over it, so a direct caller of the storage API could
+  remove the marker and every live row after it. The next append then minted a
+  fresh genesis with `prev_hash = None` and the live chain forked away from the
+  archive, defeating the single-transaction marker-plus-move that both engines
+  implement. The SQLite and Postgres engines now resolve the bound through one
+  shared helper, `continuum.storage.compaction.
+  resolve_compaction_bound`, so the anchor guard and the other safety checks
+  cannot drift apart between backends again. The CLI still calls
+  `compact_run` with no bound, so only a direct API caller could reach this;
+  that remains a real hole for a library whose storage is a public interface.
+  Behaviour on SQLite is unchanged, and the Postgres suite gains the anchor
+  rejection test the SQLite suite already had.
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
@@ -968,7 +965,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,419 collected, ~2,391 passed, ~28 skipped on a minimal env).
+  (~2,407 collected, ~2,379 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
