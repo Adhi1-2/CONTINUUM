@@ -148,7 +148,33 @@ def load_gateway_config(path: Path) -> list[Route]:
             )
         except KeyError as exc:
             raise GatewayConfigError(f"{location}: upstream missing required field {exc}") from exc
+    _reject_colliding_routes(location, routes)
     return routes
+
+
+def _reject_colliding_routes(location: Path, routes: list[Route]) -> None:
+    """Refuse two routes the matcher cannot tell apart.
+
+    ``match_route`` selects by (host, port, prefix) and then by method, so two
+    routes that agree on all three and share a method are indistinguishable and
+    registry order would silently pick one -- the wrong-claim class issue #1341
+    closed elsewhere, except here no ordering can repair it. Fail at load time,
+    where the operator still has the file open, instead of routing live traffic
+    to whichever upstream happened to be listed first.
+    """
+    seen: dict[tuple[str, str | None, str, str], str] = {}
+    for route in routes:
+        name, port = _normalize_host(route.host)
+        for method in route.methods:
+            key = (name, port, _normalize_path(route.prefix), method)
+            earlier = seen.get(key)
+            if earlier is not None:
+                raise GatewayConfigError(
+                    f"{location}: upstream {route.host!r} repeats {method} on "
+                    f"prefix {route.prefix!r} already served by {earlier!r}; "
+                    f"drop one or give them different hosts, ports or prefixes"
+                )
+            seen[key] = route.host
 
 
 def load_gateway_tenant(path: Path) -> str | None:
@@ -241,6 +267,33 @@ def _normalize_path(raw: str) -> str:
     return collapsed or "/"
 
 
+def _normalize_host(host: str) -> tuple[str, str | None]:
+    """Canonical ``(name, port)`` for route matching: name case-folded, port kept.
+
+    Two rules, one from each half of issue #1342.
+
+    HTTP host names are case-insensitive (RFC 7230 §5.4, and DNS before it),
+    so the name is folded on both sides or a client that sends
+    ``Host: API.EXAMPLE.COM`` against a route registered as ``api.example.com``
+    is refused for a spelling the protocol says is not one.
+
+    The port, though, is part of the destination, and dropping it from the
+    *route* side merges routes that are not the same upstream -- ``a.com:8443``
+    and ``a.com`` would collapse into one candidate list and registry order
+    would decide between them again, which is the selection bug #1341 closed.
+    So the port stays in the comparison: a request carrying ``:8443`` matches
+    only a route registered with that port, and a request with no port matches
+    only a route registered without one. The one fold left is ``:443`` to
+    absent, since the gateway's only upstream scheme is https and 443 is its
+    default port -- ``a.com`` and ``a.com:443`` really are one destination, and
+    a client that spells the default port explicitly must still reach it.
+    IPv6 literals are out of scope, matching the port handling the request side
+    already does.
+    """
+    name, sep, port = host.partition(":")
+    return name.casefold(), None if not sep or port == "443" else port
+
+
 def _path_under_prefix(path: str, prefix: str) -> bool:
     """Whether ``path`` is within the route's ``prefix``.
 
@@ -293,7 +346,8 @@ def match_route(
                 route=None,
             )
 
-    candidates = [r for r in routes if r.host == host]
+    request_host = _normalize_host(host)
+    candidates = [r for r in routes if _normalize_host(r.host) == request_host]
     if not candidates:
         return Decision(False, f"no upstream registered for host {host!r}")
 
@@ -315,12 +369,30 @@ def match_route(
             f"its prefixes {sorted(r.prefix for r in candidates)}",
         )
 
-    route = next((r for r in scoped if method.upper() in r.methods), None)
+    # Most specific prefix wins, regardless of the order the registry lists
+    # routes in (issue #1341). A broad route must not shadow a narrower one
+    # that also admits the path: without this sort, two configs identical but
+    # for the order of their ``upstreams`` array render different keys for the
+    # same request and so consult, or spend, a different claim. The empty-prefix
+    # whole-host default normalises to ``/`` and sorts last, which is what it
+    # means.
+    scoped.sort(key=lambda r: len(_normalize_path(r.prefix)), reverse=True)
+
+    # Method selection stays inside that most specific prefix. Once a route has
+    # won the prefix race it governs the path, so falling through to a broader
+    # route when the winner does not admit the method would authorise the
+    # request under a claim less specific than the scope that now owns the
+    # path -- the same wrong-claim class #1341 is about, one axis over. Routes
+    # sharing the winning prefix (one route per method, the natural way to
+    # express a resource family) are one scope and are all eligible here.
+    best_prefix = len(_normalize_path(scoped[0].prefix))
+    eligible = [r for r in scoped if len(_normalize_path(r.prefix)) == best_prefix]
+    route = next((r for r in eligible if method.upper() in r.methods), None)
     if route is None:
+        allowed = sorted({m.lower() for r in eligible for m in r.methods})
         return Decision(
             False,
-            f"host {host!r} is registered but {method} is not among its allowed "
-            f"methods {[m.lower() for m in scoped[0].methods]}",
+            f"host {host!r} is registered but {method} is not among its allowed methods {allowed}",
         )
 
     # A memory key's segments are colon-delimited, so a colon in a placeholder
@@ -684,7 +756,12 @@ class GatewayServer:
 
                     decision = match_route(
                         server._routes,
-                        host=host.split(":")[0],
+                        # The raw header, port included: the port is part of the
+                        # destination and ``match_route`` needs it to tell
+                        # ``a.com:8443`` from ``a.com`` apart (issue #1342). The
+                        # route's own host, not this header, is what the upstream
+                        # connection is opened to.
+                        host=host,
                         method=method,
                         path=self.path,
                         body=body,
