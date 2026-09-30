@@ -215,6 +215,15 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
+- **Re-sync documented test counts to 2,934 and CLI commands to 48 (#1109).**
+  The landing page (`docs/index.html`) had drifted behind recent parser and suite
+  additions, stating 2,501 tests and 46 CLI commands against a live suite of
+  2,934 tests and 48 CLI commands. Re-synced the figures across all eleven files
+  governed by `test_docs_counts.py` and `test_cli_docs.py`: `docs/index.html`,
+  `README.md`, the five translated READMEs, `CHANGELOG.md`,
+  `docs/CONTRIBUTING_ONBOARDING.md`, `references/install.md`, and
+  `references/testing.md`.
+
 - **The Postgres action index backfill uses jsonb accessors instead of
   SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
   seeds the `action_index` projection from existing `ACTION_*` events when the
@@ -1702,7 +1711,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,906 collected, ~2,870 passed, ~36 skipped on a minimal env).
+  (~2,934 collected, ~2,898 passed, ~36 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
