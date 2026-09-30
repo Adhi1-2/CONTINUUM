@@ -215,6 +215,11 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
+- **`_risk_score` in `RiskObservedPayload` fails open on unusable inputs (#1421).**
+  `None`, unparseable text and non-finite floats now map to `0.0` rather than
+  raising `ValueError` or passing `NaN` to the Pydantic validator, preserving the
+  fail-open contract of the risk ingestion path.
+
 - **The Postgres action index backfill uses jsonb accessors instead of
   SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
   seeds the `action_index` projection from existing `ACTION_*` events when the
