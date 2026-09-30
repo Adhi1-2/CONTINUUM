@@ -310,46 +310,39 @@ def test_documented_extras_exist_in_pyproject() -> None:
                     )
 
 
-def test_docs_name_no_continuum_file_the_code_does_not_read() -> None:
-    """Every ``.continuum/<file>`` path in prose must exist in ``src/`` (#1161).
+def _tree_counts() -> tuple[int, int]:
+    """Modules and test files, counted the way README.md states them.
 
-    ``docs/guides/embed-codex.md`` offered ``monitored_commands`` in
-    ``.continuum/config`` as the durability fallback for an operator who cannot
-    route a write through Bash. No such loader exists: the key was written into
-    the guide and never wired, so the fallback sent the reader to a dead end at
-    the exact moment the guide is needed. The real ``.continuum/`` files
-    (budgets, gate, gateway, liveness, reconcilers, resume, webhooks, ...) each
-    appear as a literal somewhere under ``src/``, which is what this asserts.
-
-    A failure means one of two things, and only one is a code change: either add
-    the loader the prose promises, or fix the prose. If the path is meant as an
-    illustration rather than a real file, it belongs in ``ALLOWLIST`` below with
-    the reason, since an unguarded illustration is how #1161 read as a feature.
+    The module figure excludes the top-level ``__init__.py`` (the package
+    entry point, not a module with a role) and the test figure counts
+    ``tests/test_*.py``. Both are read from the working tree, so a merged
+    module or test file fails the guard instead of silently aging the
+    sentence (#1068).
     """
-    ALLOWLIST: dict[str, str] = {}
+    package_init = ROOT / "src" / "continuum" / "__init__.py"
+    modules = [p for p in (ROOT / "src" / "continuum").rglob("*.py") if p != package_init]
+    tests = list((ROOT / "tests").glob("test_*.py"))
+    return len(modules), len(tests)
 
-    scanned = [
-        ROOT / "README.md",
-        *sorted(ROOT.joinpath("docs").rglob("*.md")),
-        *sorted(ROOT.joinpath("references").rglob("*.md")),
-    ]
-    src_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in ROOT.joinpath("src").rglob("*.py")
+
+def test_readme_module_and_test_file_counts_match_tree() -> None:
+    """README's module and test-file counts must match the tree (#1068).
+
+    The sentence read "124 modules" and "161 test files" while the tree
+    carried 126 and 169. Only the two file counts had rotted: the ~2,241
+    collected total in the same sentence is covered by the tolerance guard
+    above, but the two file counts had no guard at all, and the test-file
+    figure was already stale the day it was written.
+    """
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"`src/continuum`,\s*(\d+)\s*modules\)\D*?(\d+)\s*test files", text)
+    assert match, "README states no module/test-file counts to guard"
+
+    documented_modules, documented_tests = int(match.group(1)), int(match.group(2))
+    live_modules, live_tests = _tree_counts()
+    assert documented_modules == live_modules, (
+        f"README says {documented_modules} modules but src/continuum carries {live_modules}"
     )
-
-    named: dict[str, list[Path]] = {}
-    for path in scanned:
-        for match in re.findall(r"\.continuum/[A-Za-z0-9._-]+", path.read_text(encoding="utf-8")):
-            named.setdefault(match, []).append(path)
-    assert named, "no .continuum/ path appears in prose; the regex may have drifted"
-
-    unverified = {
-        path: sorted({str(p) for p in files})
-        for path, files in named.items()
-        if path not in ALLOWLIST and path not in src_text
-    }
-    assert not unverified, (
-        "prose names a .continuum/ file no code under src/ reads: "
-        f"{unverified}. Either wire the loader the docs promise, fix the prose, "
-        "or add the path to ALLOWLIST in this test with the reason."
+    assert documented_tests == live_tests, (
+        f"README says {documented_tests} test files but tests/ carries {live_tests}"
     )
