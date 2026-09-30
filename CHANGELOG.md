@@ -42,29 +42,26 @@ All notable changes to this project are documented here. The format follows
   evidence. See `docs/guides/environment-providers.md`.
 ### Fixed
 
-- **A result the ledger cannot canonicalize no longer strands the action it
-  completes (#1394).** `ActionLedger.complete` hashed the caller-reported
-  result with `stable_hash` and that call sat outside the guard around the
-  caller's effect. A normal return value containing a type canonicalization
-  has no rule for (a `Decimal` amount, a `set` of ids, any object without
-  `model_dump`) therefore raised `TypeError` *after* the irreversible effect
-  ran. The action stayed `STARTED` and pending, the caller held a raw
-  `TypeError`, and a retry on the same key was refused as `UnknownSideEffect`:
-  the effect had happened once and the ledger could neither record nor repeat
-  it. `complete` and `reconcile(occurred=True)` now settle the result through
-  `canonical_sanitize` (new in `security/hashing.py`), which tries
-  `canonical` first and degrades only the part it has no rule for to its
-  `repr`, in place, so a nested `Decimal` replaces that leaf and leaves the
-  surrounding mapping intact. Every all-canonical result is byte-for-byte
-  unchanged, and the caller's own return value from `intercept_action` is
-  untouched on the first call; only the stored copy, and therefore what a
-  replay returns, is the JSON-native form the durable record already held,
-  since the event payload is `model_dump(mode="json")` and JSON has no
-  `Decimal`. The lossy substitution is self-describing through the stored
-  `repr` string, and the stored `result_hash` always matches the stored
-  result. This covers `GenericAgentAdapter` and `OpenAIAgentAdapter`, the
-  MCP `continuum_complete_action` path, and human reconciliation, none of
-  which can complete an effect as unknown-by-shape again.
+- **The AutoGen wrapper now awaits the real async `run_json` instead of
+  settling the ledger before the tool ran (#1392).** `wrap_autogen_tool`
+  replaced `run_json` with a synchronous function, but AutoGen core declares
+  `run_json` as a coroutine function on both the `Tool` protocol and
+  `BaseTool`. Calling the original returned a coroutine nothing in the wrapper
+  awaited, so `guard.complete` fired immediately with the unrun coroutine as
+  its result: the claim was recorded COMPLETED before the side effect
+  executed, and the `except` clause could never see the tool body raise,
+  because that body only runs when the framework awaits the returned
+  coroutine, outside the wrapper. A failed side effect was then durably
+  recorded COMPLETED, which inverts what the ledger exists for. On recovery a
+  failed effect looks done and is never retried or reconciled, and a crash
+  between the premature completion and the real execution loses the effect
+  with the ledger claiming success. The replacement is now `async def` and
+  awaits the original, so claim and settle bracket the real execution and a
+  tool error reaches `guard.fail` and is re-raised exactly as before. The
+  test fake's `run_json` was synchronous, which is why CI never saw the
+  mismatch; it is now `async def` and two new tests pin that nothing settles
+  before the coroutine is awaited and that an async failure is recorded
+  FAILED.
 
 - **File-derived progress no longer bloats the log on a compacted run.**
   `record_file_progress` gates its mirror on a projection of the log, but folded
