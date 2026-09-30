@@ -215,14 +215,18 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
-- **Re-sync documented test counts to 2,934 and CLI commands to 48 (#1109).**
-  The landing page (`docs/index.html`) had drifted behind recent parser and suite
-  additions, stating 2,501 tests and 46 CLI commands against a live suite of
-  2,934 tests and 48 CLI commands. Re-synced the figures across all eleven files
-  governed by `test_docs_counts.py` and `test_cli_docs.py`: `docs/index.html`,
-  `README.md`, the five translated READMEs, `CHANGELOG.md`,
-  `docs/CONTRIBUTING_ONBOARDING.md`, `references/install.md`, and
-  `references/testing.md`.
+- **Compacting one run no longer makes the action index read another run's
+  writes as dirty (#1322).** `action_index_drift` compares the stored
+  projection against a canonical fold of the log, and the fold treated
+  `events_archive` and `events` as two segments. That holds inside a single
+  run but not across runs: while one run compacts, others keep appending, so
+  the projection stopped reproducing the number the incremental writer had
+  stored. The fold now merges the two tables into one stream ordered by
+  `(timestamp, run_id, sequence)`, and the number stored in `updated_seq` is
+  epoch microseconds of the event's own timestamp rather than a row position
+  or a sequence value. The incremental writer, both backfills, and both folds
+  share one helper, `continuum.storage.actionindex.index_order_for`, so the
+  three cannot drift apart in what number they assign.
 
 - **The Postgres action index backfill uses jsonb accessors instead of
   SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
