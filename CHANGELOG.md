@@ -8,6 +8,33 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The authority-resurrection check now goes through its own exported helper
+  instead of being inlined twice (#1154).** `is_authority_consumed` was in
+  `__all__` and documented but called nowhere; `decide` and the gateway's
+  `match_route` each tested membership inline, and each also carried a
+  `hasattr` ladder whose dict fallback could not run, because
+  `collect_consumed_authorities` stores the `Event` itself as the map value and
+  an `Event` always has `.sequence` and `.payload`. Both call sites now route
+  through the helper and read those two attributes directly, with the
+  map-holds-Events contract documented at its one definition. Behaviour is
+  unchanged: the dead branches happened to compute the same values the live
+  ones did, so no message, verdict, or sequence number moves. What goes away is
+  that a security-sensitive block no longer reads as though it handles a
+  dict-valued map it can never receive, so the next change to
+  `collect_consumed_authorities` cannot silently select a different branch.
+- **The TUI `tree` view fetches the run once instead of twice (#1157).**
+  `family_lines` in `src/continuum/tui/model.py` called
+  `storage.get_run(run_id)` twice and discarded the first result: the first
+  call was the run-existence guard, the second fetched the record the header
+  actually renders. Both hit storage for the same row, and on the SQLite and
+  Postgres backends that is a round trip on a view an operator re-renders
+  while watching a run tree. The assignment now does both jobs: `run =
+  storage.get_run(run_id)` raises `RunNotFound` for a missing run exactly as
+  the standalone guard did, so no behaviour changes beyond the spared query.
+  The neighbouring views (`checkpoint_rows`, `action_rows`, `event_rows`,
+  `budget_rows`) already fetched the row exactly once for the same guard
+  purpose, so this removes the outlier.
+
 - **The advisory verdict contract is now stated where a reader can find it (#1031).**
   `RecoveryDecision` and its `permits()` method describe themselves as
   advisory, not enforcing, and name the four enforcement seams a caller can
@@ -963,7 +990,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,468 collected, ~2,439 passed, ~28 skipped on a minimal env).
+  (~2,409 collected, ~2,381 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
