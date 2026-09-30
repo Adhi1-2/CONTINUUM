@@ -8,27 +8,42 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Recovery-contract compatibility is now a published, versioned, tested promise (#764).**
-  The integrity hash used to cover "whatever the model defines today", so a
-  contract sealed by one build could only be verified by a build with the same
-  field set, and the compatibility path was a comment in `verify_contract`
-  rather than something an external verifier could implement against. Three
-  things now pin it. `CONTRACT_VERSIONS` in `src/continuum/recovery/contract.py`
-  publishes the field set each version covers; version 0 is the pre-Phase-1
-  contract (no `evidence`/`reason`), version 1 is current. A checked-in corpus
-  at `src/continuum/recovery/corpus/` carries fixtures for every category the
-  policy depends on -- current, legacy, forward-extension, malformed and
-  tampering -- each stating its version, canonical digest input and expected
-  outcome. `continuum.recovery.conformance` is an independent checker that
-  recomputes each digest from the published rules without ever calling
-  `verify_contract`, so the production verifier and the spec remain two things
-  that can disagree. `verify_contract_detailed` reports which version accepted
-  and why; an unknown version fails closed naming the versions this build
-  knows instead of hashing whatever fields happen to be present.
-  `RecoveryContract` carries `contract_version`, excluded from the digest
-  because it selects the payload rather than being part of it.
-  `docs/contract_compatibility.md` is the spec an external verifier implements
-  against, including how to add a field or a version.
+- **Portable lineage tokens for delegated work (#760).** A downstream service
+  that receives delegated work can now independently verify where it came from
+  without a copy of the recovery database. `continuum lineage-issue <run_id>
+  --key issuer.pem --purpose "..."` mints a versioned, signed token binding the
+  source run, the checkpoint version, the event-chain point, the sealed recovery
+  contract (by integrity hash, so the exact terms are named without carrying
+  them), the embedded attestation, issuer key identity, an optional audience,
+  and finite issuance/expiry times. `continuum lineage-verify [<run_id>] --token
+  t.json` checks signature, expiry, audience, version, and the referenced
+  run/checkpoint without writing state, reports `VALID` / `MALFORMED` /
+  `UNSUPPORTED_VERSION` / `TAMPERED` / `EXPIRED` / `WRONG_AUDIENCE` /
+  `UNKNOWN_ISSUER` / `BROKEN_REFERENCE`, and exits 0 only on `VALID`. With no
+  `run_id` the token is checked on its own contents, which is what a verifier
+  with no access to the source store needs. The token is evidence of origin and
+  delegation, not a capability: it carries no secrets and no event history, and
+  verifying it authorizes nothing on the source run. New module
+  `src/continuum/security/lineage.py`, CLI in `src/continuum/cli/main.py`, tests
+  in `tests/test_lineage.py` plus the lineage cases in `tests/test_cli.py`, and
+  the design and trust boundary in `references/attestation.md`.
+### Fixed
+- **A padded argument token can no longer reset the authorization-bound retry
+  budget (#1052).** The bucket was derived from every argument token, and the
+  arguments are caller-controlled noise plus the real resource, so keeping the
+  idempotency key fixed while varying one throwaway field (a `trace_id`, a
+  request id) moved every retry into a fresh bucket at its full allowance. A
+  `budgets.json` cap of 2 that refused a third identical attempt stayed open
+  indefinitely while each retry carried a new token. `ActionLedger.claim` now
+  derives the bucket from the record the claim defers to when one exists, which
+  is the identity the ledger itself has already decided the attempt is, and
+  settlement paths already derived from those same stored arguments, so a retry
+  and its confirmation share one bucket by construction. Fresh-key minting for
+  a fixed resource still shares the bucket as before (#390, #413). A caller
+  minting both a fresh key and fresh noise per attempt presents no identity the
+  ledger can see and remains on the token fallback -- the documented residual,
+  since declaring such fields `volatile` at every call site is not a fix: a
+  caller that wants around the cap simply forgets to declare them.
 
 ### Changed
 
@@ -989,7 +1004,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,423 collected, ~2,395 passed, ~28 skipped on a minimal env).
+  (~2,459 collected, ~2,430 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
