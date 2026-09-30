@@ -42,22 +42,29 @@ All notable changes to this project are documented here. The format follows
   evidence. See `docs/guides/environment-providers.md`.
 ### Fixed
 
-- **A protected node whose result cannot be hashed now completes instead of
-  re-firing on every replay (#1444).** `replayguard.protected_call` called
-  `ledger.complete` outside the `try/except` that guards the effect itself, and
-  `complete` digests the journaled result with `stable_hash`, which has no rule
-  for a `Decimal`, a `set` or a plain object. An ordinary dict carrying such a
-  value therefore raised *after* the irreversible effect ran, leaving the slot
-  `STARTED`; `evaluate` maps `STARTED` to `ALLOW` and `protected_call` re-runs
-  the effect for an `ALLOW` verdict, so every replay fired the side effect again
-  and crashed the same way on completion. The completion now goes through a
-  guard that degrades only the journal, to a `repr` envelope `canonical` always
-  accepts, so the action records `COMPLETED` and replays answer from the record.
-  The caller still gets its real result from the call that ran the effect; a
-  replay answers with an honest description of it rather than the value itself.
-  Only the `TypeError`/`ValueError` family `stable_hash` raises is degraded, so
-  a genuine `LedgerError` still surfaces. `langgraph_protected_node`, which
-  builds on `protected_call`, is covered by the same fix.
+- **A result the ledger cannot canonicalize no longer strands the action it
+  completes (#1394).** `ActionLedger.complete` hashed the caller-reported
+  result with `stable_hash` and that call sat outside the guard around the
+  caller's effect. A normal return value containing a type canonicalization
+  has no rule for (a `Decimal` amount, a `set` of ids, any object without
+  `model_dump`) therefore raised `TypeError` *after* the irreversible effect
+  ran. The action stayed `STARTED` and pending, the caller held a raw
+  `TypeError`, and a retry on the same key was refused as `UnknownSideEffect`:
+  the effect had happened once and the ledger could neither record nor repeat
+  it. `complete` and `reconcile(occurred=True)` now settle the result through
+  `canonical_sanitize` (new in `security/hashing.py`), which tries
+  `canonical` first and degrades only the part it has no rule for to its
+  `repr`, in place, so a nested `Decimal` replaces that leaf and leaves the
+  surrounding mapping intact. Every all-canonical result is byte-for-byte
+  unchanged, and the caller's own return value from `intercept_action` is
+  untouched on the first call; only the stored copy, and therefore what a
+  replay returns, is the JSON-native form the durable record already held,
+  since the event payload is `model_dump(mode="json")` and JSON has no
+  `Decimal`. The lossy substitution is self-describing through the stored
+  `repr` string, and the stored `result_hash` always matches the stored
+  result. This covers `GenericAgentAdapter` and `OpenAIAgentAdapter`, the
+  MCP `continuum_complete_action` path, and human reconciliation, none of
+  which can complete an effect as unknown-by-shape again.
 
 - **File-derived progress no longer bloats the log on a compacted run.**
   `record_file_progress` gates its mirror on a projection of the log, but folded
