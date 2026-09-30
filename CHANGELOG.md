@@ -80,22 +80,53 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **STATUS.md's interface counts are recounted and each now names the commit it
-  was measured at (#1070).** The Verified and Interfaces sections presented
-  aged figures as if they were live: 33 CLI commands while the built parser
-  exposes 46, 11 MCP tools split 3 read-only and 8 mutating while the server
-  exposes 12 split 3 and 9, and 1047 tests collected while the suite collects
-  2255. Every figure was right when it was written, the CLI and MCP counts
-  coming from a 2026-08-24 recount at `4453c72`; they aged as features landed
-  rather than being wrong at authorship, the twelfth MCP tool
-  (`continuum_record_plan`) and thirteen more CLI subcommands arriving after
-  that baseline. All three figures are recounted at `cef019d` on 2026-09-16
-  and now carry the commit and date they were measured at, so a reader can
-  tell a snapshot from a current claim and judge how far a number has
-  travelled instead of trusting it silently. Figures inside dated verification
-  records (the 2026-08-24 full-gate audit at `8013f6a`, the 2026-08-12 MCP
-  Inspector run) are left as written: they report what those runs observed, not
-  the current interface. Documentation only; no behaviour changes.
+- **The retry budget now gates only claims that would open a new attempt slot,
+  and reads the ledger through the same resolution `claim` does (#1080).**
+  `continuum_intercept_action` ran its budget gate against an exact-key lookup
+  of its own, so it could refuse a state `claim` would have answered. The
+  reachable case was an interrupted attempt: the record sits STARTED because
+  the process died between claim and complete, its own slot counts against it,
+  and a re-claim at an exhausted budget was answered "raise the retry budget"
+  when the ledger's answer was UnknownSideEffect, that the outcome is unknown
+  and a reconciliation is owed. An operator pointed at the budget is pointed at
+  the wrong knob, since nothing was retried and the work may already have
+  happened. The exact-key lookup also diverged in shape from `claim`'s
+  drift-tolerant resolution, which is what let the two readers disagree at all.
+
+  `ActionLedger.resolve_claim` is now that resolution, shared by `claim` and by
+  the gate: the exact argument-hash key, then another run holding the same
+  unscoped key, then the identity-token fallback for argument drift. It reports
+  whether `claim` would record a new attempt slot, and only that case is gated.
+  Callers passing an explicit key are unaffected: the key hashes verbatim, so
+  no drift is possible and the derived key is the stored key.
+- **Webhook dedup now survives a compaction inside the re-notify window
+  (#1186).** `_within_dedup_window` scanned only the live event tail for the
+  `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
+  but `compact_run` archives exactly those rows. A compaction inside an
+  endpoint's re-notify window (default 3600s) therefore made the next blocked
+  assessment deliver the same verdict again. This is the precise spam the dedup
+  exists to prevent, and in the failure direction that always means more
+  noise: an operator who was paged once and compacted the long blocked run to
+  shrink the log, as the docs suggest, gets paged again for the same standing
+  blockage, and once archived, on every subsequent assessment until the
+  window expires. The scan now reads `read_all_events`, the merged
+  archive-aware history every other durable-state consumer already uses
+  (`ledger._replay`, `gateway`, `provenance_for_run`, the reconcilers).
+  Archived rows keep their original timestamps, so the window computation
+  itself is unchanged and the expired-window path still rings again on time.
+- **The docs-count guard now reads `references/` and the translated READMEs,
+  and the stale counts they held are re-synced (#1109, #1071).** The guard in
+  `tests/test_docs_counts.py` watched only three files, so `references/testing.md`
+  and `references/install.md` quietly stated a collected total of 2,241 while
+  `README.md` stated 2,278, and all five translated READMEs still reported 2,195
+  collected with a 1,380-test narrative. None of those files could fail the
+  guard. Its scope is now the three required docs plus every `README*.md` and
+  every `references/*.md`: a doc that states no total is skipped, and a doc
+  that states a wrong one fails. The collected total is also matched in the
+  `pytest -q` verify comment, whose shape every translation keeps even after
+  all its prose is rephrased, so that one pattern reads all six READMEs.
+  `references/testing.md`, `references/install.md`, and the translated READMEs
+  now carry the same figures as `README.md`.
 
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
@@ -909,7 +940,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,241 collected, ~2,216 passed, ~25 skipped on a minimal env).
+  (~2,416 collected, ~2,388 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
