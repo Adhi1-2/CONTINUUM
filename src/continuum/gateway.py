@@ -323,6 +323,33 @@ def match_route(
             f"methods {[m.lower() for m in scoped[0].methods]}",
         )
 
+    # A memory key's segments are colon-delimited, so a colon in a placeholder
+    # value before the terminal segment shifts them and defeats the positional
+    # tenant check below (#1415). Deny as malformed here, before rendering, so
+    # ``render_key``'s boundary check is never the seam that answers a proxy
+    # request: the hook raises ``GateConfigError`` and the proxy answers
+    # "malformed memory key", and each test targets its own seam. Only the
+    # fields before the terminal one are checked -- a colon in the last segment
+    # cannot move the tenant position and is re-parsed downstream as
+    # ``":".join(parts[3:])``, so a record key such as ``doc:section:1`` stays
+    # a valid write (#1149 review). The two seams must agree on which colons
+    # are allowed, or a call denied at the proxy would render and claim at the
+    # hook.
+    if is_memory_template(route.key_template):
+        import string as _fields_string
+
+        _fields = [f for _, f, _, _ in _fields_string.Formatter().parse(route.key_template) if f]
+        for _field in _fields[:-1]:
+            _value = body.get(_field, "")
+            if ":" in str(normalize_key_value(_value)):
+                return Decision(
+                    False,
+                    f"malformed memory key: template {route.key_template!r} field {_field!r} "
+                    f"must not contain ':' (it would shift the key's colon-delimited "
+                    f"segments), got {_value!r}",
+                    route=route,
+                )
+
     try:
         rendered = render_key(route.key_template, body)
     except GatewayConfigError as exc:
@@ -346,8 +373,6 @@ def match_route(
         import string as _string
 
         fields = [f for _, f, _, _ in _string.Formatter().parse(route.key_template) if f]
-        if any(":" in str(normalize_key_value(body.get(f, ""))) for f in fields):
-            return Decision(False, f"malformed memory key {rendered!r}", route=route)
         tenant_field = "tenant_id" if "tenant_id" in fields else "tenant"
         tenant_in_key = str(normalize_key_value(body.get(tenant_field, "")))
         if tenant_in_key != bound_tenant:
@@ -371,11 +396,51 @@ def match_route(
             if getattr(storage, "supports_action_index", False):
                 foreign_action = storage.foreign_action(key, exclude_run=run_id)
                 if foreign_action is not None:
+                    # Mirror gate.decide's status table for a foreign record
+                    # (the docstring promises this) instead of one blanket
+                    # "reconcile it first": reconcile only fits UNKNOWN, and
+                    # a terminal foreign record (FAILED/COMPENSATED) left no
+                    # live effect, so the way forward is a fresh claim, not a
+                    # reconcile that has nothing to settle (#765e4bc). A
+                    # foreign STARTED is still denied here: a live claim in
+                    # another run must not authorise a parallel write to the
+                    # same global key.
+                    fstatus = foreign_action.status
+                    if fstatus is ActionStatus.COMPLETED:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} "
+                            f"was already completed in another run"
+                            + (
+                                f" (external id {foreign_action.external_id!r})"
+                                if foreign_action.external_id
+                                else ""
+                            )
+                            + "; do not repeat it",
+                            route=route,
+                        )
+                    if fstatus is ActionStatus.UNKNOWN:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} has an "
+                            f"unknown outcome in another run; reconcile it first "
+                            f"(continuum_reconcile_action)",
+                            route=route,
+                        )
+                    if fstatus is ActionStatus.STARTED:
+                        return Decision(
+                            False,
+                            f"side effect {route.action_type!r} key {rendered!r} is "
+                            f"claimed live in another run; it must settle before this "
+                            f"run can claim it",
+                            route=route,
+                        )
                     return Decision(
                         False,
-                        f"side effect {route.action_type!r} key {rendered!r} "
-                        f"already has a claim in another run "
-                        f"({foreign_action.status.value}); reconcile it first",
+                        f"the previous attempt of {route.action_type!r} with key "
+                        f"{rendered!r} in another run is closed (status "
+                        f"{fstatus.value}); claim it again through "
+                        f"continuum_intercept_action before retrying",
                         route=route,
                     )
         except Exception:
