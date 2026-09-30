@@ -23,7 +23,7 @@ from continuum.cli import ExitCode
 from continuum.events import EventType
 from continuum.models import Action, ActionStatus, Run, UnknownSideEffect
 from continuum.storage import SQLiteStorage
-from continuum.storage.migrations import SCHEMA_VERSION
+from continuum.storage.migrations import SCHEMA_VERSION, schema_version_of
 from continuum.storage.postgres import PostgresStorage
 
 
@@ -181,15 +181,15 @@ def test_spurious_rows_count_as_drift_and_are_removed(store: SQLiteStorage) -> N
 def test_a_healthy_store_with_non_action_rows_between_actions_reports_no_drift(
     store: SQLiteStorage,
 ) -> None:
-    """The canonical fold must number a row as the incremental writer numbered it.
+    """The fold must number a row exactly as the incremental writer numbered it.
 
     A run records plenty of non-action events between its actions -- tool
-    calls, evidence, findings. SQLite is immune to #1321 because both the
-    incremental maintenance and the fold use the writing event's ``rowid``,
-    so intervening rows move both figures together. This pins that agreement
-    so a refactor that switches the SQLite fold to counting action events
-    only -- which is what the Postgres engine needs -- is caught here rather
-    than than silently desynchronising the two numbering scales.
+    calls, evidence, findings. Both the incremental maintenance and the fold
+    derive ``updated_seq`` from the event's own timestamp through
+    ``index_order_for``, so intervening rows move neither figure. This pins
+    that agreement: a refactor that reintroduces a position-based number on
+    either side is caught here rather than silently desynchronising the two
+    scales.
     """
     ledger = make_run(store, "run_1")
     store.append_event("run_1", EventType.EVIDENCE_ADDED, {"evidence_id": "e1", "summary": "s"})
@@ -238,9 +238,9 @@ def test_baseline_and_migration_both_produce_the_table(db_path: str) -> None:
     assert "action_index" in names
 
 
-def test_schema_version_is_six() -> None:
+def test_schema_version_is_seven() -> None:
     """Pinned so a future bump consciously revisits prior migrations."""
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
 
 
 def test_v2_database_backfills_on_open(tmp_path: Path) -> None:
@@ -295,6 +295,74 @@ def test_v2_database_backfills_on_open(tmp_path: Path) -> None:
         # The seeded rows must already be on the fold's own scale, otherwise a
         # freshly upgraded store reads dirty until its first rebuild (#1322).
         assert store.action_index_drift() == 0
+
+
+def test_a_store_upgraded_from_the_rowid_scale_lands_on_zero_drift(tmp_path: Path) -> None:
+    """The fleet that shipped before this change keeps rowid numbers until a
+    reopen moves them (#1322, review on #1337).
+
+    ``migrate_schema`` runs only the steps between the store's stamped version
+    and ``SCHEMA_VERSION``, so v3's backfill never re-runs for a store that was
+    already past it. Such a store keeps ``rowid``-scale ``updated_seq`` while
+    the fold derives epoch microseconds, so every action row disagrees and the
+    store reads dirty the instant it opens -- with nothing to self-heal it,
+    because ``action_index_drift`` only counts and ``rebuild_action_index`` is
+    never called from ``src/``. The v7 step renumbers in place, walking the same
+    merged archive+live stream the fold uses, so an upgraded store lands on the
+    numbers a fresh store gets.
+
+    A store created fresh at the baseline is DDL-identical to one that climbed
+    every step, so stamping it back to v6 is a faithful stand-in for a store the
+    old build wrote.
+    """
+    from continuum.actions.idempotency import idempotency_key
+
+    db = str(tmp_path / "rowid_scale.db")
+    with SQLiteStorage(db) as store:
+        make_run(store, "run_a")
+        late = make_run(store, "run_b")
+        key = str(idempotency_key("send_invoice", None, scope=None, key="invoice:7"))
+
+        # The earlier failure stays live; run A never compacts.
+        store.append_event(
+            "run_a",
+            EventType.ACTION_RECORDED,
+            {
+                "key": key,
+                "action": Action(
+                    run_id="run_a", action_type="send_invoice", status=ActionStatus.FAILED
+                ).model_dump(mode="json"),
+            },
+        )
+        outcome = late.claim("send_invoice", {}, key="invoice:7", scoped_to_run=False)
+        assert late.complete(outcome.key, external_id="INV-7") is not None
+        # The later completion is compacted straight away, so the winning write
+        # is only in the archive -- the renumber has to read that stream, not
+        # just the live log, or the key keeps a live-log number forever.
+        store.compact_run("run_b")
+        assert store.action_index_drift() == 0
+
+    # What the shipped build left behind: positional numbers, and a stamp that
+    # says v6 so v3's backfill will not re-run on the next open.
+    raw = sqlite3.connect(db)
+    raw.execute("UPDATE action_index SET updated_seq = rowid")
+    raw.execute("UPDATE continuum_meta SET value = '6' WHERE key = 'schema_version'")
+    raw.commit()
+    raw.close()
+
+    with SQLiteStorage(db) as upgraded:
+        assert schema_version_of(upgraded._connection) == 7
+        # The v7 renumber brought the rows onto the fold's scale, so a store
+        # upgraded from the old build reads clean on open, like a fresh one.
+        assert upgraded.action_index_drift() == 0
+        # And the winner survived the renumber: the archived completion still
+        # owns the row and still answers the claim.
+        replay = make_run(upgraded, "run_c").claim(
+            "send_invoice", {}, key="invoice:7", scoped_to_run=False
+        )
+        assert replay.fresh is False
+        assert replay.action.status is ActionStatus.COMPLETED
+        assert replay.action.external_id == "INV-7"
 
 
 def test_a_key_rewritten_by_another_run_is_global_last_write_wins(
@@ -457,6 +525,50 @@ def test_repair_keeps_a_later_archived_completion_above_an_earlier_live_failure(
     assert replay.fresh is False
     assert replay.action.status is ActionStatus.COMPLETED
     assert replay.action.external_id == "INV-1054"
+
+
+def test_two_appends_in_one_microsecond_break_the_tie_on_sequence(store: SQLiteStorage) -> None:
+    """Equal timestamps share ``updated_seq``; the fold still pins the winner.
+
+    ``index_order_for`` has microsecond resolution, so two action events for the
+    same key can carry the identical number, and the stored row then cannot say
+    which action owns it -- only the fold's ``(timestamp, run_id, sequence)``
+    walk can. Here a claim and its completion are pinned to one microsecond and
+    the row is flipped to the earlier event, so a rebuild has to rely on the
+    ordering, not the number, to restore the completion. Pins the expected
+    winner so a change to either side cannot silently flip it (review on #1337).
+    """
+    from continuum.storage.actionindex import index_order_for
+
+    ledger = make_run(store, "run_1")
+    outcome = ledger.claim("send_invoice", {}, key="invoice:tie", scoped_to_run=False)
+    assert ledger.complete(outcome.key, external_id="INV-TIE") is not None
+
+    # Pin both action events to the same microsecond. The fold now derives one
+    # number for both, so a row carrying that number cannot say which action
+    # owns it -- only the fold's ``(run_id, sequence)`` walk can.
+    shared = "2026-03-04T05:06:07.891000+00:00"
+    store._connection.execute(
+        "UPDATE events SET timestamp = ? WHERE run_id = 'run_1' AND type LIKE 'ACTION%'",
+        (shared,),
+    )
+    assert store._canonical_index_rows()[str(outcome.key)][1] == index_order_for(shared)
+
+    # Flip the row to the earlier failure: the number alone is now useless, and
+    # only the fold's tie-break can put the completion back on top.
+    store._connection.execute(
+        "UPDATE action_index SET status = 'failed', "
+        "action_json = replace(action_json, '\"completed\"', '\"failed\"') "
+        "WHERE key = ?",
+        (str(outcome.key),),
+    )
+    assert store.rebuild_action_index() >= 1
+
+    found = store.foreign_action(str(outcome.key), exclude_run="nobody")
+    assert found is not None
+    assert found.status is ActionStatus.COMPLETED
+    assert found.external_id == "INV-TIE"
+    assert store.action_index_drift() == 0
 
 
 def test_repair_refuses_when_the_chain_fails(tmp_path: Path) -> None:

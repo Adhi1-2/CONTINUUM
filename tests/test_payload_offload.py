@@ -354,10 +354,18 @@ def test_postgres_append_event_offload_mock(
     mock_conn = MagicMock()
     mock_psycopg.connect.return_value = mock_conn
 
-    # Mock head event query
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = {"sequence": 1, "hash": "prevhash"}
-    mock_conn.execute.return_value = mock_cursor
+    # The queries _create_schema and append_event issue: the head-event lookup,
+    # plus the action-index guards. The projection is empty at construction, so
+    # the renumber guard sees a NULL max and no-ops.
+    def execute(sql: str, *args: object, **kwargs: object) -> MagicMock:
+        cursor = MagicMock()
+        if "MAX(updated_seq)" in sql:
+            cursor.fetchone.return_value = {"m": None}
+        else:
+            cursor.fetchone.return_value = {"sequence": 1, "hash": "prevhash"}
+        return cursor
+
+    mock_conn.execute.side_effect = execute
 
     monkeypatch.setitem(sys.modules, "psycopg", mock_psycopg)
     monkeypatch.setitem(sys.modules, "psycopg.rows", mock_rows)

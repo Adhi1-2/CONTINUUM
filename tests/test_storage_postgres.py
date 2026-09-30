@@ -639,6 +639,63 @@ def test_pg_backfill_seeds_an_emptied_index_on_the_folds_own_scale(
         reopened.close()
 
 
+def test_pg_renumbers_a_legacy_scale_index_on_reopen(
+    isolated_storage: PostgresStorage,
+) -> None:
+    """A store written before this change keeps counter-scale numbers; reopen
+    moves them (#1322, review on #1337).
+
+    Postgres has no stamped schema version, so nothing else would renumber rows
+    a build numbered by insertion order already wrote: ``updated_seq`` used to
+    come from a per-row sequence, while the fold now derives epoch microseconds
+    of the event's own timestamp. The two scales cannot overlap -- a counter
+    advanced once per action event never reaches the epoch microseconds of any
+    plausible timestamp -- so a reopened store recognises the legacy one without
+    a marker and renumbers it in a single transaction.
+    """
+    from continuum.actions.idempotency import idempotency_key
+
+    storage = isolated_storage
+    make_run(storage, "pg_legacy")
+    ledger = ActionLedger(storage, "pg_legacy")
+    outcome = ledger.claim("send_invoice", {}, key="pg:legacy", scoped_to_run=False)
+    assert ledger.complete(outcome.key, external_id="INV-LEGACY") is not None
+    key = str(idempotency_key("send_invoice", None, scope=None, key="pg:legacy"))
+
+    # What the shipped build left in the projection: small per-row counter
+    # values, one per action row.
+    storage._connection.execute(
+        "WITH numbered AS ("
+        "SELECT key, ROW_NUMBER() OVER (ORDER BY key) AS n FROM action_index) "
+        "UPDATE action_index SET updated_seq = numbered.n "
+        "FROM numbered WHERE action_index.key = numbered.key"
+    )
+    # The fold derives epoch microseconds, so the store now reads dirty --
+    # nothing self-heals it, since drift only counts and rebuild is never
+    # called from src/.
+    assert storage.action_index_drift() >= 1
+
+    dsn = storage.dsn
+    storage.close()
+    reopened = PostgresStorage(dsn)
+    try:
+        # The renumber walked the fold's own stream, so the rows it derived are
+        # exactly the ones the incremental writer would have stored.
+        assert reopened.action_index_drift() == 0
+        found = reopened.foreign_action(key, exclude_run="nobody")
+        assert found is not None
+        assert found.status is ActionStatus.COMPLETED
+        assert found.external_id == "INV-LEGACY"
+        # Idempotent: the rows are on the event scale now, so a second reopen
+        # leaves them alone rather than rewriting them again.
+        seq = reopened._connection.execute(
+            "SELECT updated_seq FROM action_index WHERE key = %s", (key,)
+        ).fetchone()["updated_seq"]
+        assert seq > 10**12
+    finally:
+        reopened.close()
+
+
 def test_pg_action_index_drift_skips_malformed_json_payload(
     storage: PostgresStorage,
 ) -> None:
