@@ -480,69 +480,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- **`approve_restore` target resolution and input validation are now covered
-  branch by branch (#1292).** `tests/test_restore_target_resolution.py`
-  previously had one entry point, `approve_restore(..., anchor_sequence=0)`,
-  so every branch of `_anchor_for` and every guard in front of it was
-  uncovered and a change to any of them would have shipped green. The new
-  tests drive each rung directly and pin the exact error messages. Two are
-  load-bearing rather than redundant: the no-target case writes checkpoints
-  out of order so the highest version is not the highest `source_sequence`,
-  which catches a resolver returning the wrong field, and the cross-run case
-  pins that a checkpoint id belonging to another run is not a valid target.
-  `restore.py` is unchanged. Three lines stay uncovered: the `CorruptedRecord`
-  rung is already covered by `tests/test_checkpoint_corruption.py`, and the
-  trailing `checkpoint_id` ladder at `restore.py:76-78` is unreachable,
-  since a real id resolves in `get_checkpoint` before that loop runs.
-
-- **The `__all__` guard now walks the installed package instead of five
-  hand-listed modules (#1228).** `tests/test_module_all_exports.py` asserted
-  that names in `__all__` resolve by importing five modules by name, so a
-  rename that forgot `__all__` stayed green on the other 117 modules that
-  declare one. `test_all_symbols_exist_on_modules` now enumerates the package
-  with `pkgutil.walk_packages` and checks every module it finds (122 today,
-  against a floor of 90 so a walk that silently shrank to nothing fails
-  instead of passing vacuously), and `test_star_import_execution` covers the
-  same set, catching a module whose import has a side effect or a name that
-  shadows an earlier one. A second check, `__all__` equals the public names a
-  leaf module defines itself, is added per-module on a curated list: it
-  cannot hold package-wide, because aggregator modules (`continuum.actions`
-  re-exports all 15 of its entries from submodules) legitimately list names
-  they do not define and some modules hold a public name back on purpose
-  (`continuum.budgets` keeps `FALLBACK_MAX_ATTEMPTS` private to its own
-  defaulting). Both are per-module policy, so only modules that define their
-  whole surface are pinned.
-
-- **The TUI `tree` view fetches the run once instead of twice (#1157).**
-  `family_lines` in `src/continuum/tui/model.py` called
-  `storage.get_run(run_id)` twice and discarded the first result: the first
-  call was the run-existence guard, the second fetched the record the header
-  actually renders. Both hit storage for the same row, and on the SQLite and
-  Postgres backends that is a round trip on a view an operator re-renders
-  while watching a run tree. The assignment now does both jobs: `run =
-  storage.get_run(run_id)` raises `RunNotFound` for a missing run exactly as
-  the standalone guard did, so no behaviour changes beyond the spared query.
-  The neighbouring views (`checkpoint_rows`, `action_rows`, `event_rows`,
-  `budget_rows`) already fetched the row exactly once for the same guard
-  purpose, so this removes the outlier.
-
-### Changed
-
-- **Recovery anchors are now produced by a product path (#1097).**
-  `CheckpointManager.checkpoint_on_recovery` and `last_recovery_anchor` had no
-  caller in `src/` (only tests) so the `RECOVERY` trigger, the `keep_anchors`
-  guard in `prune`, and the anchor branch in `cleanup_ephemeral_artifacts` all
-  protected a set that could never be populated. `continuum resume <run>
-  --repair` now records an anchor after a non-RESUME verdict, before the
-  `RECOVERY_STARTED` event so the pin covers the state the verdict judged rather
-  than the state after the repair bookkeeping landed, and `continuum restore
-  <run> --reason ... --to-recovery-anchor` rolls back to it (refusing with an
-  error when no anchor exists, and refusing a `--to`/`--anchor` given alongside).
-  A plain `resume` stays read-only and records nothing: judging is still
-  separate from acting, so the write lives in the CLI caller, never in
-  `RecoveryEngine.assess`. An anchor failure is reported on stderr and never
-  changes the verdict or its exit code.
-
 - **The advisory verdict contract is now stated where a reader can find it (#1031).**
   `RecoveryDecision` and its `permits()` method describe themselves as
   advisory, not enforcing, and name the four enforcement seams a caller can
@@ -589,23 +526,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
-- **Dead `backoff_delay` export (#1095).** The exponential-with-cap pacing
-  helper in `src/continuum/budgets.py` was the only member of
-  `budgets.__all__` with no consumer anywhere in the repo. Every refusal site
-  (`cli/main.py`, `mcp/server.py`, `actions/ledger.py`) refuses and returns;
-  none computes or applies a delay, and the module's own docstring states
-  CONTINUUM never retries anything itself; it counts and gates. The helper
-  shipped speculatively with #240 ("ships as a pure exponential+cap helper;
-  CONTINUUM never retries itself") and no caller arrived in the year since.
-  Removed with its tests. Recoverable from history (6217a65) if a real
-  retry-pacing surface ever needs it.
-
-- **Dead `DuplicateAction` and `LeaseError` exception classes (#1115).**
-  `DuplicateAction` (`continuum.actions.ledger`) and `LeaseError`
-  (`continuum.concurrency.lease`) were exported exceptions that no code path
-  could raise: duplicate attempts are handled via `fresh=False` outcomes,
-  `UnknownSideEffect`, or `GrantDenied`, while lease contention is signaled by
-  `acquire() -> False`. Dead exception definitions and exports removed.
 - **Dead `observations_evidence_lines` helper (#867).** The function in
   `src/continuum/recovery/observations.py` was defined once and called
   nowhere: leftover scaffolding from #208 whose engine-side rendering at
@@ -632,50 +552,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **The Codex embed guide no longer offers a config key that no code reads
-  (#1161).** `docs/guides/embed-codex.md` told an operator who cannot route a
-  file write through Bash that the durability alternative was `continuum
-  observe` via the adapter's `checkpoint_node`, or via `monitored_commands` in
-  `.continuum/config`. The second half was invented: no loader exists for a
-  `.continuum/config` file, and `monitored_commands` is defined and consulted
-  nowhere in `src/`, `tests/`, or the other docs. It was written into the guide
-  by the embeddability sprint commit (9e655be) and never wired. The guide
-  now offers only the `checkpoint_node` route, which is real
-  (`src/continuum/adapters/langgraph.py`, `langchain.py`) and does not depend
-  on Codex traversing the tool call at all, and it names the two source files
-  so the claim is checkable. This is the fallback an operator reaches for when
-  the shell-routing workaround above it does not apply, which is exactly the
-  `apply_patch` case the surrounding paragraph is about, so leaving the key in
-  place sent the reader to a dead end at the moment the guide is most needed.
-  Prose-only; no runtime or behaviour change.
-- **Webhook dedup now survives a compaction inside the re-notify window
-  (#1186).** `_within_dedup_window` scanned only the live event tail for the
-  `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
-  but `compact_run` archives exactly those rows. A compaction inside an
-  endpoint's re-notify window (default 3600s) therefore made the next blocked
-  assessment deliver the same verdict again. This is the precise spam the dedup
-  exists to prevent, and in the failure direction that always means more
-  noise: an operator who was paged once and compacted the long blocked run to
-  shrink the log, as the docs suggest, gets paged again for the same standing
-  blockage, and once archived, on every subsequent assessment until the
-  window expires. The scan now reads `read_all_events`, the merged
-  archive-aware history every other durable-state consumer already uses
-  (`ledger._replay`, `gateway`, `provenance_for_run`, the reconcilers).
-  Archived rows keep their original timestamps, so the window computation
-  itself is unchanged and the expired-window path still rings again on time.
-- **The docs-count guard now reads `references/` and the translated READMEs,
-  and the stale counts they held are re-synced (#1109, #1071).** The guard in
-  `tests/test_docs_counts.py` watched only three files, so `references/testing.md`
-  and `references/install.md` quietly stated a collected total of 2,241 while
-  `README.md` stated 2,278, and all five translated READMEs still reported 2,195
-  collected with a 1,380-test narrative. None of those files could fail the
-  guard. Its scope is now the three required docs plus every `README*.md` and
-  every `references/*.md`: a doc that states no total is skipped, and a doc
-  that states a wrong one fails. The collected total is also matched in the
-  `pytest -q` verify comment, whose shape every translation keeps even after
-  all its prose is rephrased, so that one pattern reads all six READMEs.
-  `references/testing.md`, `references/install.md`, and the translated READMEs
-  now carry the same figures as `README.md`.
+- **`resume --pinning` drift now reads full history, so a compacted run stops
+  reporting every key as newly pinned (#1126).** `cmd_resume` folded
+  `latest_pinning` over `read_events`, the live tail only. `compact_run`
+  archives the pre-anchor prefix and every `ACTION_RECORDED` carrying a
+  pinning lives in it, while the anchor marker left behind carries only
+  `anchored_through`/`version`, so the fold returned `{}` and
+  `pinning_drift({}, current)` named every key as newly pinned on a run whose
+  recorded pinning was identical. The masked directions were the ones an
+  operator would act on: a genuinely changed hash rendered as "newly pinned",
+  and a key that had been unpinned never rendered at all, since the
+  "unpinned (was ...)" line needs the old value from the record it could no
+  longer see. The display stays informational only (#241) but was wrong in
+  the direction of hiding drift. The fold now reads `read_all_events`, which
+  merges the archived prefix back in by sequence, so "newest non-empty
+  pinning" stays correct across compaction. This is the same read-site class
+  as #1050 (assess) and #1072 (watch).
 
 - **A consumed authority no longer downgrades a stricter recovery verdict
   (#1146).** `RecoveryEngine.assess` overwrote the mode with
@@ -710,50 +602,6 @@ All notable changes to this project are documented here. The format follows
   prepends it to the rendered steps rather than dropping the run's guidance
   entirely, and the MCP server raises it as a `ToolError` so the calling agent
   sees it.
-
-- **A tampered checkpoint is reported as corrupted, not as missing (#1059).**
-  Both checkpoint resolvers wrapped `storage.get_checkpoint` in a bare
-  `except Exception: pass`, so a record whose body failed validation or whose
-  sealed integrity hash no longer matched was silently retried as a version
-  number and finally reported as a lookup miss. `resolve_checkpoint` and
-  `_anchor_for` now let `CorruptedRecord` through, wrapping it in the same
-  `RewindError`/`ValueError` the resolvers already raise, but naming the
-  corruption instead of pointing the operator at a typo or a missing version.
-  The tamper-evidence the storage layer raises is the one signal an operator
-  most needs on this path, and it was the signal both resolvers converted into
-  noise. A genuine lookup miss still falls through to the version and
-  source-sequence strategies exactly as before.
-
-- **`continuum attest-keygen` writes the private key owner-only (#1056).** The
-  command wrote an unencrypted PKCS8 Ed25519 private key with
-  `Path.write_text`, which creates the file at 0666 masked by the ambient umask
-  (0644 out of the box, readable by every local user on the host) while its
-  own output told the operator to keep it secret. Anyone with read access to the
-  file or a backup copy could produce validly-signed attestations for a tampered
-  event chain. The key is now created through `os.open` with an explicit 0600
-  mode, so it is owner-only from the moment it appears with no window at 0644,
-  and a pre-existing wider-mode file being overwritten is narrowed too, since
-  `open(2)` ignores the mode argument for a file that already exists. The public
-  key stays world-readable, as intended. The command now reports the mode it
-  applied next to the existing "keep the private key secret" line, so an operator
-  on a surprising filesystem can see what they actually got. Two tests pin the
-  property on POSIX (created mode, narrowing of a pre-existing 0644 key,
-  reported mode in output); Windows has no POSIX permission bits and is
-  skipped, matching the `tests/test_retry_budgets.py` precedent. A third test
-  covers the file-descriptor leak guard in the write helper on every platform.
-- **Every run-completion path now clears the instant-resume pointer (#394).**
-  `.continuum/resume.json` is written on every checkpoint so a `SessionStart`
-  hook can banner the interrupted run without opening the database. A run
-  closed as completed is no longer interrupted, but only `continuum complete`
-  removed the pointer; the TUI's and the dashboard HITL button's `complete_run`
-  claimed to mirror that command and did not, so completing a run from either
-  left the next session banner surfacing finished work as the active run. The
-  cleanup is now a single helper (`continuum.checkpoint.clear_resume_pointer`)
-  all three paths route through. A pointer naming any other run is left in
-  place, and an unreadable or undeletable file, or one holding valid JSON that
-  is not an object, is tolerated rather than failing the completion.
-  `tests/test_resume_pointer.py` pins the helper and each of the three
-  completion paths, and was verified to fail without the fix.
 
 - **The horizon `abort_condition_year` scenario now reaches abort (#1028).**
   The scenario was labelled `correct_mode="abort"` but drove the abort through
@@ -1543,7 +1391,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,406 collected, ~2,379 passed, ~27 skipped on a minimal env).
+  (~2,241 collected, ~2,216 passed, ~25 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
