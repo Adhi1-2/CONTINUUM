@@ -69,6 +69,13 @@ __all__ = [
     "PostgresStorage",
 ]
 
+#: ``action_index.updated_seq`` below this cannot be epoch microseconds of a
+#: plausible event timestamp: 10**12 epoch microseconds is 2001-09-09, while the
+#: pre-#1322 numbering was a per-row counter bounded by the number of action
+#: events ever written. The gap is what lets a reopened store tell an index
+#: already on the event scale from a legacy one without a stamped marker.
+_EVENT_SCALE_FLOOR = 10**12
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS continuum_meta (
     key   TEXT PRIMARY KEY,
@@ -256,16 +263,22 @@ class PostgresStorage(Storage):
         with self._lock:
             self._connection.execute(_SCHEMA)
             self._backfill_action_index()
+            self._renumber_action_index_if_stale()
 
     def _backfill_action_index(self) -> None:
         """Seed the projection from the log when it is empty (issue #216).
 
         The table is a derived projection: an empty index over existing
-        ACTION_* events means the database predates the index or lost its
-        rows, and rebuilding from events is always safe. Payload is stored as
-        TEXT, so it is cast to ``jsonb`` before the ``->``/``->>`` accessors
-        apply (Postgres has no ``json_extract``; that is the SQLite spelling in
-        ``migrations.py``).
+        ACTION_* events means the database predates the index or lost its rows,
+        and rebuilding from events is always safe. The rows are folded from the
+        same merged archive+live stream the canonical fold reads, so an emptied
+        index over a store that has already compacted still reseeds the keys
+        whose owners were archived -- the archive holds the winning write in
+        that state, and reading the live log alone would miss them and let a
+        cross-run claim open a slot against a completed side effect. The whole
+        reseed is one transaction, so an interrupted open leaves either a
+        complete projection or none, never a partial one that the non-empty
+        guard would then skip past on the next open.
 
         The number comes from :func:`index_order_for`, read row by row, for the
         same reason the writer uses it: the value has to be reproducible by
@@ -274,35 +287,59 @@ class PostgresStorage(Storage):
         engine and ``strftime`` on SQLite both round, and a rounded number is
         not the number the fold reproduces.
         """
-        has_events = self._connection.execute(
-            "SELECT 1 FROM events WHERE type IN "
-            "('ACTION_RECORDED', 'ACTION_RECONCILED', 'ACTION_COMPENSATED') LIMIT 1"
-        ).fetchone()
-        if has_events is None:
-            return
         empty = self._connection.execute("SELECT 1 FROM action_index LIMIT 1").fetchone()
         if empty is not None:
             return
-        rows = self._connection.execute(
-            "SELECT timestamp, type, payload FROM events "
-            "WHERE type IN ('ACTION_RECORDED', 'ACTION_RECONCILED', 'ACTION_COMPENSATED') "
-            "ORDER BY timestamp, run_id, sequence"
-        ).fetchall()
-        for row in rows:
-            payload = (
-                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            )
-            entry = index_entry_from_payload(EventType(row["type"]), payload)
-            if entry is None:
-                continue
-            key, run_id, action_id, status, action_json = entry
-            self._connection.execute(
+        canonical = self._canonical_index_rows()
+        if not canonical:
+            return
+        # psycopg's Connection has no executemany; the cursor does. The cursor
+        # opens inside the transaction so the reseed is atomic.
+        with (
+            self._write(),
+            self._connection.transaction(),
+            self._connection.cursor() as cur,
+        ):
+            cur.executemany(
                 "INSERT INTO action_index(key, run_id, action_id, status, "
-                "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (key) DO UPDATE SET run_id = EXCLUDED.run_id, "
-                "action_id = EXCLUDED.action_id, status = EXCLUDED.status, "
-                "updated_seq = EXCLUDED.updated_seq, action_json = EXCLUDED.action_json",
-                (key, run_id, action_id, status, index_order_for(row["timestamp"]), action_json),
+                "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s)",
+                [
+                    (key, entry[1], entry[2], entry[3], seq, entry[4])
+                    for key, (entry, seq) in canonical.items()
+                ],
+            )
+
+    def _renumber_action_index_if_stale(self) -> None:
+        """Renumber the projection onto the event scale when it is on the old one.
+
+        Postgres has no stamped schema version, so nothing else moves rows a
+        build numbered by insertion order already wrote: ``updated_seq`` used to
+        come from a per-row sequence, while the fold now derives epoch
+        microseconds of the event's own timestamp (#1322). Those two scales do
+        not overlap -- 10**12 epoch microseconds is 2001-09-09, and a counter
+        advanced once per action event cannot reach it -- so a single bound
+        separates an upgraded index from a legacy one without a marker, and the
+        check is idempotent: once rows carry epoch microseconds they sit above
+        the bound and this is a no-op on every later open.
+
+        Only the number is rewritten, one transaction for the whole store, so
+        an interrupted open cannot leave a half-renumbered index that the
+        re-open guard would then skip past.
+        """
+        row = self._connection.execute("SELECT MAX(updated_seq) AS m FROM action_index").fetchone()
+        if row is None or row["m"] is None:
+            return
+        if int(row["m"]) >= _EVENT_SCALE_FLOOR:
+            return
+        canonical = self._canonical_index_rows()
+        with (
+            self._write(),
+            self._connection.transaction(),
+            self._connection.cursor() as cur,
+        ):
+            cur.executemany(
+                "UPDATE action_index SET updated_seq = %s WHERE key = %s",
+                [(seq, key) for key, (_entry, seq) in canonical.items()],
             )
 
     # -- transactions ----------------------------------------------------- #
@@ -899,7 +936,7 @@ class PostgresStorage(Storage):
                 "SELECT timestamp, run_id, sequence, type, payload FROM ("
                 "SELECT timestamp, run_id, sequence, type, payload FROM events_archive "
                 "UNION ALL "
-                "SELECT timestamp, run_id, sequence, type, payload FROM events) "
+                "SELECT timestamp, run_id, sequence, type, payload FROM events) AS merged "
                 "ORDER BY timestamp, run_id, sequence"
             ).fetchall()
         canonical: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}

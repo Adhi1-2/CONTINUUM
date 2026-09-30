@@ -42,7 +42,7 @@ __all__ = [
 ]
 
 #: The schema version this build produces and understands.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: The full, current schema applied to a brand-new database.
 BASELINE_SCHEMA = """
@@ -173,7 +173,7 @@ class Migration:
     string or a callable receiving the connection; the callable form is for a
     step that cannot be expressed in SQL, which today means any step that has
     to produce the action index's ordering number (see
-    :func:`_backfill_action_index_v3`).
+    :func:`_backfill_action_index_v3` and :func:`_renumber_action_index_v7`).
     """
 
     def __init__(
@@ -352,6 +352,54 @@ def _up_v6() -> str:
 """
 
 
+def _renumber_action_index_v7(conn: sqlite3.Connection) -> None:
+    """Renumber ``action_index.updated_seq`` onto the event scale (#1322).
+
+    Stores written before this change carry a *position* in that column --
+    SQLite wrote the event's ``rowid`` -- while the fold now derives epoch
+    microseconds of the event's own timestamp (see
+    :func:`continuum.storage.actionindex.index_order_for`). A store already
+    past v3 when it first met this build keeps its old numbers, because
+    ``migrate_schema`` runs only the steps between the store's stamped version
+    and ``SCHEMA_VERSION``: v3's backfill never re-runs for it, so the fleet
+    splits into fresh stores on the new scale and upgraded stores still on the
+    old one. Every row of the latter then disagrees with the fold and
+    ``verify --index`` reads the index dirty the moment the store is opened.
+
+    This step closes the split by renumbering in place. It walks the same
+    merged ``(timestamp, run_id, sequence)`` stream the fold uses -- archive and
+    live log together, because an upgrading store may already have compacted the
+    run that owns a key -- so an upgraded store lands on the same numbers a
+    fresh store gets and ``action_index_drift`` reads zero on open.
+
+    Only the number is rewritten: the rest of a row was never position-derived,
+    so nothing else about the projection changes. A key with no owner event in
+    the log is left untouched for ``verify --repair-index`` to report, keeping
+    this step strictly about the numbering scale.
+    """
+    rows = conn.execute(
+        "SELECT timestamp, run_id, sequence, type, payload FROM ("
+        "SELECT timestamp, run_id, sequence, type, payload FROM events_archive "
+        "UNION ALL "
+        "SELECT timestamp, run_id, sequence, type, payload FROM events) AS merged "
+        "ORDER BY timestamp, run_id, sequence"
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except json.JSONDecodeError:
+            continue
+        entry = index_entry_from_payload(EventType(row["type"]), payload)
+        if entry is None:
+            continue
+        # Walking the merged stream in fold order and re-writing per row means
+        # the last write of a key wins, reproducing the fold's dict overwrite.
+        conn.execute(
+            "UPDATE action_index SET updated_seq = ? WHERE key = ?",
+            (index_order_for(row["timestamp"]), entry[0]),
+        )
+
+
 #: Forward migrations, keyed by the version they *produce*.
 MIGRATIONS: dict[int, Migration] = {
     2: Migration(version=2, name="add_versions_table_and_event_provenance", up=_up_v2()),
@@ -359,6 +407,11 @@ MIGRATIONS: dict[int, Migration] = {
     4: Migration(version=4, name="add_langgraph_checkpoint_tables", up=_up_v4()),
     5: Migration(version=5, name="add_events_archive", up=_up_v5()),
     6: Migration(version=6, name="add_runs_parent_column", up=_up_v6()),
+    7: Migration(
+        version=7,
+        name="renumber_action_index_to_event_scale",
+        up=_renumber_action_index_v7,
+    ),
 }
 
 

@@ -759,7 +759,7 @@ class SQLiteStorage(Storage):
                 "SELECT timestamp, run_id, sequence, type, payload FROM ("
                 "SELECT timestamp, run_id, sequence, type, payload FROM events_archive "
                 "UNION ALL "
-                "SELECT timestamp, run_id, sequence, type, payload FROM events) "
+                "SELECT timestamp, run_id, sequence, type, payload FROM events) AS merged "
                 "ORDER BY timestamp, run_id, sequence"
             ).fetchall()
         canonical: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}
