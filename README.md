@@ -101,7 +101,7 @@ Verify:
 continuum --help                 # CLI entrypoint
 continuum-mcp --help             # MCP server entrypoint (needs [mcp] or [dev])
 pytest -q                        # ~2,241 collected, ~2,216 passed, ~25 skipped on a minimal env (exact counts vary)
-ruff check src/ tests/ examples/ scripts/ demo-run/ && ruff format --check src/ tests/ examples/ scripts/ demo-run/
+ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # the three gates CI enforces
 ```
 
@@ -428,7 +428,7 @@ Schema v6. SQLite is primary, Postgres is CI verified. One log, many projections
 
 ### Module map: one library, many surfaces
 
-CONTINUUM is one library (`src/continuum`, 124 modules) plus a large test suite (161 test files, ~2,241 tests). All modules append to and replay one hash chained event log:
+CONTINUUM is one library (`src/continuum`, 126 modules) plus a large test suite (170 test files, ~2,241 tests). All modules append to and replay one hash chained event log:
 
 | Module | Role |
 |:--|:--|
