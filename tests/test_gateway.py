@@ -1874,3 +1874,39 @@ def test_colliding_upstreams_are_refused_at_config_load(tmp_path: Path) -> None:
     with pytest.raises(GatewayConfigError) as excinfo:
         load_gateway_config(cfg)
     assert "repeats POST on prefix" in str(excinfo.value)
+
+
+def test_method_refusal_names_every_method_in_the_winning_scope() -> None:
+    """The refusal lists the winning prefix scope's methods, not one route's.
+
+    Method selection covers every route sharing the winning prefix, so the
+    refusal must name their union: with a GET route and a POST route on the
+    same prefix, a PUT refusal naming only one of them depends on registry
+    order, the dependence #1341 set out to remove.
+    """
+    get_route = Route(
+        host="api.example.com",
+        methods=("GET",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    post_route = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/invoices",
+        action_type="mem_write",
+        key_template="mem:{store_id}:{tenant}:invoice",
+    )
+    for routes in ([get_route, post_route], [post_route, get_route]):
+        decision = match_route(
+            routes,
+            host="api.example.com",
+            method="PUT",
+            path="/v1/invoices/9",
+            body={},
+            actions_by_key={},
+            run_id="run_1",
+        )
+        assert decision.allow is False
+        assert "'get'" in decision.reason and "'post'" in decision.reason

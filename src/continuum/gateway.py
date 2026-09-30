@@ -389,10 +389,10 @@ def match_route(
     eligible = [r for r in scoped if len(_normalize_path(r.prefix)) == best_prefix]
     route = next((r for r in eligible if method.upper() in r.methods), None)
     if route is None:
+        allowed = sorted({m.lower() for r in eligible for m in r.methods})
         return Decision(
             False,
-            f"host {host!r} is registered but {method} is not among its allowed "
-            f"methods {[m.lower() for m in scoped[0].methods]}",
+            f"host {host!r} is registered but {method} is not among its allowed methods {allowed}",
         )
 
     # A memory key's segments are colon-delimited, so a colon in a placeholder
