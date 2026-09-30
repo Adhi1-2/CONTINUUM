@@ -391,6 +391,35 @@ All notable changes to this project are documented here. The format follows
   `except EditPreconditionError` handlers are unaffected; only `type(exc)`
   becomes observable.
 
+- **The gateway again caps the upstream reply, not just the request body
+  (#1055).** This fix shipped in `54002e2` and was then deleted by the merge
+  `a37442f` ("Merge main into PR #1263"), which resolved a conflict in
+  `gateway.py` against the other branch's side and removed `MAX_RESPONSE_BYTES`,
+  `_read_bounded_response`, the capped read, and the tests that guarded them,
+  without a matching revert in the changelog, so the regression reached `main`
+  silently. Restored here. A proxy that only bounds what a client can make it
+  hold is still hostage to what an upstream sends it, so the reply half carries
+  the request cap's sibling: a reply whose declared `Content-Length` passes
+  `MAX_RESPONSE_BYTES` (10 MB) is refused with `502` before it is buffered, and
+  a reply that declares no length at all is bounded by the running total rather
+  than read whole, which is the only way a chunked reply can be bounded. The
+  claim settles uncertain rather than completed, since an upstream that cannot
+  answer inside the cap may still have applied the side effect, and reporting it
+  as done would promise a delivery the proxy could not verify.
+
+- **`codecov/patch` no longer fails on every change to the Postgres backend
+  (#1329).** Coverage was uploaded from a single matrix leg, the Linux
+  Python 3.12 one, and that leg runs the suite without
+  `CONTINUUM_TEST_POSTGRES_DSN`, so `tests/test_storage_postgres.py` skips
+  wholesale there. The `Test (Postgres backend)` job is the only place the
+  suite actually executes, and it uploaded nothing. Every `postgres.py` line
+  therefore read as uncovered, the patch check reported `0.00% of diff hit` on
+  an otherwise-green PR, and it had been doing so since the backend landed --
+  the last `postgres.py` change before the fix carries the identical failure.
+  The Postgres job now runs under `--cov` and uploads its own report; Codecov
+  merges the two per commit rather than overriding, so the backend's line data
+  folds into the same patch and total figures.
+
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
   arguments are caller-controlled noise plus the real resource, so keeping the
@@ -426,6 +455,28 @@ All notable changes to this project are documented here. The format follows
   told it may proceed. `required_actions` is unchanged, so an auditor still
   sees the work; only the single permitted action is held until the gate
   clears.
+
+- **The evidence export builds its own models instead of untyped dicts (#1155).**
+  `src/continuum/interchange/evidence.py` declared `EvidencePrimitive` plus the
+  four subclasses `Transition`, `Observation`, `Relation` and `Checkpoint`,
+  exported all of them, and then constructed none of them: `export_evidence`
+  hand-rolled `dict[str, Any]` values and returned `list[dict[str, Any]]`. So
+  every subclass field existed only in a class the producing function never
+  touched, and a field could be added, renamed or dropped with nothing
+  breaking, because the dict keys were spelled separately in the function
+  body. `content()` and `digest()` were unreachable, and `verify_export` had
+  no typed shape to work against. The exporter now routes every primitive
+  through the models and returns `list[EvidencePrimitive]`; pydantic's
+  `extra="forbid"` makes a missing or stray field an immediate error at
+  export instead of a silent shape drift, and `Relation.from_event` hosts the
+  one piece of construction that inspects a payload (dependency endpoints are
+  spelled `resource` for a declaration and `decision_id` / `finding_id` for
+  those families) next to the fields it fills. `Checkpoint` now declares
+  `event_id` and `event_type`, which the dict it replaced always emitted, so
+  the wire format is unchanged; `cmd_export_evidence` serialises with
+  `model_dump(mode="json")`. `verify_export` accepts the models or the
+  mappings a JSON-lines receiver produces after `json.loads`, so both paths
+  run the same check.
 
 ### Changed
 
@@ -691,6 +742,20 @@ All notable changes to this project are documented here. The format follows
   served one literal segment that never reached the invoice endpoint. The
   verdict is now taken on the raw request line, which is what the upstream
   decodes.
+
+- **The landing page's headline metrics no longer drift behind the code (#1283).**
+  `docs/index.html` stated 2,163 tests and 45 CLI commands while the suite
+  collected 2,401 and the parser built 46 -- the figures a first-time visitor
+  sees were the oldest in the repo, and nothing noticed, because every existing
+  guard reads markdown. The page now states 2,452 tests (the README canonical
+  figure the rest of the docs agree on) and 46 commands, and two guards now
+  read the page: `tests/test_docs_counts.py` treats it as a counted file, so
+  its test figure must agree with every markdown figure exactly, and
+  `tests/test_cli_docs.py` compares its two CLI-command sites against
+  `build_parser()` and against each other. The page's own refresh note names
+  the three sources, so a future resync is one edit plus a test run rather
+   than a hunt.
+
 - **`resume --pinning` compares against the archived pinning, so a compacted
   run stops reporting every key as newly pinned (#1126).** The drift display
   folded the live event tail alone, and compaction moves the pinning-carrying
