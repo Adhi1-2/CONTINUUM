@@ -124,8 +124,8 @@ source of truth, and events persist to storage.
 
 - Append-only, hash-chained: each event stores the digest of the prior event.
 - `EventLog.verify()` re-walks the chain and localizes the first corrupted
-  event (`events.py:401`).
-- 51 event types (`EventType` StrEnum, `events.py:47`). Complete list:
+  event (`events.py:304`).
+- 51 event types (`EventType` StrEnum, `events.py:46`). Complete list:
 
 ```text
 RUN_STARTED, RUN_COMPLETED, RUN_ABORTED, TASK_UPDATED,
