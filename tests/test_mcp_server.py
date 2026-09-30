@@ -122,6 +122,7 @@ async def test_every_tool_is_registered(server_ctx: tuple[Any, Any]) -> None:
         "continuum_complete_action",
         "continuum_fail_action",
         "continuum_reconcile_action",
+        "continuum_compensate_action",
         "continuum_list_actions",
         "continuum_confirm",
         "continuum_record_summary",
@@ -139,6 +140,7 @@ async def test_read_only_tools_are_annotated_as_such(server_ctx: tuple[Any, Any]
     assert hints["continuum_list_actions"] is True
     assert hints["continuum_checkpoint"] is False
     assert hints["continuum_intercept_action"] is False
+    assert hints["continuum_compensate_action"] is False
 
 
 @pytest.mark.asyncio
@@ -452,7 +454,9 @@ async def test_a_racing_writer_cannot_compose_an_unprojectable_log(
         history = real_read(run_id, **kwargs)
         # Only the unbounded read is the one `_project_candidate` validates
         # against; `ensure_run` reads with `upto=1` earlier in the same call.
-        if not interposed["done"] and not kwargs and run_id == "run_1":
+        # `read_all_events` forwards ``rehydrate`` to this call, so the guard
+        # keys on the absence of a bound rather than on an empty kwargs.
+        if not interposed["done"] and kwargs.get("upto") is None and run_id == "run_1":
             interposed["done"] = True
             # A concurrent writer shrinks the total after we have read it.
             real_append(
@@ -1419,6 +1423,62 @@ async def test_reconciling_an_unknown_outcome_records_that_it_was_a_correction(
     assert settled["side_effect_uncertain"] is False
     assert (await call(server, "continuum_list_actions", run_id="run_1"))["unresolved"] == 0
     assert EventType.ACTION_RECONCILED in [e.type for e in ctx.storage.read_events("run_1")]
+
+
+@pytest.mark.asyncio
+async def test_compensate_action_records_undo_and_emits_event(
+    server_ctx: tuple[Any, Any],
+) -> None:
+    """ActionLedger.compensate has an MCP transport (issue #1096).
+
+    Records a compensating settlement, marks the action COMPENSATED, emits
+    ACTION_COMPENSATED, and surfaces in recovery summary briefings.
+    """
+    from continuum.models import StateValidationResult
+    from continuum.recovery.summary import build_informed_retry, render_informed_retry
+
+    server, ctx = server_ctx
+    await seed_run(server)
+
+    claimed = await call(
+        server,
+        "continuum_intercept_action",
+        run_id="run_1",
+        action_type="stripe.charge",
+        arguments={"customer": "c_1", "amount": 5000},
+    )
+    await call(
+        server,
+        "continuum_complete_action",
+        run_id="run_1",
+        action_key=claimed["action_key"],
+        external_id="ch_123",
+    )
+
+    compensated = await call(
+        server,
+        "continuum_compensate_action",
+        run_id="run_1",
+        action_key=claimed["action_key"],
+        note="refunded full amount",
+        by="stripe.refund:ref_1",
+    )
+
+    assert compensated["status"] == "compensated"
+    assert compensated["compensated_by"] == ["stripe.refund:ref_1"]
+
+    events = ctx.storage.read_events("run_1")
+    assert EventType.ACTION_COMPENSATED in [e.type for e in events]
+
+    block = build_informed_retry(
+        ctx.storage,
+        "run_1",
+        validation_report=StateValidationResult(run_id="run_1", statuses=[]),
+    )
+    assert block is not None
+    assert block["compensations"] == 1
+    rendered = render_informed_retry(block)
+    assert any("compensations applied: 1" in line for line in rendered)
 
 
 @pytest.mark.asyncio
@@ -2637,6 +2697,37 @@ async def test_an_interrupted_claim_still_reconciles_at_budget(
     assert len(slots) == 1
 
 
+def test_ensure_run_recognises_archived_run_started_after_compaction(tmp_path: Any) -> None:
+    """ensure_run must not append duplicate RUN_STARTED or wipe constraints after compaction (#1436)."""
+    from continuum.state.semantic import project
+
+    storage = SQLiteStorage(str(tmp_path / "compacted_ensure.db"))
+    storage.create_run(Run(run_id="run_c", goal="deliver cargo"))
+    storage.append_event(
+        "run_c",
+        EventType.RUN_STARTED,
+        {"goal": "deliver cargo", "constraints": ["refrigerated", "priority"], "total": 10},
+        source=Origin.HUMAN,
+    )
+    storage.append_event(
+        "run_c",
+        EventType.WORK_ADDED,
+        {"task_id": "w1", "description": "load pallet"},
+        source=Origin.HUMAN,
+    )
+    storage.compact_run("run_c")
+
+    ctx = ContinuumMCP(storage=storage)
+    ctx.ensure_run("run_c")
+
+    events = storage.read_all_events("run_c")
+    run_started_events = [e for e in events if e.type is EventType.RUN_STARTED]
+    assert len(run_started_events) == 1
+
+    state = project("run_c", events)
+    assert state.goal.constraints == ["refrigerated", "priority"]
+
+
 async def _compact_out_run_started(ctx: Any, run_id: str = "run_1") -> None:
     """Archive the pre-anchor prefix so ``RUN_STARTED`` leaves the live tail.
 
@@ -2691,3 +2782,46 @@ async def test_record_plan_survives_compaction(server_ctx: tuple[Any, Any]) -> N
     )
     assert payload["plan_id"] == "p1"
     assert payload["units"] == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_survives_compaction(server_ctx: tuple[Any, Any]) -> None:
+    """Regression: the checkpoint tool folds full history, not the live tail.
+
+    ``ensure_run`` already accepts a compacted run (#1452), but the checkpoint's
+    own projection -- and the two declare helpers it calls -- read the live tail
+    alone. Once ``RUN_STARTED`` moved into the archive the fold saw no goal and
+    every ``continuum_checkpoint`` raised, precisely on the long-running runs the
+    tool exists for. The declare helpers also have to see the archived model and
+    dependencies to de-duplicate an unchanged declaration instead of re-recording
+    it over the compacted prefix.
+    """
+    server, ctx = server_ctx
+    await call(server, "continuum_record_progress", run_id="run_1", completed=1, total=10, goal="G")
+    await call(
+        server,
+        "continuum_checkpoint",
+        run_id="run_1",
+        model_id="sonnet-5",
+        provider="anthropic",
+        env={"dataset": "v3"},
+    )
+    await _compact_out_run_started(ctx)
+
+    # Must not raise: the goal lives in the archive now, and the fold must read it.
+    payload = await call(
+        server,
+        "continuum_checkpoint",
+        run_id="run_1",
+        model_id="sonnet-5",
+        provider="anthropic",
+        env={"dataset": "v3"},
+    )
+    assert payload["run_id"] == "run_1"
+    assert payload["model"] == "sonnet-5"
+
+    # The archived model and dependency are still visible, so the unchanged
+    # declaration is de-duplicated rather than appended a second time.
+    history = list(ctx.storage.read_all_events("run_1"))
+    assert sum(1 for e in history if e.type is EventType.MODEL_CHANGED) == 1
+    assert sum(1 for e in history if e.type is EventType.DEPENDENCY_DECLARED) == 1

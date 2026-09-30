@@ -25,7 +25,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from continuum.models import EnvironmentSnapshot, EnvResource, utcnow
+from continuum.models import EnvironmentSnapshot as EnvironmentSnapshot
+from continuum.models import EnvResource, utcnow
 from continuum.security.hashing import stable_hash
 
 __all__ = [
@@ -92,14 +93,20 @@ class ValueProvider(EnvironmentProvider):
             try:
                 checksum = stable_hash(value)
                 version = checksum[:16]
-            except (TypeError, ValueError) as exc:
+            except Exception as exc:
+                # Broad by design, matching the CallableProvider sibling and the
+                # docstring contract: hashing an arbitrary in-memory value can
+                # fail in ways beyond TypeError/ValueError -- a self-referential
+                # structure makes stable_hash raise RecursionError -- and one bad
+                # value must degrade to UNKNOWN_VERSION, not abort the whole
+                # snapshot (issue #1374).
                 checksum, version = None, UNKNOWN_VERSION
                 captured[key] = EnvResource(
                     name=key,
                     kind="value",
                     version=version,
                     checksum=checksum,
-                    metadata={"error": str(exc)},
+                    metadata={"error": f"{type(exc).__name__}: {exc}"},
                 )
                 continue
             captured[key] = EnvResource(name=key, kind="value", version=version, checksum=checksum)

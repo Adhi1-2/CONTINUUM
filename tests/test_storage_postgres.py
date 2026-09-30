@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from itertools import count
+from pathlib import Path
 
 import pytest
 
@@ -196,6 +197,37 @@ def test_action_status_enum_round_trip(storage: PostgresStorage) -> None:
     assert statuses["deploy"] is ActionStatus.FAILED
 
 
+def test_pg_backfill_reseeds_the_index_when_empty_with_existing_actions() -> None:
+    # A database that predates the index (issue #216) or lost its rows has
+    # ACTION_* events but an empty action_index. Reopening must reseed the
+    # projection from the log, not raise: the backfill query has to speak
+    # Postgres JSON (``::jsonb->>``), never SQLite's ``json_extract``.
+    seed = PostgresStorage(DSN)
+    try:
+        a = ActionLedger(seed, "pg_bf")
+        make_run(seed, "pg_bf", "backfill")
+        first = a.claim("send_invoice", {}, key="invoice:BF-1", scoped_to_run=False)
+        a.complete(first.key, external_id="INV-BF")
+        # Simulate the lost/absent projection (autocommit commits immediately).
+        seed._connection.execute("DELETE FROM action_index")
+        assert seed._connection.execute("SELECT 1 FROM action_index LIMIT 1").fetchone() is None
+    finally:
+        seed.close()
+
+    reopened = PostgresStorage(DSN)
+    try:
+        # Reopening ran _backfill_action_index over the existing ACTION_* events;
+        # the reseeded row is functional, so a cross-run claim on the same key
+        # deduplicates through the index.
+        b = ActionLedger(reopened, "pg_bf2")
+        make_run(reopened, "pg_bf2", "b")
+        again = b.claim("send_invoice", {}, key="invoice:BF-1", scoped_to_run=False)
+        assert again.fresh is False
+        assert again.action.external_id == "INV-BF"
+    finally:
+        reopened.close()
+
+
 # --- langgraph tables exist (schema v4 baseline) ---------------------------------- #
 
 
@@ -226,6 +258,27 @@ def test_compact_archives_prefix_and_verify_stays_ok(storage: PostgresStorage) -
     assert archived[0].sequence == 1
     # Archived prefix and live tail agree on history: no gaps, hashes line up.
     assert storage.verify_events("pg_k").ok is True
+
+
+def test_compaction_carries_the_anchor_environment(storage: PostgresStorage) -> None:
+    """Issue #1049 parity with the SQLite engine: the forced anchor must
+    record an environment, not None. An environment-blind anchor becomes the
+    newest checkpoint, and the next assessment marks every pinned dependency
+    UNKNOWN, silently downgrading a clean run to request_human."""
+    from continuum.environment.snapshot import StaticProvider, capture
+
+    make_run(storage, "pg_env", "pinned task")
+    snapshot = capture("pg_env", StaticProvider(dataset="v3"))
+    storage.append_event(
+        "pg_env", EventType.DEPENDENCY_DECLARED, {"resource": "dataset", "version": "v3"}
+    )
+    CheckpointManager(storage).checkpoint("pg_env", environment=snapshot)
+
+    storage.compact_run("pg_env")
+
+    anchor = storage.latest_checkpoint("pg_env")
+    assert anchor.environment is not None
+    assert anchor.environment.resources["dataset"].version == "v3"
 
 
 def test_pg_compact_rejects_through_sequence_that_would_eat_the_anchor(
@@ -586,6 +639,27 @@ def test_pg_backfill_seeds_an_emptied_index_on_the_folds_own_scale(
         reopened.close()
 
 
+def test_pg_action_index_drift_skips_malformed_json_payload(
+    storage: PostgresStorage,
+) -> None:
+    """Postgres fold skips a malformed JSON payload without raising JSONDecodeError (#1386)."""
+    make_run(storage, "pg_corrupt", "corrupt payload")
+    ledger = ActionLedger(storage, "pg_corrupt")
+    outcome = ledger.claim("process_doc", {}, key="doc:corrupt")
+    ledger.complete(outcome.key, external_id="doc:corrupt")
+
+    with storage._write():
+        storage._connection.execute(
+            "UPDATE events SET payload = '{not valid json' WHERE run_id = 'pg_corrupt' AND sequence = 2"
+        )
+
+    # action_index_drift and rebuild_action_index must skip the corrupt row instead of crashing
+    drift = storage.action_index_drift()
+    assert isinstance(drift, int)
+    rebuilt = storage.rebuild_action_index()
+    assert isinstance(rebuilt, int)
+
+
 def test_pg_run_without_a_parent_round_trips_null(storage: PostgresStorage) -> None:
     """A parentless run must load back as parentless, not as a corrupt row."""
     make_run(storage, "pg_solo", "solo")
@@ -613,3 +687,23 @@ def test_pg_child_run_keeps_its_parent_after_the_round_trip(
 
     assert [run.run_id for run in children_of(storage, "pg_par")] == ["pg_kid"]
     assert children_of(storage, "pg_kid") == []
+
+
+def test_pg_payload_offload(storage: PostgresStorage, tmp_path: Path) -> None:
+    """PostgresStorage offloads oversized payloads to blob storage."""
+    make_run(storage, "pg_offload", "test offload")
+    storage._payload_offload_bytes = 50
+    storage._storage_dir = tmp_path
+
+    large_payload = {"details": "q" * 200}
+    event = storage.append_event("pg_offload", EventType.TOOL_CALLED, large_payload)
+    from continuum.storage.blob import OFFLOAD_KEY, is_offload_descriptor
+
+    assert is_offload_descriptor(event.payload)
+    sha256_hex = event.payload[OFFLOAD_KEY]
+    blob_file = tmp_path / "blobs" / f"{sha256_hex}.blob"
+    assert blob_file.exists()
+    assert event.hash == event.digest()
+
+    report = storage.verify_events("pg_offload")
+    assert report.ok
