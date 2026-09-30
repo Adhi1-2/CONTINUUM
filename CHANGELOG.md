@@ -215,10 +215,17 @@ All notable changes to this project are documented here. The format follows
   and behave exactly as before.
 ### Fixed
 
-- **`_risk_score` in `RiskObservedPayload` fails open on unusable inputs (#1421).**
-  `None`, unparseable text and non-finite floats now map to `0.0` rather than
-  raising `ValueError` or passing `NaN` to the Pydantic validator, preserving the
-  fail-open contract of the risk ingestion path.
+- **The cross-run merge arm raises `MergePreconditionError` and is now pinned
+  by a test (#1114).** `check_merge_preconditions` with a `source_run_id`
+  computes the union derivation itself rather than going through
+  `check_preconditions`, so it has its own raise site. A caller catching
+  `MergePreconditionError` to handle a merge refusal specifically now has
+  regression coverage on that path. The new
+  `test_cross_run_merge_refusal_raises_merge_subclass` asserts the exact type
+  on both `approve_merge` and direct `check_merge_preconditions`, and fails if
+  that site reverts to the base `EditPreconditionError`. The
+  `Fork`/`Merge`/`RestorePreconditionError` docstrings no longer call
+  themselves aliases, since the gate raises them distinctly.
 
 - **The Postgres action index backfill uses jsonb accessors instead of
   SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
