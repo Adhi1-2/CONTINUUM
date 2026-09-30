@@ -23,6 +23,7 @@ from continuum.gateway import (
     GatewayServer,
     Route,
     load_gateway_config,
+    load_gateway_tenant,
     match_route,
     render_key,
 )
@@ -148,6 +149,52 @@ def test_claimed_request_is_forwarded_settled_and_recorded(db: str, gateway: str
     assert action.status is ActionStatus.UNKNOWN
 
 
+def test_a_truncated_upstream_reply_settles_the_claim_uncertain(
+    db: str, gateway: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed/truncated upstream response must not leave a live STARTED claim.
+
+    ``conn.getresponse()``/``resp.read()`` can raise ``http.client.HTTPException``
+    subclasses (``IncompleteRead``, ``BadStatusLine``, ...) that are *not*
+    ``OSError``. A catch of only ``OSError`` let them escape ``_handle`` with the
+    claim still STARTED; a retry then saw a live claim and forwarded the effect a
+    second time -- the double-fire the gateway exists to prevent. The request may
+    already have reached the upstream and fired the effect, so the honest
+    settlement is UNKNOWN (uncertain), exactly as for a dropped connection.
+    """
+
+    class _TruncatedResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            raise http.client.IncompleteRead(b"partial", 512)
+
+    class _TruncatedConn:
+        def __init__(self, netloc: str, timeout: int | None = None) -> None:
+            pass
+
+        def request(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def getresponse(self) -> _TruncatedResponse:
+            return _TruncatedResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _TruncatedConn)
+
+    key = claim(db, "invoice:I-read")
+    status, _ = post(gateway, "/v1/invoices", {"id": "I-read"})
+    assert status == 502
+    with SQLiteStorage(db) as store:
+        from continuum.actions.ledger import fold_action_events
+
+        action = fold_action_events(store.read_events("run_1"))[key]
+    assert action.status is ActionStatus.UNKNOWN
+    assert action.side_effect_uncertain is True
+
+
 def test_completed_effect_blocks_the_duplicate(db: str, gateway: str) -> None:
     key = claim(db, "invoice:I-3")
     with SQLiteStorage(db) as store:
@@ -184,51 +231,6 @@ def test_unknown_host_is_refused_fail_closed(db: str, gateway: str) -> None:
     status, body = post(gateway, "/anything", {"id": "x"}, host="evil.example.net")
     assert status == 403
     assert "no upstream registered" in body["reason"]
-
-
-def test_a_port_bound_route_is_reachable_through_the_live_gateway(db: str, tmp_path: Path) -> None:
-    """The live server hands the raw Host header, port included, to match_route.
-
-    The first pass at #1342 had the server strip the port before calling
-    ``match_route``, so the matcher could never see one: every route had to be
-    registered without a port or it was dead, and the fix lived only in the
-    unit tests. This exercises the seam that actually broke -- the header the
-    socket sees, not the argument a test passes.
-    """
-    cfg = tmp_path / "gateway.json"
-    cfg.write_text(
-        json.dumps(
-            {
-                "upstreams": [
-                    {
-                        "host": "api.example.com:8443",
-                        "methods": ["POST"],
-                        "prefix": "/v1/invoices",
-                        "action_type": "send_invoice",
-                        "key_template": "invoice:{id}",
-                    }
-                ]
-            }
-        )
-    )
-    server = GatewayServer(lambda: SQLiteStorage(db), "run_1", load_gateway_config(cfg), port=0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    addr = f"127.0.0.1:{server.port}"
-    try:
-        # Unclaimed, so the refusal is a claim instruction -- which is only
-        # reachable at all when the route matched, rather than "no upstream".
-        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com:8443")
-        assert status == 403
-        assert "no upstream registered" not in body["reason"]
-
-        # The default port is a different destination and must not reach the
-        # port-bound route.
-        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com")
-        assert status == 403
-        assert "no upstream registered" in body["reason"]
-    finally:
-        server.shutdown()
 
 
 def test_method_mismatch_is_refused(db: str, gateway: str) -> None:
@@ -747,6 +749,749 @@ def test_a_route_without_a_prefix_keeps_the_whole_host(tmp_path: Path) -> None:
         run_id="run_1",
     )
     assert decision.allow is True
+
+
+def _mem_scenario(final: str) -> Decision:
+    """Seed a foreign run holding a global memory key in ``final`` state, then
+    return the gateway's verdict for a second run that has no local claim."""
+    from continuum.actions.ledger import fold_action_events
+
+    memkey = "mem:store1:tenantA:rec1"
+    atype = "mem_write"
+    store = SQLiteStorage(":memory:")
+    for rid in ("runA", "runB"):
+        store.create_run(Run(run_id=rid, goal="g"))
+        store.append_event(rid, EventType.RUN_STARTED, {"goal": "g"})
+    other = ActionLedger(store, "runA")
+    oc = other.claim(atype, {"k": "rec1"}, key=memkey, scoped_to_run=False)
+    if final == "failed":
+        other.fail(oc.key, "rejected upstream", certain=True)
+    elif final == "unknown":
+        other.fail(oc.key, "connection dropped", certain=False)
+    elif final == "compensated":
+        other.complete(oc.key)
+        other.compensate(oc.key, note="rolled back")
+    elif final == "completed":
+        other.complete(oc.key, external_id="EXT1")
+    # "started" leaves the foreign claim live.
+    route = Route(
+        host="api.example.com",
+        methods=("POST",),
+        prefix="/v1/mem",
+        action_type=atype,
+        key_template=memkey,
+    )
+    actions_b = fold_action_events(store.read_events("runB"))
+    return match_route(
+        [route],
+        host="api.example.com",
+        method="POST",
+        path="/v1/mem",
+        body={"k": "rec1"},
+        actions_by_key=actions_b,
+        run_id="runB",
+        storage=store,
+    )
+
+
+def test_foreign_memory_record_gets_a_status_specific_verdict() -> None:
+    """A foreign claim on a global memory key is denied with guidance that
+    matches its status, mirroring gate.decide rather than telling the caller
+    to "reconcile" a record that cannot be reconciled.
+
+    Regression for the blanket "reconcile it first" message: reconcile only
+    fits an UNKNOWN outcome. A terminal foreign record (failed/compensated)
+    left no live effect, so the way forward is a fresh claim (#765e4bc); a
+    completed one must not be repeated. Every foreign status is still denied.
+    """
+    started = _mem_scenario("started")
+    assert started.allow is False
+    assert "claimed live in another run" in started.reason
+
+    completed = _mem_scenario("completed")
+    assert completed.allow is False
+    assert "already completed in another run" in completed.reason
+    assert "do not repeat" in completed.reason
+    assert "EXT1" in completed.reason
+
+    unknown = _mem_scenario("unknown")
+    assert unknown.allow is False
+    assert "unknown outcome in another run" in unknown.reason
+    assert "reconcile it first (continuum_reconcile_action)" in unknown.reason
+
+    failed = _mem_scenario("failed")
+    assert failed.allow is False
+    assert "claim it again through continuum_intercept_action" in failed.reason
+    assert "closed (status failed)" in failed.reason
+
+    compensated = _mem_scenario("compensated")
+    assert compensated.allow is False
+    assert "closed (status compensated)" in compensated.reason
+    assert "reconcile it first" not in compensated.reason
+
+
+def test_gateway_enforces_tenant_scoped_memory_boundary_and_header(tmp_path: Path) -> None:
+    """Enforce tenant-scoped namespace boundaries on external memory claims (#1415)."""
+    from continuum.actions.ledger import fold_action_events
+    from continuum.gate import is_memory_key
+
+    # Standardized key convention: memory:<store_id>:<tenant_id>:<namespace>:<record_key>
+    template = "memory:{store_id}:{tenant_id}:{namespace}:{record_key}"
+    assert is_memory_key(template)
+
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template=template,
+    )
+    store = SQLiteStorage(":memory:")
+    # Run with bound tenant metadata
+    store.create_run(Run(run_id="run_t1", goal="g", metadata={"tenant_id": "tenant_alpha"}))
+    store.append_event("run_t1", EventType.RUN_STARTED, {"goal": "g"})
+
+    # Claim for authorized tenant
+    ActionLedger(store, "run_t1").claim(
+        "memory_write",
+        {},
+        key="memory:pgvector:tenant_alpha:kb:doc-1",
+        scoped_to_run=False,
+    )
+    actions = fold_action_events(store.read_events("run_t1"))
+
+    # Authorized request matches and is allowed
+    authorized_body = {
+        "store_id": "pgvector",
+        "tenant_id": "tenant_alpha",
+        "namespace": "kb",
+        "record_key": "doc-1",
+    }
+    decision_ok = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories/upsert",
+        body=authorized_body,
+        actions_by_key=actions,
+        run_id="run_t1",
+        bound_tenant="tenant_alpha",
+    )
+    assert decision_ok.allow is True
+
+    # Cross-tenant request is denied with tenant mismatch
+    cross_tenant_body = {
+        "store_id": "pgvector",
+        "tenant_id": "tenant_beta",
+        "namespace": "kb",
+        "record_key": "doc-1",
+    }
+    decision_deny = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories/upsert",
+        body=cross_tenant_body,
+        actions_by_key=actions,
+        run_id="run_t1",
+        bound_tenant="tenant_alpha",
+    )
+    assert decision_deny.allow is False
+    assert "tenant mismatch" in decision_deny.reason
+
+
+def test_gateway_server_header_tenant_boundary_enforcement(tmp_path: Path) -> None:
+    """GatewayServer extracts tenant from X-Continuum-Tenant and denies cross-tenant write (#1415)."""
+    db_path = str(tmp_path / "gw_tenant.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_gw_t", goal="g", metadata={"tenant_id": "acme"}))
+        store.append_event("run_gw_t", EventType.RUN_STARTED, {"goal": "g"})
+        ActionLedger(store, "run_gw_t").claim(
+            "memory_write",
+            {},
+            key="memory:vstore:acme:ns1:k1",
+            scoped_to_run=False,
+        )
+
+    routes = [
+        Route(
+            host="vector.internal",
+            methods=("POST",),
+            prefix="/v1/memories",
+            action_type="memory_write",
+            key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+        )
+    ]
+    # Server initialized without static bound_tenant
+    server = GatewayServer(lambda: SQLiteStorage(db_path), "run_gw_t", routes, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        # Cross-tenant write with X-Continuum-Tenant: acme
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        cross_body = {
+            "store_id": "vstore",
+            "tenant_id": "globex",
+            "namespace": "ns1",
+            "record_key": "k1",
+        }
+        conn.request(
+            "POST",
+            "/v1/memories/upsert",
+            body=json.dumps(cross_body),
+            headers={
+                "Host": "vector.internal",
+                "Content-Type": "application/json",
+                "X-Continuum-Tenant": "acme",
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        data = json.loads(resp.read() or b"{}")
+        assert "tenant mismatch" in data.get("reason", "")
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_gateway_server_run_metadata_tenant_boundary_enforcement(tmp_path: Path) -> None:
+    """GatewayServer extracts tenant from run context metadata when no header is present (#1415)."""
+    db_path = str(tmp_path / "gw_run_tenant.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_meta_t", goal="g", metadata={"tenant_id": "tenant_x"}))
+        store.append_event("run_meta_t", EventType.RUN_STARTED, {"goal": "g"})
+        ActionLedger(store, "run_meta_t").claim(
+            "memory_write",
+            {},
+            key="memory:vstore:tenant_x:kb:doc-1",
+            scoped_to_run=False,
+        )
+
+    routes = [
+        Route(
+            host="vector.internal",
+            methods=("POST",),
+            prefix="/v1/memories",
+            action_type="memory_write",
+            key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+        )
+    ]
+    server = GatewayServer(lambda: SQLiteStorage(db_path), "run_meta_t", routes, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        # Cross-tenant write with body tenant_id = tenant_y, run tenant = tenant_x
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        cross_body = {
+            "store_id": "vstore",
+            "tenant_id": "tenant_y",
+            "namespace": "kb",
+            "record_key": "doc-1",
+        }
+        conn.request(
+            "POST",
+            "/v1/memories/upsert",
+            body=json.dumps(cross_body),
+            headers={
+                "Host": "vector.internal",
+                "Content-Type": "application/json",
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        data = json.loads(resp.read() or b"{}")
+        assert "tenant mismatch" in data.get("reason", "")
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_gateway_server_header_conflicts_with_run_tenant(tmp_path: Path) -> None:
+    """Header tenant conflicting with run metadata tenant is denied (#1415)."""
+    db_path = str(tmp_path / "gw_conflict.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_c", goal="g", metadata={"tenant_id": "tenant_real"}))
+        store.append_event("run_c", EventType.RUN_STARTED, {"goal": "g"})
+
+    routes = [
+        Route(
+            host="vector.internal",
+            methods=("POST",),
+            prefix="/v1/memories",
+            action_type="memory_write",
+            key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+        )
+    ]
+    server = GatewayServer(lambda: SQLiteStorage(db_path), "run_c", routes, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/memories/upsert",
+            body=json.dumps(
+                {
+                    "store_id": "vstore",
+                    "tenant_id": "tenant_real",
+                    "namespace": "kb",
+                    "record_key": "doc-1",
+                }
+            ),
+            headers={
+                "Host": "vector.internal",
+                "Content-Type": "application/json",
+                "X-Continuum-Tenant": "tenant_spoofed",
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        data = json.loads(resp.read() or b"{}")
+        assert "tenant mismatch" in data.get("reason", "")
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_load_gateway_tenant_reads_tenant_id(tmp_path: Path) -> None:
+    """load_gateway_tenant supports 'tenant_id' alongside 'bound_tenant' and 'tenant' (#1415)."""
+    cfg = tmp_path / "gateway_id.json"
+    cfg.write_text(json.dumps({"tenant_id": "tenant_omega"}))
+    assert load_gateway_tenant(cfg) == "tenant_omega"
+
+    cfg_bound = tmp_path / "gateway_bound.json"
+    cfg_bound.write_text(json.dumps({"bound_tenant": "tenant_alpha"}))
+    assert load_gateway_tenant(cfg_bound) == "tenant_alpha"
+
+    cfg_plain = tmp_path / "gateway_plain.json"
+    cfg_plain.write_text(json.dumps({"tenant": "tenant_beta"}))
+    assert load_gateway_tenant(cfg_plain) == "tenant_beta"
+
+
+def test_gateway_cli_tenant_flag() -> None:
+    """CLI parser accepts --tenant option for gateway command (#1415)."""
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["gateway", "--tenant", "tenant_prod"])
+    assert args.tenant == "tenant_prod"
+
+
+def test_load_gateway_config_validates_memory_templates(tmp_path: Path) -> None:
+    """load_gateway_config requires namespace for memory: templates (#1415)."""
+    bad_cfg = tmp_path / "bad_gw.json"
+    bad_cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "vector.internal",
+                        "action_type": "memory_write",
+                        "key_template": "memory:{store_id}:{tenant_id}:{record_key}",
+                    }
+                ]
+            }
+        )
+    )
+    with pytest.raises(GatewayConfigError, match="missing required placeholder"):
+        load_gateway_config(bad_cfg)
+
+    good_cfg = tmp_path / "good_gw.json"
+    good_cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "vector.internal",
+                        "action_type": "memory_write",
+                        "key_template": "memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+                    }
+                ]
+            }
+        )
+    )
+    routes = load_gateway_config(good_cfg)
+    assert len(routes) == 1
+    assert routes[0].key_template == "memory:{store_id}:{tenant_id}:{namespace}:{record_key}"
+
+
+def test_match_route_rejects_colon_in_body_fields() -> None:
+    """Colon in body values is rejected as malformed memory key (#1415)."""
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+    )
+    body = {
+        "store_id": "vstore:corrupted",
+        "tenant_id": "acme",
+        "namespace": "kb",
+        "record_key": "k1",
+    }
+    decision = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body,
+        actions_by_key={},
+        run_id="run_1",
+        bound_tenant="acme",
+    )
+    assert decision.allow is False
+    assert "must not contain ':'" in decision.reason
+
+
+def test_match_route_supports_flexible_placeholder_order() -> None:
+    """Tenant check works regardless of placeholder position in memory template (#1415)."""
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template="memory:{store_id}:{namespace}:{tenant_id}:{record_key}",
+    )
+    body_ok = {
+        "store_id": "vstore",
+        "namespace": "kb",
+        "tenant_id": "acme",
+        "record_key": "k1",
+    }
+    decision_ok = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body_ok,
+        actions_by_key={},
+        run_id="run_1",
+        bound_tenant="acme",
+    )
+    # Claim not found in actions_by_key, but tenant check passed
+    assert "tenant mismatch" not in decision_ok.reason
+
+    body_bad = {
+        "store_id": "vstore",
+        "namespace": "kb",
+        "tenant_id": "globex",
+        "record_key": "k1",
+    }
+    decision_bad = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body_bad,
+        actions_by_key={},
+        run_id="run_1",
+        bound_tenant="acme",
+    )
+    assert decision_bad.allow is False
+    assert "tenant mismatch" in decision_bad.reason
+
+
+def test_gateway_server_header_conflicts_with_bound_tenant(tmp_path: Path) -> None:
+    """Header tenant conflicting with server bound tenant is denied (#1415)."""
+    db_path = str(tmp_path / "gw_bound_conflict.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_bc", goal="g"))
+        store.append_event("run_bc", EventType.RUN_STARTED, {"goal": "g"})
+
+    routes = [
+        Route(
+            host="vector.internal",
+            methods=("POST",),
+            prefix="/v1/memories",
+            action_type="memory_write",
+            key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+        )
+    ]
+    server = GatewayServer(
+        lambda: SQLiteStorage(db_path),
+        "run_bc",
+        routes,
+        port=0,
+        bound_tenant="tenant_primary",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/memories/upsert",
+            body=json.dumps(
+                {
+                    "store_id": "vstore",
+                    "tenant_id": "tenant_primary",
+                    "namespace": "kb",
+                    "record_key": "doc-1",
+                }
+            ),
+            headers={
+                "Host": "vector.internal",
+                "Content-Type": "application/json",
+                "X-Continuum-Tenant": "tenant_other",
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        data = json.loads(resp.read() or b"{}")
+        assert "tenant mismatch" in data.get("reason", "")
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_gateway_server_ignores_upstream_tenant_headers_on_non_memory_routes(
+    tmp_path: Path,
+) -> None:
+    """Non-Continuum tenant headers like X-Tenant-Id are ignored by tenant boundary check (#1415)."""
+    db_path = str(tmp_path / "gw_upstream_header.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_uh", goal="g"))
+        store.append_event("run_uh", EventType.RUN_STARTED, {"goal": "g"})
+
+    routes = [
+        Route(
+            host="api.upstream.com",
+            methods=("POST",),
+            prefix="/v1/invoices",
+            action_type="send_invoice",
+            key_template="invoice:{id}",
+        )
+    ]
+    server = GatewayServer(
+        lambda: SQLiteStorage(db_path),
+        "run_uh",
+        routes,
+        port=0,
+        bound_tenant="tenant_contin",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/invoices",
+            body=json.dumps({"id": "123"}),
+            headers={
+                "Host": "api.upstream.com",
+                "Content-Type": "application/json",
+                "X-Tenant-Id": "upstream_tenant_abc",
+            },
+        )
+        resp = conn.getresponse()
+        # Request will be denied because invoice:123 is unclaimed, but NOT due to tenant mismatch
+        assert resp.status == 403
+        data = json.loads(resp.read() or b"{}")
+        assert "tenant mismatch" not in data.get("reason", "")
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_gateway_server_handles_unknown_run_id_cleanly(tmp_path: Path) -> None:
+    """Unknown run_id does not raise unhandled RunNotFound exception (#1415)."""
+    db_path = str(tmp_path / "gw_unknown_run.db")
+    routes = [
+        Route(
+            host="vector.internal",
+            methods=("POST",),
+            prefix="/v1/memories",
+            action_type="memory_write",
+            key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+        )
+    ]
+    server = GatewayServer(
+        lambda: SQLiteStorage(db_path),
+        "nonexistent_run_id",
+        routes,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        conn = http.client.HTTPConnection(addr, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/memories",
+            body=json.dumps(
+                {"store_id": "v", "tenant_id": "t", "namespace": "n", "record_key": "k"}
+            ),
+            headers={"Host": "vector.internal", "Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        conn.close()
+    finally:
+        server.shutdown()
+
+
+def test_cmd_gateway_runs_with_tenant_flag(tmp_path: Path) -> None:
+    """cmd_gateway sets bound_tenant from args.tenant (#1415)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_gateway
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    db_path = str(tmp_path / "cli_gw.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="run_cli_gw", goal="g"))
+        store.append_event("run_cli_gw", EventType.RUN_STARTED, {"goal": "g"})
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            tenant="tenant_cli_override",
+            run_id="run_cli_gw",
+            db=db_path,
+            port=0,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        with patch("continuum.gateway.GatewayServer") as mock_server:
+            mock_server.return_value.serve_forever.return_value = None
+            mock_server.return_value.port = 12345
+            code = cmd_gateway(args, store, out, err)
+            assert code == 0
+            assert mock_server.call_args.kwargs["bound_tenant"] == "tenant_cli_override"
+
+
+def test_match_route_falls_back_to_run_metadata_tenant(tmp_path: Path) -> None:
+    """match_route extracts bound tenant from storage run metadata when bound_tenant is None (#1415)."""
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+    )
+    store = SQLiteStorage(str(tmp_path / "meta_tenant.db"))
+    store.create_run(Run(run_id="run_m", goal="g", metadata={"tenant": "tenant_from_meta"}))
+    store.append_event("run_m", EventType.RUN_STARTED, {"goal": "g"})
+
+    body_mismatch = {
+        "store_id": "vstore",
+        "tenant_id": "other_tenant",
+        "namespace": "kb",
+        "record_key": "k1",
+    }
+    decision = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body_mismatch,
+        actions_by_key={},
+        run_id="run_m",
+        bound_tenant=None,
+        storage=store,
+    )
+    assert decision.allow is False
+    assert "tenant mismatch" in decision.reason
+    assert "tenant_from_meta" in decision.reason
+
+
+def test_match_route_with_run_metadata_missing_tenant(tmp_path: Path) -> None:
+    """match_route skips tenant check when run metadata has no tenant (#1415)."""
+    route = Route(
+        host="vector.internal",
+        methods=("POST",),
+        prefix="/v1/memories",
+        action_type="memory_write",
+        key_template="memory:{store_id}:{tenant_id}:{namespace}:{record_key}",
+    )
+    store = SQLiteStorage(str(tmp_path / "meta_no_tenant.db"))
+    store.create_run(Run(run_id="run_no_t", goal="g", metadata={"env": "prod"}))
+    store.append_event("run_no_t", EventType.RUN_STARTED, {"goal": "g"})
+
+    body = {
+        "store_id": "vstore",
+        "tenant_id": "any_tenant",
+        "namespace": "kb",
+        "record_key": "k1",
+    }
+    decision = match_route(
+        [route],
+        host="vector.internal",
+        method="POST",
+        path="/v1/memories",
+        body=body,
+        actions_by_key={},
+        run_id="run_no_t",
+        bound_tenant=None,
+        storage=store,
+    )
+    assert "tenant mismatch" not in decision.reason
+
+
+def test_a_port_bound_route_is_reachable_through_the_live_gateway(db: str, tmp_path: Path) -> None:
+    """The live server hands the raw Host header, port included, to match_route.
+
+    The first pass at #1342 had the server strip the port before calling
+    ``match_route``, so the matcher could never see one: every route had to be
+    registered without a port or it was dead, and the fix lived only in the
+    unit tests. This exercises the seam that actually broke -- the header the
+    socket sees, not the argument a test passes.
+    """
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com:8443",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    server = GatewayServer(lambda: SQLiteStorage(db), "run_1", load_gateway_config(cfg), port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    addr = f"127.0.0.1:{server.port}"
+    try:
+        # Unclaimed, so the refusal is a claim instruction -- which is only
+        # reachable at all when the route matched, rather than "no upstream".
+        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com:8443")
+        assert status == 403
+        assert "no upstream registered" not in body["reason"]
+
+        # The default port is a different destination and must not reach the
+        # port-bound route.
+        status, body = post(addr, "/v1/invoices", {"id": "I-9"}, host="api.example.com")
+        assert status == 403
+        assert "no upstream registered" in body["reason"]
+    finally:
+        server.shutdown()
 
 
 def test_the_most_specific_prefix_wins_regardless_of_registry_order(tmp_path: Path) -> None:

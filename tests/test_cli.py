@@ -25,7 +25,7 @@ from continuum.cli import ExitCode, main
 from continuum.cli.exitcodes import exit_code_for
 from continuum.environment import StaticProvider, capture
 from continuum.events import EventType
-from continuum.models import Finding, RecoveryMode, Run
+from continuum.models import Finding, RecoveryMode, Run, StateCheckpoint
 from continuum.storage import SQLiteStorage
 
 
@@ -215,6 +215,29 @@ def test_only_resume_maps_to_a_zero_exit() -> None:
     for mode in RecoveryMode:
         code = exit_code_for(mode)
         assert (code == ExitCode.OK) == (mode is RecoveryMode.RESUME)
+
+
+def test_every_recovery_mode_maps_to_a_distinct_code() -> None:
+    """The safety contract README states: every mode gets its own code (#1170).
+
+    A coarse scheme collapsed WAIT onto REQUEST_HUMAN and ROLLBACK onto ABORT,
+    so a shell consumer could not do what the module docstring told it to --
+    tell "hold and retry" apart from "page a human", or "roll back" from
+    "abort". Distinct codes make both branches reachable.
+    """
+    codes = [exit_code_for(mode) for mode in RecoveryMode]
+    assert len(codes) == len(set(codes)), dict(zip(RecoveryMode, codes, strict=True))
+
+    # The pairs the old scheme merged now differ, and stay within their band.
+    assert exit_code_for(RecoveryMode.WAIT) != exit_code_for(RecoveryMode.REQUEST_HUMAN)
+    assert exit_code_for(RecoveryMode.ROLLBACK) != exit_code_for(RecoveryMode.ABORT)
+    assert exit_code_for(RecoveryMode.REPAIR_AND_RESUME) != exit_code_for(RecoveryMode.REPLAN)
+    # Every non-resume mode is non-zero, so a pipeline still short-circuits.
+    assert all(
+        code != ExitCode.OK
+        for mode, code in zip(RecoveryMode, codes, strict=True)
+        if mode is not RecoveryMode.RESUME
+    )
 
 
 def test_an_unclassified_mode_is_never_mistaken_for_permission() -> None:
@@ -436,6 +459,33 @@ def test_an_empty_database_says_so(tmp_path: Path) -> None:
     assert "No runs recorded" in out
 
 
+def test_runs_refuses_a_zero_limit_instead_of_looking_empty(db: str) -> None:
+    """Issue #1354: --limit 0 must not misreport a populated store as empty.
+
+    SQLite reads LIMIT 0 as an empty listing, so passing it straight through
+    printed "No runs recorded." (exit 0) for a store that has runs. Mirror the
+    tree/provenance/impact contract and refuse limit < 1.
+    """
+    code, out, err = run("--db", db, "runs", "--limit", "0")
+    assert code == ExitCode.ERROR
+    assert "--limit must be 1 or more (got 0)" in err
+    assert "No runs recorded" not in out
+
+
+def test_runs_refuses_a_negative_limit_instead_of_ignoring_it(db: str) -> None:
+    """SQLite treats LIMIT -1 as unlimited, so a negative --limit was silently
+    ignored and listed everything; it must be rejected (issue #1354)."""
+    code, _, err = run("--db", db, "runs", "--limit", "-1")
+    assert code == ExitCode.ERROR
+    assert "--limit must be 1 or more (got -1)" in err
+
+
+def test_runs_still_honours_a_valid_limit(db: str) -> None:
+    code, out, _ = run("--db", db, "runs", "--limit", "5")
+    assert code == ExitCode.OK
+    assert "run_1" in out
+
+
 def test_init_reports_where_storage_lives(tmp_path: Path) -> None:
     path = str(tmp_path / "new.db")
     code, out, _ = run("--db", path, "init")
@@ -579,6 +629,107 @@ def test_resume_without_repair_is_still_read_only(db: str) -> None:
     code, _, _ = run("--db", db, "resume", "run_1", "--env", "dataset=v4")
     assert code == ExitCode.REQUIRES_REPAIR
     assert SQLiteStorage(db).last_sequence("run_1") == before
+
+
+def _recovery_anchors(db: str) -> list[str]:
+    with SQLiteStorage(db) as store:
+        return [c.checkpoint_id for c in store.list_checkpoints("run_1") if c.trigger == "recovery"]
+
+
+def test_repair_records_a_recovery_anchor(db: str) -> None:
+    """--repair pins the pre-failure state as a rollback anchor (#1097).
+
+    Without this the RECOVERY trigger, the anchor lookup and the anchor guards
+    in ``prune``/``cleanup_ephemeral_artifacts`` all protect a set that can
+    never be populated through any product path.
+    """
+    code, _, err = run("--db", db, "resume", "run_1", "--env", "dataset=v4", "--repair")
+    assert code == ExitCode.REQUIRES_REPAIR
+    assert "Recovery anchor recorded" in err
+    assert len(_recovery_anchors(db)) == 1
+
+    # The anchor precedes the repair bookkeeping: it must capture the state the
+    # verdict judged, not the state after RECOVERY_STARTED landed in the log.
+    with SQLiteStorage(db) as store:
+        started = [e for e in store.read_events("run_1") if e.type is EventType.RECOVERY_STARTED]
+    assert started, "no RECOVERY_STARTED event was written"
+    with SQLiteStorage(db) as store:
+        anchor = store.list_checkpoints("run_1")[-1]
+    assert anchor.state.source_sequence < started[0].sequence
+
+
+def test_resume_without_repair_records_no_anchor(db: str) -> None:
+    """An inquiry must not pin state: anchors land only when the caller acts."""
+    run("--db", db, "resume", "run_1", "--env", "dataset=v4")
+    assert _recovery_anchors(db) == []
+
+
+def test_restore_to_recovery_anchor_rolls_back_to_the_pinned_state(db: str) -> None:
+    """``restore --to-recovery-anchor`` returns to the state the verdict judged."""
+    run("--db", db, "resume", "run_1", "--env", "dataset=v4", "--repair")
+    with SQLiteStorage(db) as store:
+        expected = store.list_checkpoints("run_1")[-1].state.source_sequence
+
+    code, out, _ = run(
+        "--db", db, "restore", "run_1", "--reason", "dataset went stale", "--to-recovery-anchor"
+    )
+    assert code == ExitCode.OK
+    assert f"Restored run_1 to anchor {expected}." in out
+
+    with SQLiteStorage(db) as store:
+        restored = [e for e in store.read_events("run_1") if e.type is EventType.RUN_RESTORED]
+    assert restored[-1].payload["anchor_sequence"] == expected
+
+
+def test_restore_to_recovery_anchor_without_an_anchor_is_an_error(db: str) -> None:
+    """A run that was never repaired has nothing to roll back to."""
+    code, _, err = run(
+        "--db",
+        db,
+        "restore",
+        "run_1",
+        "--reason",
+        "nothing to roll back to",
+        "--to-recovery-anchor",
+    )
+    assert code == ExitCode.ERROR
+    assert "no recovery anchor" in err
+
+
+def test_restore_to_recovery_anchor_rejects_a_second_target(db: str) -> None:
+    """A restore discards (anchor, head], so the target must be unambiguous."""
+    code, _, err = run(
+        "--db", db, "restore", "run_1", "--reason", "ambiguous", "--to-recovery-anchor", "--to", "1"
+    )
+    assert code == ExitCode.ERROR
+    assert "cannot be combined" in err
+
+
+def test_an_anchor_failure_never_changes_the_verdict(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durability must not reach back into the safety contract (#1097).
+
+    The verdict and its exit code are already final when the anchor is
+    attempted, so a checkpoint failure is reported and swallowed rather than
+    changing what `resume` returns - the caller still gets the repair plan and
+    the non-zero exit.
+    """
+    # `continuum.cli.main` the attribute is the entry-point function (the
+    # package rebinds the name), so fetch the submodule itself.
+    import importlib
+
+    cli_main = importlib.import_module("continuum.cli.main")
+
+    class _BrokenManager(CheckpointManager):
+        def checkpoint_on_recovery(self, *args: object, **kwargs: object) -> StateCheckpoint:
+            raise RuntimeError("storage is down")
+
+    monkeypatch.setattr(cli_main, "CheckpointManager", _BrokenManager)
+    code, _, err = run("--db", db, "resume", "run_1", "--env", "dataset=v4", "--repair")
+    assert code == ExitCode.REQUIRES_REPAIR, "a failed anchor must not change the exit code"
+    assert "could not record a recovery anchor: storage is down" in err
+    assert _recovery_anchors(db) == []
 
 
 def test_resume_surfaces_a_malformed_reconciler_registry(
@@ -1466,3 +1617,50 @@ def test_json_flag_works_after_the_subcommand(db: str) -> None:
     code, out, _ = run("--db", db, "watch", "run_1", "--max-silence", "1h", "--json")
     assert code == ExitCode.OK, out
     assert json.loads(out)["breached"] is False
+
+
+def test_json_flag_is_discoverable_on_every_subcommand() -> None:
+    """--json appears in each subcommand's own help, not just the top parser (#328).
+
+    Newcomers check ``continuum <command> --help`` and used to see no ``--json``
+    there, so JSON output was invisible to them. Every subcommand inherits the
+    flag now, so its help must advertise it.
+    """
+    import argparse
+
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    subs = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    missing = [name for name, sp in subs.choices.items() if "--json" not in sp.format_help()]
+    assert missing == []
+
+
+def test_report_does_not_redeclare_the_inherited_json_flag() -> None:
+    """``build_parser`` must not raise a conflicting-option error (#328).
+
+    ``report`` predates the inherited ``--json`` and carried its own SUPPRESS
+    copy (#677). When #328 hung the flag off a parent every subcommand
+    inherits, the leftover declaration made argparse reject the duplicate
+    ``--json`` and every ``build_parser()`` call -- including this suite's own
+    doc guards -- died. ``report`` must parse a trailing ``--json`` through the
+    inherited flag alone.
+    """
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["report", "--trajectory", "run_1", "--json"]).json is True
+
+
+def test_trailing_json_works_on_a_command_that_never_declared_it(db: str) -> None:
+    """``runs --json`` is accepted and equals ``--json runs`` (#328).
+
+    ``runs`` never declared its own ``--json``; before #328 a trailing flag was
+    rejected as unrecognised. The inherited flag must produce identical JSON in
+    either position and must not clobber the global flag back to text.
+    """
+    trailing_code, trailing_out, _ = run("--db", db, "runs", "--json")
+    global_code, global_out, _ = run("--db", db, "--json", "runs")
+    assert trailing_code == ExitCode.OK, trailing_out
+    assert global_code == ExitCode.OK, global_out
+    assert json.loads(trailing_out) == json.loads(global_out)
