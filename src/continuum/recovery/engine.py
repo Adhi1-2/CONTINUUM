@@ -60,6 +60,7 @@ from continuum.models import (
 )
 from continuum.plugins import Registry, ValidationRule
 from continuum.recovery.contract import build_contract
+from continuum.recovery.ledger import BudgetStatus, RecoveryLedger, resolve_scope
 from continuum.recovery.observations import collect_observations
 from continuum.recovery.planner import RepairPlan, plan_repairs
 from continuum.recovery.rules import active_rules, apply_rule_findings, run_validation_rules
@@ -247,8 +248,7 @@ class RecoveryEngine:
         *,
         validator: StateValidator | None = None,
         strict_unknown: bool = True,
-        validation_rules: Iterable[ValidationRule] | None = None,
-        registry: Registry | None = None,
+        ledger: RecoveryLedger | None = None,
     ) -> None:
         """Build an engine.
 
@@ -269,15 +269,12 @@ class RecoveryEngine:
         self.ledger = ledger
         self.dependency_budgets = dependency_budgets
         self._manager = CheckpointManager(storage)
-        self._validation_rules: tuple[object, ...] = tuple(validation_rules or ())
-        if registry is not None:
-            # A seam is a Protocol: structural selection, then narrowing.
-            registered = tuple(
-                service
-                for service in registry.all_matching(ValidationRule)
-                if isinstance(service, ValidationRule)
-            )
-            self._validation_rules = (*self._validation_rules, *registered)
+        # Optional (issue #744): a recovery ledger to read the attempt budget
+        # from. Absent it, contracts carry no budget line and every decision is
+        # byte-identical to before. Present, it is only ever read here: spending
+        # the allowance is the caller's job (a resume attempt), not the
+        # assessment's, so assess stays free of side effects.
+        self._ledger = ledger
 
     def assess(
         self,
@@ -647,6 +644,7 @@ class RecoveryEngine:
             plan=plan,
             reason=reason,
             scope=scope,
+            budget=self._budget_for(run_id, scope, plan),
             post_checkpoint_observations=observations,
             liveness=liveness_section,
             triggering_risks=triggering_risks,
@@ -696,6 +694,26 @@ class RecoveryEngine:
             pass
 
         return decision
+
+    def _budget_for(
+        self, run_id: str, scope: Iterable[str] | None, plan: RepairPlan
+    ) -> BudgetStatus | None:
+        """The attempt budget this decision charges, or ``None`` when unknown.
+
+        Ownership is the assessment scope together with the dependencies the
+        plan's own steps name: they must agree on one dependency, otherwise the
+        attempt is unattributable and :func:`resolve_scope` returns the run-wide
+        bucket rather than charging a dependency the repair may not belong to.
+        The budget is advisory evidence in the contract; it never participates
+        in the decision, so a ledger that cannot be read costs a line of
+        evidence and nothing else.
+        """
+        if self._ledger is None:
+            return None
+        try:
+            return self._ledger.budget(run_id, scope=resolve_scope(scope, *plan.scopes))
+        except Exception:
+            return None
 
     # -- the decision rule ------------------------------------------------ #
 

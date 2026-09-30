@@ -8,43 +8,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Registered domain validation rules run during recovery assessment (#761).**
-  The `ValidationRule` plugin seam existed since Phase 1 but had no consumer:
-  an integration that needed staleness the environment diff cannot express, a
-  decision void because the policy it cites was revoked rather than because any
-  dependency moved, had to patch `StateValidator` and fork core recovery
-  behaviour. `RecoveryEngine(storage, validation_rules=[...])` and
-  `RecoveryEngine(storage, registry=...)` now execute those rules after built-in
-  validation, and `assess()` accepts a per-call collection that adds to the
-  engine's rather than replacing it.
-
-  Rules receive the projected state and the current environment and nothing
-  else, so a rule cannot mutate storage, emit events, or rewrite the repair plan
-  during assessment. Findings are provenance-labelled (`entry.rule`) and
-  namespaced `component:id [rule:name]` in the contract's `verified`,
-  `invalidated` and `evidence` lists and in the text and JSON renderings. Merge
-  is most-cautious-wins per component and commutative, so a rule can raise a
-  component's status and can never lower what built-in validation or another
-  rule already found; an engine with no rules, or a rule that finds nothing,
-  leaves the report and the sealed contract byte-identical. A rule that raises,
-  returns malformed output, carries no name, or shares a name becomes a
-  `validation_rule` entry at `requires_review` naming the rule and what it did
-  wrong, so a broken rule escalates rather than silently widening the trust
-  boundary.
-
-  `continuum.plugins.RevokedApprovalRule` is the built-in worked example,
-  opt-in and off by default: the validator already grades a revoked approval,
-  and this rule follows the revocation to the decision, finding or plan unit the
-  approval authorized. `check_validation_rule()` is the conformance helper a
-  third-party rule author runs in their own test suite: it checks the interface,
-  determinism across two calls with equal inputs, read-only behaviour on the
-  state and environment it is handed, namespacing, and tolerance of an empty
-  state. It deliberately does not check that a rule's verdict is *true*.
-  Registration stays explicit: nothing is loaded from a path, a plugin directory
-  or an entry point, because executing a third party's staleness logic during
-  recovery is a decision an operator makes on purpose. `docs/guides/validation-rules.md`
-  documents the trust boundary, and is careful not to claim the seam learns
-  policy from observed approvals, because it does not.
+- **Recovery-attempt budgets are scoped to the dependency that owns them (#744).**
+  `RecoveryLedger` records an optional dependency scope on each attempt, so a
+  repeatedly failing integration spends its own allowance instead of the run's:
+  exhausting dependency A leaves dependency B's repair path open, which is what
+  `docs/research/human_gate_minimization.md` asked for. `record_attempt`,
+  `attempts`, `requires_human` and the new `budget` all take a scope; callers
+  who never pass one get the previous run-wide behaviour unchanged, including
+  the entries already on disk, whose sealed content omits the key when it is
+  unset and therefore still verifies. The escalation marker is anchored and
+  scoped, so it survives compaction and stops at its own dependency.
+  Ownership is fail-closed by construction. `resolve_scope` accepts every
+  signal the system already carries, an action's `dep_scope`, a dependency
+  finding's component id, the resource set a scoped assessment was confined
+  to, and charges the run-wide bucket whenever they are absent, malformed, or
+  disagree. A scoped limit is additionally capped at the run-wide ceiling, so
+  a per-dependency allowance can never buy more attempts than the run was ever
+  allowed. `RepairStep` carries the scope the plan derived, and the contract's
+  evidence names the budget scope with its remaining or exhausted allowance;
+  the line carries counts and a dependency name only, never arguments, files
+  or failure detail. `RecoveryEngine` takes an optional ledger and reads the
+  budget read-only; without one every decision is unchanged.
 ### Fixed
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
@@ -1022,7 +1006,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,443 collected, ~2,414 passed, ~28 skipped on a minimal env).
+  (~2,460 collected, ~2,431 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses

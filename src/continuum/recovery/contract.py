@@ -32,6 +32,7 @@ from continuum.models import (
     StateValidationResult,
     utcnow,
 )
+from continuum.recovery.ledger import BudgetStatus
 from continuum.recovery.planner import RepairPlan
 from continuum.security.hashing import hash_content, to_json
 from continuum.state.validator import ValidationOutcome
@@ -44,8 +45,7 @@ __all__ = [
     "ContractVerification",
     "SUPPORTED_CONTRACT_VERSIONS",
     "build_contract",
-    "canonical_digest_input",
-    "contract_digest",
+    "render_budget",
     "render_contract",
     "seal_contract",
     "verify_contract",
@@ -182,38 +182,23 @@ def _identifier(component: Component, component_id: str | None) -> str:
     return f"{component.value}:{component_id}" if component_id else component.value
 
 
-def _namespaced(entry: ComponentValidationEntry) -> str:
-    """The component identifier, with the rule that reported it (issue #761).
+def render_budget(budget: BudgetStatus) -> str:
+    """One evidence line naming the budget scope and what it has left.
 
-    A rule's findings are namespaced by its identifier so an operator reading
-    ``invalidated`` or ``evidence`` can tell a built-in finding from a domain
-    one, and can see *which* domain rule spoke. Built-in findings carry no
-    suffix and read exactly as before.
+    Counts and the scope name only: why the attempts failed and what they
+    touched are not budget facts, so they stay out of anything a contract
+    prints (issue #744).
     """
-    ident = _identifier(entry.component, entry.component_id)
-    if not entry.rule:
-        return ident
-    return f"{ident} [rule:{entry.rule}]"
+    label = budget.scope if budget.scope is not None else "global"
+    line = f"recovery budget: scope {label}: {budget.attempts} of {budget.max_attempts} attempts used, {budget.remaining} remaining"
+    if budget.escalated:
+        return f"{line}; human required (escalated)"
+    if budget.exhausted:
+        return f"{line}; exhausted, human required"
+    return line
 
 
-#: Additive fields a contract sealed before they existed carries no key for.
-#:
-#: ``created_at`` is excluded separately: it is wall-clock metadata, not terms.
-#: A stored contract from before a group existed verifies only when its digest
-#: is recomputed without that group's keys, so each is tried; the alternative
-#: is a contract that stops verifying on upgrade. Rule findings (#761) reach
-#: the contract only as text inside ``verified``/``invalidated``/``evidence``,
-#: never as their own key, so they add no group here: a contract with no rule
-#: findings seals byte-identically to one assessed before #761.
-_ADDITIVE_FIELDS: tuple[frozenset[str], ...] = (
-    frozenset(),
-    frozenset({"evidence", "reason"}),
-)
-
-
-def _hashable_payload(
-    contract: RecoveryContract, *, excluded: frozenset[str] = frozenset()
-) -> dict[str, Any]:
+def _hashable_payload(contract: RecoveryContract) -> dict[str, Any]:
     """Payload the integrity hash covers.
 
     ``created_at`` is wall-clock metadata, not terms. ``liveness`` carries one
@@ -392,6 +377,7 @@ def build_contract(
     reason: str | None = None,
     evidence: list[str] | None = None,
     scope: Iterable[str] | None = None,
+    budget: BudgetStatus | None = None,
     post_checkpoint_observations: list[dict[str, Any]] | None = None,
     liveness: dict[str, object] | None = None,
     triggering_risks: list[str] | None = None,
@@ -410,7 +396,9 @@ def build_contract(
 
     When ``scope`` names specific dependency resources, the contract records that
     the recovery was localized to them, so an auditor can see at a glance that
-    clean parts of the state were intentionally preserved.
+    clean parts of the state were intentionally preserved. ``budget`` carries
+    that scoping to the attempt allowance (issue #744): it records which
+    dependency's budget the recovery charges and how much of it remains.
     """
     verified: list[str] = []
     invalidated: list[str] = []
@@ -482,6 +470,13 @@ def build_contract(
                 *evidence,
                 f"localized recovery scoped to: {', '.join(named)}",
             ]
+    # The budget line follows the localization line deliberately: the scope
+    # says what the repair was confined to, the budget says what that confinement
+    # cost. A scope that fell back to the run-wide bucket is reported as such,
+    # because a reader who saw a named scope here and none above would assume
+    # the localization applied when it did not (issue #744).
+    if budget is not None:
+        evidence = [*evidence, render_budget(budget)]
 
     contract = RecoveryContract(
         run_id=run_id,
