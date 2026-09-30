@@ -17,6 +17,7 @@ Conventions
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -842,12 +843,20 @@ def _risk_score(value: Any) -> float:
     """Clamp a monitor's confidence into [0, 1] rather than reject it.
 
     A monitor reporting 1.4 or -0.1 is reporting nonsense, but the observation
-    behind it is still a signal worth keeping, and ingestion is fail-open.
+    behind it is still a signal worth keeping, and ingestion is fail-open. A
+    ``None``, unparseable or non-finite score therefore maps to ``0.0``, the
+    same fallback the pre-#1421 writer used, so a malformed score neither drops
+    the event on the write path nor blows up a later ``project()`` of a log
+    that already carries one.
     """
+    if value is None or isinstance(value, bool):
+        return 0.0
     try:
         score = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("score must be a number") from exc
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(score) or math.isinf(score):
+        return 0.0
     if score < 0.0:
         return 0.0
     if score > 1.0:

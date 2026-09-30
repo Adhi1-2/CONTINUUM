@@ -6,6 +6,432 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`continuum policy-review` reports recovery history by action type (#743).**
+  A read-only, deterministic aggregate of repair attempts, human-gate
+  outcomes, compaction survival and reconciliation outcomes per action type,
+  over live and archived history alike, for periodic maintainer review. The
+  report is evidence for a human decision and never a policy engine: nothing
+  it computes feeds `plan_repairs` or changes a recovery verdict, and a high
+  human-required rate means the probes or the workflow deserve investigation,
+  not a lower safety bar. Without a `run_id` it spans every run.
+
+- **The escalation policy that budgets human attention (#1409).** Every action
+  the ledger cannot settle on its own becomes `REQUIRES_REVIEW` and interrupts
+  a human at once, and on a weeks-long run that floods the reviewer into
+  approving without reading, which is a gate with no gate in it. This ships
+  the schema, the loader and the deterministic scorer for the
+  attention-budgeted human gate: an `hourly_prompt_cap`, a
+  `batch_window_seconds` buffering window, a `blast_radius_threshold` above
+  which an item skips batching and interrupts immediately, and `risk_weights`
+  per action type or resource class. `load_escalation_policy` in
+  `src/continuum/recovery/escalation.py` reads `.continuum/escalation.json`,
+  falling back to a fail-safe default when the file is absent and raising
+  `EscalationPolicyError` when it exists but cannot be honoured, so a broken
+  policy never silently substitutes a risk posture the operator never chose.
+  `evaluate_action_risk` scores an action as the highest applicable weight,
+  because when two classifications disagree the more dangerous one should
+  govern. Nothing consumes the policy yet: the deferred review queue (#1410)
+  and the reviewer fatigue telemetry (#1411) are its wired consumers, so the
+  scorer is shipped and tested on its own rather than arriving with a heuristic
+  that moves while the queue is built.
+
+- **`continuum report --trajectory <run_id>` distils a run's whole history into
+  an auditable summary (#1427).** Operators had no high-level view of a
+  long-running agent's archived behaviour: replaying the raw log is expensive
+  and there was no structured way to inspect failure patterns once compaction
+  moved most of the history out of the live log. The new command folds
+  `events_archive` and the active log together, so the figures cover the whole
+  run regardless of compaction, and it is read-only -- it says what the run did,
+  never whether resuming it is safe (`status` answers that). The report carries
+  the counts the issue named: `total_attempts` (actions put into flight, counted
+  once each, since the ledger records a claim and its settlement as two
+  `ACTION_RECORDED` events), `uncertain_count` (side effects still flagged
+  `side_effect_uncertain`, i.e. awaiting reconciliation), `scar_rate`, and the
+  stall sites, which now rank a re-claimed-but-unsettled action type as a retry
+  site so a single retry surfaces before any type has failed twice. `--json`
+  emits the full model; the human form renders the same figures, and both carry
+  the report's digest. `TrajectoryReport` gained a `digest()` method that hashes
+  its own analytical fields deterministically, and `report_id` is now the prefix
+  of that digest, so a stored report can be checked against the events it
+  summarises instead of taken on trust; the command exits non-zero when a
+  persisted `TRAJECTORY_REPORT` no longer hashes to its own id. The two new
+  fields default to zero, so reports written before this change still load.
+  Existing quiet-time generation is unchanged.
+
+- **Typed `RiskObservedPayload` schema and projection of observed risks into
+  `SemanticState` (#1421).** `RISK_OBSERVED` existed as an event type with
+  `EXTERNAL_MONITOR` provenance (#303), but its payload had no typed schema and
+  the fold skipped it entirely, so a projection never reported what a run had
+  been seen doing. `RiskObservedPayload` in `src/continuum/models.py` now types
+  the wire payload (`trigger`, `score`, `episode_id`, `step_id`, `detail`,
+  `ts`), normalising what monitors send rather than refusing it: scores clamp
+  to `[0.0, 1.0]`, `detail` accepts a structured dict or a legacy plain string
+  (wrapped as `{"message": ...}`) bounded to 32 keys and 512 chars, and `ts`
+  accepts an epoch number or ISO 8601. `ingest_risk` validates and normalises
+  through the schema, so what lands on the log is always schema-shaped.
+  `project()` folds each event into `SemanticState.observed_risks` carrying its
+  provenance forward, and `RISK_OBSERVED` left `_NON_PROJECTING`. An observation
+  is knowledge rather than a change, so `observed_risks` joins
+  `PROJECTION_BOOKKEEPING`: folding one mints no state version, while mitigation
+  that actually alters the run still bumps it through whatever it changed.
+
+- **Continuous-monitoring fault-injection scenarios for the recovery-correctness
+  suite (#1426).** Four scenarios in `continuum.benchmark.phase6.scenarios`
+  inject mid-run `RISK_OBSERVED` events into a live trajectory instead of
+  unit-mocking the risk feed: `risk_loop_replan` (a repeating-tool-action signal
+  must drive REPLAN with guidance naming the steps to avoid),
+  `risk_meltdown_rollback` (an error cascade with a meltdown on top must roll
+  back to the verified fact-gathering checkpoint), `risk_fail_open_resilience`
+  (corrupted, blank and torn feed lines must be dropped without disturbing the
+  trajectory), and `risk_side_effect_abort` (a duplicate side-effect signal must
+  abort and settle on the completed record without a second execution). Each
+  records decision accuracy against the policy expectation, duplicate side
+  effects, and ingestion latency per step. The phase6 suite is now 18 scenarios.
+
+- **Risk verdicts now carry located guidance for repeating steps (#1426).** A
+  `loop` trigger previously produced a replan verdict naming only the trigger;
+  the `step_id` the probe supplied was dropped, so a replanning agent had no way
+  to tell which plan units to avoid. The decision rationale and sealed contract
+  reason now append `repeating steps to avoid: <ids>`, deduplicated in
+  first-seen order, collected only from the events that contributed to the
+  winning mode. Triggers carrying no step id, and less severe triggers that lost
+  the severity vote, contribute no guidance.
+
+- **The recovery surfaces now name the risk observations that triggered a
+  verdict (#1424).** A risk-driven verdict already carried the `RISK_OBSERVED`
+  event ids behind it on the sealed contract as `triggering_risks`, and the
+  field was covered by the integrity hash with a legacy fallback for contracts
+  sealed before it existed, but no surface rendered it: an operator could see
+  *that* a run was rolled back and read the prose rationale, and a resumed
+  session could read the verdict, without either being able to cite the
+  observation that produced it. `render_contract` (`continuum show-contract`)
+  now lists the ids under a `triggering_risks:` block, `RecoveryDecision.render`
+  (`continuum resume` / `watch`) lists them under a `Triggering risks:` heading
+  next to the rationale, and the curated briefing's verified contract section
+  carries a `triggering risks:` line. All three omit the section entirely when
+  the verdict came from drift or the ledger alone, so an empty list stays the
+  signal that no risk drove it. The field is unchanged and still `list[str]` of
+  event ids, deduplicated by trigger (#1057), so existing sealed contracts and
+  every machine-readable consumer are unaffected.
+
+- **Out-of-band blob store and `CONTINUUM_PAYLOAD_OFFLOAD_BYTES` threshold (#1418).**
+  Event payloads exceeding the configurable byte threshold `CONTINUUM_PAYLOAD_OFFLOAD_BYTES`
+  (default 0, disabled) are offloaded to content-addressed canonical JSON blob files at
+  `<storage_dir>/blobs/<sha256>.blob`. Stored event records replace inline payloads with an
+  offload descriptor `{"__offloaded": sha256_hex, "size_bytes": length, "keys": list(payload.keys())}`.
+  The event hash chain calculation covers the offload descriptor, maintaining full cryptographic
+  tamper evidence while preventing row bloat and scan degradation across SQLite and Postgres.
+
+- **Transparent blob payload rehydration and deep integrity verification (#1419).**
+  Event payloads offloaded to content-addressed blobs are transparently rehydrated during
+  `read_events()`, `read_archived_events()`, and `read_all_events()`, allowing downstream
+  projections, validators, and replays to operate seamlessly over complete payloads without
+  descriptor-awareness. If a referenced blob is missing or tampered with on disk, reads fail
+  closed by raising `CorruptedRecord` identifying the event sequence number and sha256 digest.
+  Extended `continuum verify` and storage engines with `--deep` / `deep=True` verification to
+  audit the existence and content hashes of on-disk blobs across both live and archived events.
+  Compaction preserves content-addressed blobs for archived event records.
+
+- **The gateway now enforces tenant-scoped namespace boundaries on external memory claims (#1415).**
+  External memory mutation claims now support the standardized structured key convention
+  `memory:<store_id>:<tenant_id>:<namespace>:<record_key>` alongside `mem:<store_id>:<tenant>:<record_key>`.
+  `continuum gateway` binds the authorized tenant identity from server configuration, request headers
+  (`X-Continuum-Tenant`), or run context metadata (`tenant_id`, `tenant`),
+  and denies cross-tenant write attempts with HTTP 403 before outbound requests reach external stores.
+  The gateway CLI command also exposes `--tenant` to allow operators to pin the tenant boundary at proxy startup.
+
+- **Registered `ActionReconciler` plugins are now dispatched during reconciliation (#765).**
+  The `ActionReconciler` seam in `continuum.plugins.seams` was declared in Phase 7
+  with no consumer: `docs/ARCHITECTURE_EVOLUTION.md` listed it among the plugin
+  seams declared but not load-bearing. `continuum.plugins.reconcile` is the
+  consumer. It dispatches registered reconcilers over a run's uncertain actions,
+  merges their evidence, and settles through the existing ledger path alongside the
+  subprocess probe registry (#218).
+
+  Every assessed action lands in one of four documented categories: confirmed
+  occurrence, confirmed non-occurrence, unavailable evidence, or conflicting
+  evidence. Confirmation settles the action; anything else escalates it to
+  `REQUIRES_REVIEW`. Two rules keep that safe: a reconciler that raises or returns
+  a malformed value blocks confirmation rather than being ignored (its silence is
+  not neutrality), and disagreeing sources are escalated rather than
+  majority-voted. The human queue only ever grows on anything less than unanimous
+  confirmation, so plugins can shrink what a person must inspect and never widen
+  what an agent may certify on its own.
+
+  Reconcilers run sorted by declared name, so registration or iteration order can
+  never change a verdict, and every report carries per-source provenance in that
+  same order for diffable JSON and text diagnostics. `Reconciliation.occurred`
+  widens from `bool` to `bool | None`, where `None` means looked and could not
+  obtain evidence rather than evidence of absence; existing reconcilers returning
+  `True`/`False` are unaffected.
+
+  A reconciler receives the `Action` record and nothing else (no storage, no
+  ledger), so plugin code cannot persist anything outside the controlled
+  settlement loop. Registration stays explicit and is never discovered: `continuum
+  reconcile run_1 --reconciler myapp:OutboxReconciler` (repeatable) names each
+  plugin by dotted path, and `settle_with_reconcilers` also accepts a `Registry` to
+  resolve from. Probes and plugins compose: the probe pass runs first and plugins
+  only see what it left pending. Default behaviour with no `--reconciler` is
+  unchanged. See `docs/guides/reconciler-plugins.md`, including how to implement a
+  #268-compatible OpenTelemetry reconciler on the seam.
+
+- **Per-dependency human gate budgets are now wired into the recovery boundary (#1459).**
+  The per-dependency recovery attempt tracking introduced in #1428 is now enforced
+  across the recovery lifecycle:
+  `RecoveryEngine.assess` and `assess_scoped` accept a `ledger` and `dependency_budgets`
+  mapping (auto-loading `.continuum/budgets.json` by default), evaluate ceilings for
+  every relevant external dependency and uncertain action, and escalate only exhausted
+  dependencies to `REQUEST_HUMAN` while letting untouched, healthy dependencies recover
+  automatically (`REPAIR_AND_RESUME` or `RESUME`).
+  `plan_repairs` flags repair steps as `requires_human` when the target dependency or
+  action has exhausted its recovery budget.
+  `build_contract` withholds automatic machine-executable steps as `next_allowed_action`
+  under `REQUIRES_HUMAN`, ensuring automation cannot proceed until human intervention
+  clears the gate.
+  `GenericAgentAdapter` exposes `ledger` configuration and forwards scoping and
+  per-dependency budgets to `resume()`, `record_attempt()`, and `requires_human()`.
+
+- **`RecoveryLedger` now evaluates the human gate per external dependency, not
+  only for the run as a whole (#1428).** A single flaky upstream (a
+  rate-limited sandbox, a weather API) failed repeatedly and drained the run's
+  one global attempt budget, and once that pool was empty every later recovery,
+  including unrelated and highly reliable core tasks, escalated to a person.
+  `record_attempt` accepts a `dependency` and tags the attempt with it;
+  `requires_human` accepts the same `dependency` and counts only that
+  dependency's attempts against its own ceiling. Escalation writes a
+  namespaced, anchored `human_required:<dependency>` gate entry rather than the
+  run-wide marker, so exhausting one dependency escalates only that dependency,
+  and the marker survives compaction the same way the global one does.
+  Dependency ceilings come from an optional `dependency_budgets` section in
+  `.continuum/budgets.json` (`{"dependency_budgets": {"ext:weather-api": 2}}`),
+  validated on load like every other integer in the registry: a positive
+  integer, with a boolean or a float rejected rather than silently read as a cap
+  of 1. A dependency the section does not name falls back to
+  `default_max_attempts`, then to the caller's own threshold, so a registry
+  never has to list every dependency to govern all of them. The change is
+  additive: entries written before the field existed load with no dependency tag
+  and behave exactly as before.
+### Fixed
+
+- **`_risk_score` in `RiskObservedPayload` fails open on unusable inputs (#1421).**
+  `None`, unparseable text and non-finite floats now map to `0.0` rather than
+  raising `ValueError` or passing `NaN` to the Pydantic validator, preserving the
+  fail-open contract of the risk ingestion path.
+
+- **The Postgres action index backfill uses jsonb accessors instead of
+  SQLite's `json_extract` (#1441).** `PostgresStorage._backfill_action_index`
+  seeds the `action_index` projection from existing `ACTION_*` events when the
+  index is empty, which is the recovery path for a database that predates the
+  index (#216) or one that lost its rows. Its `INSERT ... SELECT` was ported
+  from the SQLite v3 migration, but the two `WHERE` predicates were left as
+  `json_extract(e.payload, '$.key')` while the rest of the statement had been
+  translated to jsonb. Postgres has no `json_extract`, so whenever the backfill
+  actually fired the store failed to open outright with `UndefinedFunction`
+  (SQLSTATE 42883), out of `_create_schema` on connection. No test covered the
+  case, which is why CI saw nothing: the backfill short-circuits unless
+  `ACTION_*` events exist and the index is empty, and every test database
+  starts empty in both senses. The `WHERE` clause now reads
+  `e.payload::jsonb->>'key' IS NOT NULL` and
+  `e.payload::jsonb->'action' IS NOT NULL`, matching the `SELECT` list.
+
+  The same statement had also dropped SQLite's `INSERT OR REPLACE`, so a key
+  that was claimed and later completed, appearing in two `ACTION_*` events,
+  proposed a duplicate primary key. The port now selects
+  `DISTINCT ON (key) ... ORDER BY key, ord DESC`, keeping the last event per
+  key, with `ON CONFLICT (key) DO NOTHING` as a second guard.
+
+- **`policy-review` no longer reports an uncertain side effect as absent.**
+  The `side_effect_actions` rows folded every `ACTION_RECONCILED` event that was
+  not `completed` into `reconciled_absent`, but only `reconcile(occurred=False)`
+  is a confirmation of absence. `ActionLedger.claim` also writes that event type
+  for whatever a caller-supplied `on_unknown` resolver returns, and such a
+  resolver can legitimately resolve to `UNKNOWN` ("the probe could not tell") or
+  `REQUIRES_REVIEW` ("a human has to judge"). Both were counted as confirmed
+  absence, so the report answered "was the effect absent?" with "yes" when the
+  truth was "nobody knows", which is the one claim a maintainer reading it must
+  not be able to make by mistake. Only `failed` counts as absent now; the other
+  two land in a new `reconciled_uncertain` bucket that the text render shows
+  alongside the other two, so the open question stays visible instead of being
+  reported as a finding.
+
+- **File-derived progress no longer bloats the log on a compacted run.**
+  `record_file_progress` gates its mirror on a projection of the log, but folded
+  the live tail (`read_events`) alone. Once a run has been compacted the
+  goal-bearing prefix, `RUN_STARTED` included, lives in `events_archive`, so the
+  fold raised `ProjectionError` and the except branch fell through to "changed",
+  appending a redundant `TASK_UPDATED` and a duplicate-evidence tail on every call
+  over an unchanged file — the documented no-op contract was silently void. The
+  fold now reads the full history (`read_all_events`); a run with no goal yet
+  still raises against the merged history, so the "not yet projectable" behaviour
+  is unchanged. The reproject inside `GenericAgentAdapter.capture_state`'s auto
+  branch had the same live-tail read and rejected the checkpoint outright with
+  `TASK_UPDATED before the run was started` — the mirror's own appended event
+  could not fold against the archived start. It now reads the archive too.
+
+
+  merges.** Several branches each synced the documented collected total on its
+  own base, so once merged the tree collected more tests than every doc stated
+  and the docs-count guard failed; README, the translated READMEs, CHANGELOG,
+  `docs/CONTRIBUTING_ONBOARDING.md`, `references/testing.md` and
+  `references/install.md` now all read the live total. `README.md` and
+  `docs/api/mcp.md` still counted twelve MCP tools after #1260 added a
+  thirteenth (`continuum_compensate_action`), so the tool-count guard read 12
+  against the server's 13. The MCP doc guard
+  also tripped because `curate_briefing` reads `contract.triggering_risks`
+  while the wiring test's contract stand-in predated that field, and the
+  pre-#1262 trajectory-render label test still asserted the old inline
+  `"unverified (derived)"` string against the shared `derived_label`. Two mypy
+  errors from the recovery-anchor wiring (`anchor_seq` narrowing and a `payload`
+  redefinition in `cmd_actions`) are fixed. No behavior changes.
+
+- **PostgresStorage action-index fold skips malformed JSON payloads (#1386).**
+  `PostgresStorage._canonical_index_rows` decoded raw payload strings without
+  guarding against decode errors, so an event with a malformed JSON payload
+  raised an unhandled `json.JSONDecodeError` during `action_index_drift()` and
+  `rebuild_action_index()`. `SQLiteStorage` already wrapped the parse in
+  `try/except json.JSONDecodeError: continue` to skip corrupt rows and complete
+  the fold. The Postgres fold now guards payload decoding with matching
+  skip-not-crash semantics, allowing `continuum verify --index` to complete
+  consistently across backends on partially corrupted stores.
+
+- **GenericAgentAdapter records dependency declarations as deterministic (#1391).**
+  `GenericAgentAdapter._declare_dependencies` previously hardcoded
+  `source=Origin.EXTERNAL_AGENT`, which contradicted its documented contract as
+  a trusted in-process facade writing `Origin.DETERMINISTIC` state. This dropped
+  the advisory prefix trust score on runs with pinned environments. The adapter
+  now stamps `DEPENDENCY_DECLARED` events with `source=Origin.DETERMINISTIC` to
+  match its checkpoint and action ledger writes.
+
+- **`ensure_run` now checks archived history so compaction does not inject a duplicate `RUN_STARTED` (#1436).**
+  `ContinuumMCP.ensure_run` and `SidecarServer._ensure_run` checked `read_events(run_id, upto=1)`
+  to decide whether a run needed its genesis event backfilled. On a compacted run, events up to
+  the anchor sequence reside in `events_archive`, so the live query returned an empty list,
+  causing both servers to append a second `RUN_STARTED` event into the live tail. The duplicate
+  event wiped initial goal constraints, reset progress counters, and corrupted projected state.
+  Both entry points now inspect archived events first, recognizing that a compacted run was
+  already started properly.
+
+- **Compaction no longer mints an environment-blind anchor checkpoint (#1049).**
+  `compact_run` took its forced anchor checkpoint without an `environment`
+  argument, so the anchor's `StateCheckpoint.environment` was always `None`.
+  That anchor becomes the run's newest checkpoint, and `RecoveryEngine.assess`
+  hands `None` to the validator, which marks every pinned dependency `UNKNOWN`
+  for want of a snapshot to compare against. A run that resumed cleanly one
+  moment before compaction downgraded to `REQUEST_HUMAN` one moment after,
+  with nothing about the world having changed. Both engines now thread an
+  optional `environment` through `compact_run`: `continuum compact` captures
+  one from `--env` the way `continuum validate` does, and when the caller
+  supplies none, the anchor carries forward the environment the run's newest
+  checkpoint already recorded, because compaction observes the world rather
+  than changing it. A run with no recorded checkpoint still anchors with
+  `None` rather than inventing a snapshot.
+
+- **Path canonicalization in idempotency hashing is now platform-independent (#1437).**
+  `_canonicalize_paths` previously used `os.path.normpath`, which converted separators
+  to backslashes on Windows while leaving forward slashes on POSIX. Because `stable_hash`
+  hashes canonical JSON strings, equivalent path arguments hashed differently on Windows
+  versus Linux, causing shared ledgers or cross-platform replays to generate mismatched
+  idempotency keys and fail deduplication. Normalization now standardizes Windows path
+  separators to forward slashes using `posixpath.normpath` across all operating systems,
+  while preserving backslashes in POSIX filenames and regex-like strings. Note that
+  existing ledger entries recorded on Windows with backslash paths will compute new
+  idempotency keys under the normalized representation.
+
+- **Agent adapters now check archived history so compaction does not inject a duplicate `RUN_STARTED` (#1453).**
+  `LangChainAgentAdapter.start_run`, `LangGraphAgentAdapter.start_run`, and `OpenAIAgentAdapter._ensure_run_exists`
+  checked `read_events(run_id, upto=1)` to decide whether a run needed its genesis event recorded. On a compacted run,
+  events up to the anchor sequence reside in `events_archive`, so the live query returned an empty list, causing
+  the adapters to append a second `RUN_STARTED` event into the live tail. The duplicate event wiped initial goal
+  constraints, reset progress counters, and corrupted projected state. All three adapters now inspect archived
+  events first, recognizing that a compacted run was already started properly.
+
+- **ActionLedger.compensate() now enforces a completed status precondition (#1387).**
+  The method accepted any existing record and transitioned it to `COMPENSATED`
+  while clearing `side_effect_uncertain`, mirroring the gap #366 and #733 fixed
+  for `complete()` and `fail()`. Because `claim()` deliberately treats a
+  compensated action as re-fireable, compensating an interrupted or uncertain
+  (`UNKNOWN`) action laundered the recovery blocker away and allowed duplicate
+  execution of an external effect that may have already run. `compensate()` now
+  verifies the action is in `(ActionStatus.COMPLETED, ActionStatus.COMPENSATED)`,
+  raising `LedgerError` for any in-flight or un-reconciled record.
+
+- **`record-plan` now succeeds on compacted runs (#1438).** `cmd_record_plan`
+  queried `read_events` for its preflight projection check and post-write
+  emission, which on a compacted run reads only the post-anchor live tail.
+  Because `RUN_STARTED` lives in `events_archive`, projecting the candidate
+  against that truncated history raised `ProjectionError` and refused valid
+  plans with exit code 1. The command now queries `read_all_events` so the
+  preflight fold and state emission see the full merged event history.
+
+- **The MCP candidate fold now reads the full history, so `continuum_record_progress`
+  and `continuum_record_plan` keep working on a compacted run (#1133).**
+  `_project_candidate` folded only the live tail; once compaction moved
+  `RUN_STARTED` into `events_archive`, the goal no longer projected and both
+  write tools refused every payload as "unprojectable" -- exactly the
+  long-running runs they exist for. It now folds `read_all_events`, so the goal
+  still projects and the head sequence it validates against is unchanged. The
+  original fix (PR #1219) was dropped in a merge-of-main and never landed.
+
+- **`DependencyGraph.impacted_by` now cascades taint along finding-to-finding
+  citation edges to a fixpoint (#1475).** Findings may cite other findings
+  (blessed by `SemanticState.dangling_evidence`), and `StateValidator._propagate`
+  iterated to a fixpoint so stale findings cascade down the derivation graph.
+  `impacted_by` previously only checked citations against the initial evidence
+  set in a single pass, missing findings and decisions that depended on tainted
+  findings. `DependencyGraph.impacted_by` now repeats until no new findings are
+  tainted, restoring parity with the validator and preventing stale downstream
+  findings and decisions from surviving localized repair plans.
+- **The edit-precondition gate now raises the exception subclass matching the
+  edit type it refused (#1114).** The gate picked `ForkPreconditionError` for
+  forks but the plain `EditPreconditionError` for every other edit type, so
+  `MergePreconditionError` and `RestorePreconditionError` -- both exported
+  through `recovery/__init__.py` -- were never raised anywhere and a caller
+  could not distinguish a merge refusal from a restore refusal by exception
+  type. `check_preconditions` now maps `edit_type` to its subclass, and the
+  two-sided `check_merge_preconditions` path raises `MergePreconditionError`
+  as well. The three subclasses are defined once in `gate.py` and re-exported
+  by `fork.py`, `merge.py` and `restore.py` as before, so existing imports and
+  `except EditPreconditionError` handlers are unaffected; only `type(exc)`
+  becomes observable.
+
+- **A padded argument token can no longer reset the authorization-bound retry
+  budget (#1052).** The bucket was derived from every argument token, and the
+  arguments are caller-controlled noise plus the real resource, so keeping the
+  idempotency key fixed while varying one throwaway field (a `trace_id`, a
+  request id) moved every retry into a fresh bucket at its full allowance. A
+  `budgets.json` cap of 2 that refused a third identical attempt stayed open
+  indefinitely while each retry carried a new token. `ActionLedger.claim` now
+  derives the bucket from the record the claim defers to when one exists, which
+  is the identity the ledger itself has already decided the attempt is, and
+  settlement paths already derived from those same stored arguments, so a retry
+  and its confirmation share one bucket by construction. Fresh-key minting for
+  a fixed resource still shares the bucket as before (#390, #413). A caller
+  minting both a fresh key and fresh noise per attempt presents no identity the
+  ledger can see and remains on the token fallback -- the documented residual,
+  since declaring such fields `volatile` at every call site is not a fix: a
+  caller that wants around the cap simply forgets to declare them.
+
+- **A human-gated contract no longer advertises a machine-executable step as
+  the next permitted action (#1388).** `build_contract` nulled
+  `next_allowed_action` only for `ROLLBACK` and `ABORT` (the #1058 fix), so
+  `RecoverySafety.REQUIRES_HUMAN` fell through to the `else` and named
+  `plan.first`. That step stays automatic whenever the verdict is imposed
+  *after* the plan is built, which a consumed authority and a risk-policy
+  escalation both do without adding a `RepairStep` of their own, so the engine
+  declared a human must gate while the sealed contract handed out a green
+  light, and `permits()` confirmed it. Under `REQUIRES_HUMAN` a step is now
+  named only when it itself requires a person, so the #42 reconcile step and
+  the unreadable-log repair (#385) keep their action and their permission, and
+  `REQUIRES_REPAIR` / `REQUIRES_REVALIDATION` are untouched. `permits()` also
+  returns `False` when the contract names no action at all: the plain
+  comparison answered `permits(None) is True` on any verdict that deliberately
+  permits nothing, so a caller reading the action back out of the contract was
+  told it may proceed. `required_actions` is unchanged, so an auditor still
+  sees the work; only the single permitted action is held until the gate
+  clears.
+
 ### Changed
 
 - **The authority-resurrection check now goes through its own exported helper
