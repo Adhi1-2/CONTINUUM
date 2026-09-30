@@ -8,27 +8,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Recovery-attempt budgets are scoped to the dependency that owns them (#744).**
-  `RecoveryLedger` records an optional dependency scope on each attempt, so a
-  repeatedly failing integration spends its own allowance instead of the run's:
-  exhausting dependency A leaves dependency B's repair path open, which is what
-  `docs/research/human_gate_minimization.md` asked for. `record_attempt`,
-  `attempts`, `requires_human` and the new `budget` all take a scope; callers
-  who never pass one get the previous run-wide behaviour unchanged, including
-  the entries already on disk, whose sealed content omits the key when it is
-  unset and therefore still verifies. The escalation marker is anchored and
-  scoped, so it survives compaction and stops at its own dependency.
-  Ownership is fail-closed by construction. `resolve_scope` accepts every
-  signal the system already carries, an action's `dep_scope`, a dependency
-  finding's component id, the resource set a scoped assessment was confined
-  to, and charges the run-wide bucket whenever they are absent, malformed, or
-  disagree. A scoped limit is additionally capped at the run-wide ceiling, so
-  a per-dependency allowance can never buy more attempts than the run was ever
-  allowed. `RepairStep` carries the scope the plan derived, and the contract's
-  evidence names the budget scope with its remaining or exhausted allowance;
-  the line carries counts and a dependency name only, never arguments, files
-  or failure detail. `RecoveryEngine` takes an optional ledger and reads the
-  budget read-only; without one every decision is unchanged.
+- **A run can configure the environment providers it trusts at resume (#762).**
+  Providers for files, git, values and static inputs existed, but a resume only
+  applied the ones a caller remembered to pass to `assess`, so an integration
+  could wire a reliable world-observer and still resume through a path that
+  validated only what was supplied by hand, with nothing in the output saying
+  so. A run now records provider descriptors and their bounded resource scopes
+  in the event log (`ENVIRONMENT_PROVIDERS_CONFIGURED`, append-only, newest
+  record authoritative); at resume `RecoveryEngine.assess` resolves them when no
+  environment was supplied, captures, and feeds the result to the validator that
+  already existed. New `continuum providers <add|remove|list|check>` manages the
+  configuration, and `check` resolves exactly as resume would so a failing
+  observer is visible before it gates a recovery.
+
+  The trust boundary is the design. A provider name is a lookup key matching
+  `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`, never a path or import; only the four
+  built-ins and names handed to a `ProviderRegistry` resolve, and an unknown
+  name is reported unavailable rather than autoloaded. Parameters must be
+  JSON-native, so a callable cannot mean one thing in memory and another after
+  a restart, and a parameter whose name looks like a secret is refused so it
+  never reaches the hashed log. `CallableProvider` is not configurable at all:
+  it registers by name and the configuration references the name.
+
+  Fail-closed everywhere. A disabled, unavailable, malformed, conflicting or
+  failing provider emits `UNKNOWN_VERSION` for every resource it declared
+  instead of leaving it out, and `UNKNOWN` is what the validator already
+  downgrades on. Two specs claiming one resource key fail closed for both
+  rather than letting one win by order. A provider reporting beyond its scope
+  has those keys marked unknown too. Unconfigured runs behave exactly as
+  before, and a caller-supplied environment still wins. Captured resources
+  carry the provider that produced them, so a validation entry reads
+  `verified unchanged (provider: git)` and the recovery contract inherits that
+  evidence. See `docs/guides/environment-providers.md`.
 ### Fixed
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
@@ -49,20 +60,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- **The authority-resurrection check now goes through its own exported helper
-  instead of being inlined twice (#1154).** `is_authority_consumed` was in
-  `__all__` and documented but called nowhere; `decide` and the gateway's
-  `match_route` each tested membership inline, and each also carried a
-  `hasattr` ladder whose dict fallback could not run, because
-  `collect_consumed_authorities` stores the `Event` itself as the map value and
-  an `Event` always has `.sequence` and `.payload`. Both call sites now route
-  through the helper and read those two attributes directly, with the
-  map-holds-Events contract documented at its one definition. Behaviour is
-  unchanged: the dead branches happened to compute the same values the live
-  ones did, so no message, verdict, or sequence number moves. What goes away is
-  that a security-sensitive block no longer reads as though it handles a
-  dict-valued map it can never receive, so the next change to
-  `collect_consumed_authorities` cannot silently select a different branch.
+- **A compaction anchor keeps the environment it was validated against (#762).**
+  `compact_run` writes a forced anchor checkpoint, which becomes the newest one
+  and the resume comparison point. It was written with no environment, so a
+  compacted run had no snapshot to diff a resumed capture against and every
+  resource read as unknown. The anchor now inherits the previous checkpoint's
+  environment. Both the SQLite and Postgres paths changed, since they carry
+  identical anchor logic.
+
 - **The TUI `tree` view fetches the run once instead of twice (#1157).**
   `family_lines` in `src/continuum/tui/model.py` called
   `storage.get_run(run_id)` twice and discarded the first result: the first
@@ -1006,7 +1011,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,460 collected, ~2,431 passed, ~28 skipped on a minimal env).
+  (~2,440 collected, ~2,411 passed, ~28 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
