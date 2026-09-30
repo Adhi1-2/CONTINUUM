@@ -421,6 +421,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`continuum mcp install` and `continuum mcp remove` register the server
+  cross-platform (#834), and the registration's lifecycle is now defined
+  (#841).** The committed `.mcp.json` cannot express "`.venv/bin/x` on POSIX,
+  `.venv\Scripts\x.exe` on Windows", and a bare command name is resolved by
+  the host's `CreateProcess` against *its* PATH, never the child's, so
+  resolution has to happen on the machine that will spawn the server.
+  `mcp install` does that: it probes the `mcp` SDK in a fresh subprocess
+  first (a missing extra is refused with the install command and nothing is
+  written), then bakes the resolved console script, or the
+  `python -u -m continuum.mcp` fallback that carries zero PATH assumptions,
+  plus an absolute `--db`, into the local- or project-scope registration.
+  The result connects regardless of the host's PATH and spawn cwd. `mcp
+  remove` deletes only the entries install recognises; a foreign or
+  hand-edited entry under the same name is left alone. The lifecycle #841
+  left undefined is documented as a table in `docs/api/mcp.md`: a re-run
+  after an upgrade repoints a moved venv in place and never duplicates, and
+  `pip uninstall` leaves the registration behind so `mcp remove` is the
+  documented pairing. `tests/test_mcp_install.py` pins idempotency, the
+  repoint, the foreign-entry guarantee and both scopes.
+
 - **MCP and sidecar ledger writes now carry `EXTERNAL_AGENT` (#653).**
   `ContinuumMCP.ledger` and `SidecarServer._ledger` construct their
   `ActionLedger` with `source=AGENT_SOURCE`, matching the `EXTERNAL_AGENT`
@@ -1171,7 +1191,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,950 collected, ~2,870 passed, ~36 skipped on a minimal env).
+  (~2,948 collected, ~2,911 passed, ~37 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses

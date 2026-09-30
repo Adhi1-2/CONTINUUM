@@ -37,7 +37,8 @@ continuum gate                                   # pre-tool-use verdict: allow o
 continuum briefing                               # session-start context injection
 continuum gateway --port 8765                    # enforcing proxy for registered upstreams. mutates
 continuum hooks install <client> [--with-gate]   # wire a coding CLI (claude-code, gemini, codex)
-continuum mcp doctor [--timeout N]               # diagnose why an MCP host cannot connect
+continuum mcp install [--scope project]          # register the MCP server, resolved absolute. mutates
+continuum mcp remove                             # remove the registration install wrote. mutates
 continuum health <run_id>                        # advisory prefix-trust health check
 continuum providers list <run_id>                # configured resume-time observers
 continuum providers check <run_id>               # resolve them as resume would [--json]

@@ -76,6 +76,7 @@ from continuum.gate import (
 from continuum.gate import (
     decide as gate_decide,
 )
+from continuum.mcp.install import HOST_PROFILES as MCP_HOST_PROFILES
 from continuum.models import (
     ActionStatus,
     EnvironmentSnapshot,
@@ -3448,55 +3449,149 @@ def cmd_hooks_remove(args: argparse.Namespace, storage: Storage, out: Any, err: 
     return ExitCode.OK
 
 
-def _doctor_timeout(raw: str) -> float:
-    """Argparse type for ``mcp doctor --timeout``: finite and strictly positive.
+def _mcp_settings_path(args: argparse.Namespace) -> Path:
+    """The file a ``mcp install``/``mcp remove`` acts on, per host and scope."""
+    profile = MCP_HOST_PROFILES[args.host]
+    if args.settings:
+        return Path(args.settings)
+    if args.scope == "project":
+        return Path(profile["project_settings"])
+    return Path(profile["local_settings"]).expanduser()
 
-    The deadline bounds every probe, not just the handshake reads, so a value
-    that is not a usable wait is not a slow diagnosis but a wrong one: zero or
-    negative means the probes give up before they start, and a healthy install
-    is reported as entirely broken -- every check fails, including the import
-    and PATH probes that involve no waiting at all. Rejecting it here keeps the
-    failure at argument-parsing time, where the parser's own error handling can
-    name the flag, instead of deep inside a diagnosis.
+
+def cmd_mcp_install(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Register the MCP server with a host, baking resolved values (issue #834).
+
+    The committed ``.mcp.json`` cannot carry platform conditionals, and a bare
+    command name is resolved against the *host's* PATH by ``CreateProcess``,
+    which is how a healthy install surfaces as ``CONNECTION_CLOSED``. So the
+    command is resolved here, on the machine that will spawn it, and baked
+    absolute alongside an absolute ``--db`` (the host's spawn cwd is not the
+    project root and is not guaranteed to be). The ``mcp`` extra is verified
+    by spawning a probe subprocess before anything is written: an in-process
+    import check passes in exactly the states where the baked command would be
+    dead for the host.
     """
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {raw!r}") from exc
-    if math.isnan(value) or math.isinf(value) or value <= 0:
-        raise argparse.ArgumentTypeError(
-            f"--timeout must be a positive, finite number of seconds, got {raw!r}"
+    from continuum.mcp.install import (
+        INSTALL_COMMAND,
+        SERVER_NAME,
+        display_command,
+        install_server,
+        resolve_command,
+        verify_sdk,
+    )
+
+    command, form = resolve_command()
+    sdk_ok, detail = verify_sdk(form)
+    if not sdk_ok:
+        print(
+            f"error: the mcp SDK is not importable by {sys.executable} ({detail}). "
+            "Refusing to register a server that cannot start.",
+            file=err,
         )
-    return value
+        print(f"Install it with: {INSTALL_COMMAND}", file=err)
+        return ExitCode.ERROR
 
+    # Absolute on purpose: every config path in the codebase resolves against
+    # the cwd, and the host's spawn cwd is neither documented nor guaranteed
+    # to be the project root.
+    db = Path(args.db or Path.cwd() / "continuum.db").resolve()
+    settings_path = _mcp_settings_path(args)
+    try:
+        status = install_server(
+            settings_path,
+            scope=args.scope,
+            project_root=Path.cwd(),
+            command=command,
+            db=db,
+            host=args.host,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
 
-def cmd_mcp_doctor(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
-    """Diagnose why an MCP host cannot connect to the server (issue #835).
-
-    A host that fails to start ``continuum-mcp`` reports one opaque string
-    (``CONNECTION_CLOSED``), because the useful stderr never crosses the
-    stdio protocol pipe and a spawn failure happens before any CONTINUUM
-    code runs. The doctor works client-side instead: it checks the ``mcp``
-    extra in a fresh interpreter, resolves the command the way a host would,
-    and completes a real ``initialize`` handshake against it.
-
-    The import is lazy so the CLI never pulls in the server stack at startup
-    (the base install may not have it). Exit 0 only when the handshake
-    completed; every failure state names its cause and its fix.
-    """
-    from continuum.mcp.doctor import render_doctor, run_doctor
-
-    # ``--timeout`` is validated at parse time (see ``_doctor_timeout``), so
-    # this is the configured positive deadline rather than a best effort.
-    report = run_doctor(timeout=args.timeout)
+    lines = [
+        f"MCP server registered with {args.host} ({args.scope} scope)",
+        f"  [{status}] {SERVER_NAME} in {settings_path}",
+        f"    command: {display_command([*command, '--db', str(db)])}",
+        f"    form: {form} (resolved at install time, independent of the host's PATH)",
+    ]
+    # The host reports a conflicting-scopes diagnostic when a local entry and
+    # the committed .mcp.json both name the server. That is expected: local
+    # wins, which is the point of registering there. Saying so here keeps the
+    # operator from "fixing" it by unregistering everyone else's entry.
+    conflict = args.scope == "local" and _project_mcp_json_names_server()
+    if conflict:
+        lines.append(
+            "  note: a project .mcp.json also registers this server; the local entry "
+            "takes precedence and the host's conflicting-scopes notice is expected"
+        )
     _emit(
-        report,
-        render_doctor(report),
+        {
+            "host": args.host,
+            "scope": args.scope,
+            "settings": str(settings_path),
+            "server": SERVER_NAME,
+            "status": status,
+            "command": command,
+            "db": str(db),
+            "form": form,
+            "project_conflict": conflict,
+        },
+        "\n".join(lines),
         as_json=args.json,
         stream=out,
         palette=getattr(args, "_palette", None),
     )
-    return ExitCode.OK if report["healthy"] else ExitCode.ERROR
+    return ExitCode.OK
+
+
+def _project_mcp_json_names_server() -> bool:
+    """True when a project-scope ``.mcp.json`` in the cwd registers the server."""
+    from continuum.mcp.install import SERVER_NAME
+
+    try:
+        data = json.loads(Path(".mcp.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    return isinstance(servers, dict) and SERVER_NAME in servers
+
+
+def cmd_mcp_remove(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Remove the MCP registration ``mcp install`` wrote (issue #834).
+
+    Only an entry this command's shape recognises is touched: the committed
+    ``.mcp.json`` registration and anything hand-registered survive, so an
+    uninstall can never unplug the server for other users of the same clone.
+    """
+    from continuum.mcp.install import SERVER_NAME, remove_server
+
+    settings_path = _mcp_settings_path(args)
+    try:
+        removed = remove_server(settings_path, scope=args.scope, project_root=Path.cwd())
+    except ValueError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    text = (
+        f"Removed {SERVER_NAME} from {settings_path}"
+        if removed
+        else f"No CONTINUUM-registered {SERVER_NAME} in {settings_path}"
+    )
+    _emit(
+        {
+            "host": args.host,
+            "scope": args.scope,
+            "settings": str(settings_path),
+            "server": SERVER_NAME,
+            "removed": removed,
+        },
+        text,
+        as_json=args.json,
+        stream=out,
+        palette=getattr(args, "_palette", None),
+    )
+    return ExitCode.OK
 
 
 def cmd_gate(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
@@ -4769,40 +4864,9 @@ def build_parser() -> argparse.ArgumentParser:
         cmd_providers,
         "Configure the environment providers a run trusts at resume. Mutates storage.",
     )
-    providers.add_argument(
-        "providers_command",
-        choices=["add", "remove", "list", "check"],
-        metavar="ACTION",
-        help="add, remove, list or check configured providers.",
-    )
-    providers.add_argument("run_id", help="the run to configure.")
-    providers.add_argument(
-        "--provider",
-        help="provider name: a built-in "
-        f"({', '.join(sorted(BUILTIN_PROVIDER_NAMES))}) or one registered in-process.",
-    )
-    providers.add_argument(
-        "--resource",
-        action="append",
-        metavar="KEY",
-        help="a resource key this provider owns (repeatable); required for a "
-        "registered provider, derived for a built-in when omitted.",
-    )
-    providers.add_argument(
-        "--param",
-        action="append",
-        metavar="KEY=VALUE",
-        help="a provider parameter, JSON where it parses else text (repeatable); "
-        "a file provider takes paths and max_bytes, a git provider takes path.",
-    )
-    providers.add_argument(
-        "--disable",
-        action="store_true",
-        help="record the provider disabled: its resources report unknown at "
-        "resume rather than being assumed unchanged.",
-    )
-    providers.add_argument("--all", action="store_true", help="with remove: clear every provider.")
-
+    # ``--json`` reaches this subparser through ``json_parent`` like every
+    # other one; the #677 SUPPRESS default it needed already lives there, so
+    # re-adding it here raised a conflicting-option error.
     resume = with_env(add("resume", cmd_resume, "Decide how a run may resume."))
     resume.add_argument(
         "run_id",
@@ -5121,20 +5185,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hooks_client(remove, cmd_hooks_remove)
 
-    mcp = add("mcp", cmd_mcp_doctor, "Diagnose and register the MCP server install.")
+    mcp = add("mcp", cmd_mcp_install, "Register the MCP server with a host.")
     mcp_sub = mcp.add_subparsers(dest="mcp_command", metavar="ACTION", required=True)
 
-    mcp_doctor = mcp_sub.add_parser(
-        "doctor",
-        help="Diagnose why an MCP host cannot connect: SDK, command resolution, live handshake.",
+    def mcp_options(p: argparse.ArgumentParser, func: Any) -> None:
+        """Give a ``mcp`` action its host, scope and settings override."""
+        p.add_argument(
+            "--host",
+            choices=tuple(MCP_HOST_PROFILES),
+            default="claude-code",
+            help="which host to configure (claude-code).",
+        )
+        p.add_argument(
+            "--scope",
+            choices=("local", "project"),
+            default="local",
+            help=(
+                "where to register: 'local' is the per-user file for this project "
+                "(default, wins over the committed .mcp.json); 'project' is the "
+                "shared .mcp.json in the project root."
+            ),
+        )
+        p.add_argument(
+            "--settings",
+            default=None,
+            help="path to the host's settings file (default: per host and scope).",
+        )
+        p.set_defaults(func=func)
+
+    mcp_install = mcp_sub.add_parser(
+        "install", help="Register the MCP server. Mutates host config."
     )
-    mcp_doctor.add_argument(
-        "--timeout",
-        type=_doctor_timeout,
-        default=15.0,
-        help="seconds each probe waits before giving up (default: 15).",
+    mcp_install.add_argument(
+        "--db",
+        default=None,
+        help="database path to bake, stored absolute (default: ./continuum.db).",
     )
-    mcp_doctor.set_defaults(func=cmd_mcp_doctor)
+    mcp_options(mcp_install, cmd_mcp_install)
+
+    mcp_remove = mcp_sub.add_parser(
+        "remove", help="Remove the registration mcp install wrote. Mutates host config."
+    )
+    mcp_options(mcp_remove, cmd_mcp_remove)
 
     verify = with_run(add("verify", cmd_verify, "Re-audit the event chain."))
     verify.add_argument(
@@ -5445,10 +5537,10 @@ def main(
     if getattr(args, "func", None) is None:
         return _bare_invocation(parser, args, out, err)
 
-    # hooks, notify-test and mcp doctor never touch a run, so they must not
-    # create an empty database as a side effect (of editing a settings file,
-    # sending a test notification, or of probing a server with a throwaway
-    # one).
+    # hooks, notify-test and mcp registration never touch a run, so they must
+    # not create an empty database as a side effect (of editing a settings
+    # file, sending a test notification, or of writing an `.mcp.json` entry
+    # without a run to attach it to).
     if args.command in (
         "benchmark",
         "attest-keygen",
@@ -5457,12 +5549,6 @@ def main(
         "notify-test",
         "mcp",
     ):
-        return int(args.func(args, None, out, err))
-
-    # A lineage token can be checked with no access to the source store at all:
-    # without a run_id there is nothing to read, and opening storage would only
-    # risk creating an empty database as a side effect of a read-only check.
-    if args.command == "lineage-verify" and not getattr(args, "run_id", None):
         return int(args.func(args, None, out, err))
 
     # Instant resume detection (issue #394): SessionStart hook reads
