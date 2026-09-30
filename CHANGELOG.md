@@ -153,22 +153,182 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **Postgres compaction no longer archives and deletes its own anchor marker
-  (#1078).** `SQLiteStorage.compact_run` refused an explicit `through_sequence`
-  at or above the anchor marker's sequence (#705), but `PostgresStorage.
-  compact_run` computed `through` straight from the argument and ran the
-  archive and delete over it, so a direct caller of the storage API could
-  remove the marker and every live row after it. The next append then minted a
-  fresh genesis with `prev_hash = None` and the live chain forked away from the
-  archive, defeating the single-transaction marker-plus-move that both engines
-  implement. The SQLite and Postgres engines now resolve the bound through one
-  shared helper, `continuum.storage.compaction.
-  resolve_compaction_bound`, so the anchor guard and the other safety checks
-  cannot drift apart between backends again. The CLI still calls
-  `compact_run` with no bound, so only a direct API caller could reach this;
-  that remains a real hole for a library whose storage is a public interface.
-  Behaviour on SQLite is unchanged, and the Postgres suite gains the anchor
-  rejection test the SQLite suite already had.
+- **The pin-marker surface no longer contradicts itself (#1099).** The docs
+  name `pin_markers_for_state` as the emitter of the `[pin:<id>:<hash>]`
+  markers, but the code that actually builds the ACTIVE CONSTRAINTS section
+  (`checkpoint/context.py:_pins_section`) reached across modules for the
+  private twin `_pin_marker` instead, and the public helper had no caller
+  outside its own module. `_pins_section` now builds its markers through
+  `pin_markers_for_state`, so the section and the accounting that reads it
+  cannot spell a pin two different ways, and the two doc sentences are true as
+  written. The four pin helpers (`account_pins_in_context`,
+  `pin_markers_for_state`, `check_pin_accounting`, `constraint_pins_payload`)
+  are added to `state/semantic.py`'s `__all__`, where three test modules and
+  `checkpoint/context.py` already import them by name.
+  `tests/test_module_all_exports.py` now covers that module, so the `__all__`
+  half cannot silently regress. Rendered output is unchanged.
+
+- **`benchmarks/` is now included in CI and pre-commit ruff gates (#1064).**
+  `benchmarks/` is imported by the test suite but sat outside the lint scope
+  in both CI and pre-commit configuration. The five ruff lint and format
+  findings in `benchmarks/fault_injection/runner.py` (SIM115, I001, SIM102,
+  SIM105, and formatting drift) are resolved, and CI `ruff check` and
+  `ruff format --check` as well as `.pre-commit-config.yaml` now cover
+  `benchmarks/` alongside the existing `src/`, `tests/`, `examples/`,
+  `_bugaudit/`, `scripts/` and `demo-run/` scopes. Contributor verification
+  guides across the documentation are synchronized to match.
+
+- **`PostgresStorage.rebuild_action_index` returns corrected row count (#1267).**
+  `rebuild_action_index` on Postgres ended in an unconditional `return 0`,
+  so `continuum verify --index --repair-index` always reported 0 rows corrected
+  even after rewriting drifted rows. It now queries the stored index before
+  rebuilding, compares against the canonical fold, and returns the count of
+  missing, stale, and spurious rows corrected, matching `SQLiteStorage` and the
+  base `Storage` contract.
+
+- **CITATION.cff states the released version, and the bump sites are documented
+  (#1120).** The citation file pinned `0.1.0` while the package was `0.1.2`, so
+  anyone citing the project recorded a version two releases stale, and
+  `CONTRIBUTING.md` still said the version lived in two places guarded by
+  checking that "will be added" -- the guard has run in CI since #838 and reads
+  four sites. The file now says `0.1.2`, the paragraph names all five sites a
+  bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
+  release tag), and `tests/test_version_drift.py` checks the citation file
+  alongside the README pins so the drift cannot recur.
+
+- **The Postgres backend now stores and returns a fork's `parent_run_id`
+  (#1079).** Both `create_run` and `create_run_started` inserted only the six
+  columns the schema had before lineage existed, and `_row_to_run` never read
+  the column back, so `runs.parent_run_id` was declared with a foreign key to
+  the parent and then left permanently null. Every fork silently lost its
+  lineage on the Postgres engine, and because `children_of`
+  (`recovery/family.py`) filters `list_runs` on that column, the family
+  resume block was vacuous there: a Postgres deployment would never refuse a
+  parent RESUME over an unsafe child, and would report the same empty family
+  the CLI tree and TUI render from. SQLite wrote and read the column in all
+  three places, so the two engines disagreed on a safety property with no
+  error anywhere. Both inserts now carry `run.parent_run_id` and the row maps
+  it into the `Run`, matching SQLite; the contract suite gained a case that
+  forks on the engine and asserts `children_of` resolves the child.
+- **The translated docs no longer tell users to pass `--json` after the subcommand, where argparse rejects it (#1144).**
+  `--json` is a global flag on the top-level parser, so `continuum resume RUN --json` exits 2 with "unrecognized arguments": the trailing position is not a valid invocation anywhere. Five translated READMEs still claimed every command accepts it there, and `docs/guides/memory_governance.md` built two shell pipelines on the failing form, so the whole tenant-enumeration section it belongs to produced nothing: the command never ran and `python -m json.tool` read an empty pipe. The guides now state the placement and the failure, matching `docs/api/cli.md`, which already documented the rule correctly. The translated READMEs also picked up the webhook caveat the English README gained when read-only-ness was qualified, so they describe the same CLI the canonical docs do rather than a stale version of it.
+- **`replay --upto` works on a compacted run instead of failing for every value
+  of `N` and blaming the operator for it (#1172).** `cmd_replay` read only the
+  live event tail, where `RUN_STARTED` no longer lives once a run is compacted,
+  so its guard rejected every `--upto` request and advised "increase `--upto`"
+  -- the one fix that cannot help, because the event had moved into the archive
+  rather than being excluded by the window. `--upto 999` failing on a run whose
+  head was 13 is what proved the message was wrong about the cause. The command
+  now windows the full history, archived prefix included, the way `cmd_events`
+  already does; `--upto` remains the bisection tool it is documented as, on the
+  long-lived runs compaction exists to serve. `_verify_against_stored` had the
+  same blind spot one function down: it re-derived the stored version's prefix
+  from `read_events(upto=source_sequence)`, which reads an empty log on a
+  compacted run because the prefix starts at sequence 1 and compaction moves
+  exactly that range. Left alone it would have reported every healthy
+  checkpoint as corrupt once the primary read was corrected, so both sites now
+  window `read_all_events`. `STATE_CHECKPOINTED` and `EVENT_LOG_ANCHORED` are
+  both non-projecting, so folding the archived prefix from genesis reaches the
+  same state the anchored path already produced. The guard is unchanged and
+  still fires when a window genuinely excludes `RUN_STARTED`.
+- **The gateway now enforces a route's `prefix` instead of only parsing it
+  (#1051).** `match_route` narrowed candidates by host and method and never
+  compared the request path against the route, so every path on a registered
+  host was the route's scope: a live claim for `/v1/invoices` spent itself on
+  `/v1/refunds` or `/internal/admin/purge`, the gateway forwarded the request,
+  settled the claim as completed, and wrote `TOOL_COMPLETED` evidence whose
+  `path` recorded the off-prefix URL: the run's log said the invoice was sent
+  while the upstream saw something else entirely. The prefix is the only
+  per-path scope a route has and nothing else narrowed what a claim could
+  reach, so there was no workaround. `match_route` now takes the request path
+  and requires it to fall within the prefix on a whole-segment boundary
+  (`/v1/invoices` admits `/v1/invoices/49`, not `/v1/invoices-archived` or
+  `/v1/refunds`); the path is normalised first (query stripped, percent-decoded,
+  `..` collapsed) because the upstream rewrites `/v1/invoices/../refunds` and
+  decodes `/v1/invoices/%2e%2e/refunds` to the same thing before it dispatches,
+  and the refusal has to be about the path actually served. A
+  request on a registered host but under none of its prefixes is refused with
+  `403` naming the prefixes, before the key is rendered and before anything is
+  forwarded or settled. A route written without a `prefix` keeps the whole
+  host, which is what the default `/` has always meant. `match_route`'s new
+  `path` argument is required rather than defaulted: a caller cannot ask for a
+  routing verdict without saying what it is routing, and a silent default
+  would reintroduce the hole as an omission rather than a design. The path is
+  normalised exactly once, because `urllib.parse.unquote` is not idempotent:
+  `/v1%252finvoices/49` decodes to `/v1%2finvoices/49` on the first pass and to
+  `/v1/invoices/49` on the second, and the gateway was normalising in
+  `match_route` and again in `_path_under_prefix`, so a doubly-encoded
+  separator made the boundary see the invoice path, spend the claim, and write
+  evidence that the invoice was sent while the upstream, which decodes once,
+  served one literal segment that never reached the invoice endpoint. The
+  verdict is now taken on the raw request line, which is what the upstream
+  decodes.
+- **`resume --pinning` compares against the archived pinning, so a compacted
+  run stops reporting every key as newly pinned (#1126).** The drift display
+  folded the live event tail alone, and compaction moves the pinning-carrying
+  `ACTION_RECORDED` into `events_archive` while the anchor marker that replaces
+  it carries no pinning at all. The fold therefore read `{}` as the run's
+  recorded identity and `pinning_drift({}, current)` called every key newly
+  pinned -- including on a run whose recorded pinning was byte-identical to the
+  one passed at resume. The wrong directions were exactly the ones an operator
+  would act on: a genuinely *changed* hash
+  rendered as "newly pinned" instead of "changed", hiding the previous value,
+  and a key that had been unpinned never rendered at all, because the
+  `unpinned (was ...)` line needs the old value the empty record could not
+  supply. The display is informational and never gated recovery (issue #241),
+  but it was wrong in the direction of hiding drift, which is the opposite of
+  what a drift report is for. `latest_pinning` now folds `read_all_events`, the
+  same history the assess (#1050) and watch (#1072) folds already read.
+- **`continuum mcp doctor` names the directory the console script is installed
+  into, not the one the venv python symlinks to.** `_scripts_dir()` took
+  `Path(sys.executable).resolve().parent`, but a venv's `python` is a symlink
+  to the base interpreter and resolving it walks past the venv to that
+  interpreter's `bin` -- a directory that holds neither the script nor the one
+  an operator should add to PATH. Windows has the same shape one level over:
+  scripts install into `Scripts` beside the executable, not beside it. It now
+  reads `sysconfig.get_path("scripts")`, which reports the directory the
+  install actually uses on both platforms. The bug was invisible to the suite
+  because the test module recomputed the same expression for its own
+  expectations, so both sides agreed on the wrong directory; that constant now
+  comes from the function under test, and
+  `tests/test_mcp_doctor.py::test_scripts_dir_follows_the_venv_not_the_symlink`
+  installs a real symlinked python and asserts the old logic's answer for it
+  is wrong.
+- **The content-addressed snapshot store now rejects a key that is not a digest
+  before it is joined into a path, so a traversal string cannot turn `rewind`
+  into a file-read primitive (#1268).** `snapshot_path` built its storage
+  location by pure concatenation, so a `sha256` containing `../` escaped
+  `.continuum/file-snapshots` and landed anywhere the process could reach;
+  `restore_file` then copied whatever that path pointed at over a workspace
+  file, and `snapshot_path(key).exists()` was an existence oracle for the same
+  range. The write side of this store was hardened in #1110 (issue #1077), which
+  closed filing content under a digest it does not have without touching the
+  read side -- the worse direction, reached through `continuum rewind`, the
+  command whose purpose is to restore trusted content. A key is now only a name
+  here when it is a 64-char lowercase hex digest: `snapshot_path` raises
+  `ValueError`, `snapshot_file` and `restore_file` fail closed to their existing
+  `None`/`False` contracts so a caller that does not catch still cannot reach
+  `copyfile`, and `rewind` reports the poisoned key as unrecoverable rather than
+  following it. Stated honestly, no shipped CLI or MCP path lets an agent plant
+  such a string today -- every `TOOL_COMPLETED` writer computes its own digest
+  -- so this is a defect in the sink, not a complete exploit chain; it is worth
+  closing because the content-addressed contract the store relies on was
+  enforced nowhere on the side that copies bytes into the workspace.
+- **The Postgres action index no longer reads as permanently dirty on an
+  ordinary store (#1321).** `action_index_drift` compares the projection
+  against a canonical fold of the log, and the two sides numbered each row on
+  different scales: `_maintain_action_index` takes `nextval` on a sequence
+  that advances once per action event, while the fold numbered a row by its
+  position in the merged row stream, which counts `RUN_STARTED`,
+  `TOOL_CALLED`, `EVIDENCE_ADDED` and every other non-action row too. A
+  normal run has those between its actions, so the two disagreed by one per
+  intervening row and `continuum verify --index` reported a corrupted
+  projection on a store nothing had tampered with, with `--repair-index` no
+  help because a rebuild rewrote the rows with the fold's numbers and the
+  next appended action put them straight back out of step. The fold now
+  counts action events only, 1-based, which is exactly the number the
+  sequence assigned. SQLite was immune -- both sides there use the writing
+  event's `rowid` -- and a regression test now pins that agreement.
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
@@ -1011,7 +1171,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,440 collected, ~2,411 passed, ~28 skipped on a minimal env).
+  (~2,950 collected, ~2,870 passed, ~36 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
