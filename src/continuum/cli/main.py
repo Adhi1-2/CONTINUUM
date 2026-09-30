@@ -3366,8 +3366,20 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         return ExitCode.OK if authority_report.valid is True else ExitCode.REQUIRES_HUMAN
 
     pending = ActionLedger(storage, args.run_id).pending()
-    report = settle_run(storage, args.run_id, probes, dry_run=args.dry_run)
-    payload: dict[str, Any] = {"run_id": args.run_id, "dry_run": args.dry_run, **report.as_dict()}
+    report = settle_run(storage, args.run_id, probes, dry_run=args.dry_run, strict=args.strict)
+    # Discrepancy pass (issue #268): evidence that contradicts the ledger is a
+    # review finding, never a silent re-settlement. Only artifact_check probes
+    # have an independent reality to check against.
+    from continuum.evidence import detect_discrepancies
+
+    discrepancies = detect_discrepancies(storage, args.run_id, probes, flag=not args.dry_run)
+    payload = {
+        "run_id": args.run_id,
+        "dry_run": args.dry_run,
+        "strict": args.strict,
+        **report.as_dict(),
+        "discrepancies": [d.as_dict() for d in discrepancies],
+    }
     lines = [
         f"pending actions: {len(pending)}, "
         f"settled: {report.settled} "
@@ -3377,39 +3389,8 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
     ]
     for action_type, detail in report.unresolved:
         lines.append(f"  [!!] {action_type}: {detail}")
-
-    # Plugin pass (issue #765): only actions the probes left pending are seen
-    # here, so a probe's settlement is never revisited or contradicted.
-    unresolved_after_plugins = 0
-    if plugins:
-        from continuum.plugins.reconcile import (
-            ReconciliationOutcome,
-            settle_with_reconcilers,
-        )
-
-        # Counted before the pass: an action the plugins escalate to
-        # REQUIRES_REVIEW leaves `pending()` (which only lists STARTED and
-        # UNKNOWN), so re-reading the ledger afterwards would report an
-        # escalated conflict as resolved and exit OK on a run a human must see.
-        open_before = len(ActionLedger(storage, args.run_id).pending())
-        plugin_report = settle_with_reconcilers(storage, args.run_id, plugins, dry_run=args.dry_run)
-        payload["plugins"] = plugin_report.as_dict()
-        unresolved_after_plugins = open_before - plugin_report.settled
-        lines.append(
-            f"plugin reconcilers: {len(plugins)} registered, "
-            f"settled: {plugin_report.settled} "
-            f"(occurred {len(plugin_report.settled_true)}, "
-            f"not-occurred {len(plugin_report.settled_false)}), "
-            f"escalated: {len(plugin_report.escalated)}"
-        )
-        for assessment in plugin_report.assessments:
-            # Only the escalated ones carry the warning sigil: a confirmed
-            # outcome is good news and must not render red in the terminal.
-            rendered = assessment.render().splitlines()[0]
-            if assessment.outcome is ReconciliationOutcome.CONFIRMED_OCCURRED:
-                lines.append(f"  [ok] {rendered}")
-            else:
-                lines.append(f"  [!!] {rendered}")
+    for finding in discrepancies:
+        lines.append(f"  [!!] {finding.action_type}: {finding.detail}")
     if args.dry_run:
         lines.append("dry run: nothing was written")
     _emit(
@@ -3419,7 +3400,9 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         stream=out,
         palette=getattr(args, "_palette", None),
     )
-    remaining = unresolved_after_plugins if plugins else len(pending) - report.settled
+    remaining = len(pending) - report.settled
+    if discrepancies:
+        return ExitCode.REQUIRES_HUMAN
     return ExitCode.OK if remaining <= 0 else ExitCode.REQUIRES_HUMAN
 
 
@@ -4658,6 +4641,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_auto.add_argument(
         "--dry-run", action="store_true", help="report what probes would settle, write nothing."
+    )
+    reconcile_auto.add_argument(
+        "--strict",
+        action="store_true",
+        help="escalate actions a probe could not settle to requires-review "
+        "instead of leaving them pending (issue #268).",
     )
     reconcile_auto.add_argument(
         "--config",
