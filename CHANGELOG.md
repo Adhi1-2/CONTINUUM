@@ -107,21 +107,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-<<<<<<< HEAD
-- **The TUI and dashboard `complete` verbs now perform the whole verb (#1153).**
-  Only `continuum complete` appended `REVIEW_CONFIRMED`, flipped the run row,
-  and cleared `.continuum/resume.json`; the TUI skipped the file, and the
-  dashboard skipped both the file and the confirmation. A run closed from the
-  dashboard left the resume file pointing at finished work, so the next
-  session's instant-resume fast path landed the operator back in the run they
-  had just closed, the exact hijack `cmd_complete` exists to prevent; and a
-  dashboard-closed externally-driven run stayed self-certified, because the
-  event that clears that marker never landed. The tail now lives in
-  `continuum.runs.close_run` and all three surfaces call it, so the events,
-  the row flip, and the cleanup cannot drift apart again. The resume delete
-  stays conditional on the file naming the run being closed, and an unreadable
-  file still does not block completing a run.
-=======
+- **The Postgres backend now persists and returns `runs.parent_run_id` (#1079).**
+  The column was declared in the schema but both inserts (`create_run` and
+  `create_run_started`) omitted it and `_row_to_run` did not read it, so a
+  fork's lineage was silently dropped on write and came back as the model
+  default `None` even for a row that had a value. `children_of` filters
+  `list_runs` on that column, so it always returned empty on Postgres,
+  `roll_up_children` never reported a family block, and the rule both the CLI
+  and the TUI render ("a parent may not RESUME while any child is unsafe")
+  could not fire. The SQLite backend already did all three; the schema needed
+  no change, so existing Postgres databases are fixed on their next write and
+  the foreign-key constraint that was declared but never exercised now holds.
+  A deployment would have looked healthy and simply never blocked a parent
+  over an unsafe child, with no error anywhere.
+
+  Added a Postgres contract test that forks and asserts `children_of` returns
+  the child through the query the roll-up reads, not just the column, and
+  strengthened the SQLite family test to assert the same. Nothing caught the
+  gap before because the SQLite tests covered the round-trip and the Postgres
+  suite never forked.
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
