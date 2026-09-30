@@ -14,7 +14,7 @@ ruff format --check src/ tests/ examples/ scripts/ demo-run/
 mypy src/continuum                     # strict type check
 ```
 
-On the current main branch, collection reports approximately 2,934 tests; the
+On the current main branch, collection reports approximately ~2,781 tests; the
 exact count and pass/skip totals vary with Python version, platform, optional
 dependencies, and external services.
 
