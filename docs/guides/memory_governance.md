@@ -147,17 +147,18 @@ When a run is bound to a tenant identity, only keys whose `tenant` field matches
 Every memory write is a ledger row keyed by tenant namespace. Enumeration is therefore a filter:
 
 ```bash
-continuum actions <run> --json | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if 'mem:' in a['action_id']])"
+# --json is a global flag: it goes before the subcommand, not after it
+continuum --json actions <run> | python -c "import json,sys; data=json.load(sys.stdin); print([a for a in data['actions'] if 'mem:' in a['action_id']])"
 ```
 
 `continuum forget --tenant X` builds on this enumeration to list exactly what to delete externally and to append a tombstone event:
 
 ```bash
 # Dry run: list what would be tombstoned
-continuum forget --tenant acme --dry-run --json | python -m json.tool
+continuum --json forget --tenant acme --dry-run | python -m json.tool
 
 # Tombstone and keep audit trail
-continuum forget --tenant acme --reason "gdpr request" --json
+continuum --json forget --tenant acme --reason "gdpr request"
 continuum verify <run_id>  # still passes, chain keeps hashes
 ```
 
@@ -182,8 +183,8 @@ Chain verification keeps hashes, so logical deletion does not break `verify()`. 
 
 ```bash
 pytest tests/test_memory_gate_keys.py -q
-ruff check src/ tests/ examples/
-ruff format --check src/ tests/ examples/
+ruff check src/ tests/ examples/ benchmarks/ scripts/ demo-run/
+ruff format --check src/ tests/ examples/ benchmarks/ scripts/ demo-run/
 mypy src/continuum --ignore-missing-imports
 # also verify no em dashes in changed files
 rg -n "$(printf '\\u2014')" src/ tests/ docs/ examples/ benchmarks/
