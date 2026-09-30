@@ -833,9 +833,14 @@ _NON_PROJECTING = frozenset(
         # observer. Success or failure of a side channel is not state.
         EventType.NOTIFICATION_SENT,
         EventType.NOTIFICATION_FAILED,
-        # memory (issue #1169): a tombstone records that a memory entry was
-        # retired; it is a deletion record, not a projection input.
-        EventType.MEMORY_TOMBSTONED,
+        # subagent spanning: delegation-chain trace the provenance and adapter
+        # surfaces read back; a span records what happened, not run state.
+        EventType.SUBAGENT_SPAWNED,
+        EventType.SUBAGENT_COMPLETED,
+        EventType.SUBAGENT_FAILED,
+        # context compaction: a marker the validator reads to report what a
+        # compaction kept; the fold reads its effect off the log boundary.
+        EventType.PRECOMPACT_HOOK,
     }
 )
 

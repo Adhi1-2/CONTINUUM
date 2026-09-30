@@ -465,7 +465,6 @@ class RecoveryEngine:
             exhausted_dependencies=exhausted_dependencies,
             run_budget_exhausted=run_budget_exhausted,
         )
-        # Liveness: silence as WAIT, never auto-rollback (issue #302)
         liveness_advisory = None
         liveness_breaches = 0
         try:
