@@ -576,27 +576,11 @@ Open an issue before submitting large PRs. See [CONTRIBUTING.md](CONTRIBUTING.md
 
 ### Contributors
 
-<a href="https://github.com/Cyrax321/CONTINUUM/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Cyrax321/CONTINUUM" />
-</a>
+Thanks to our contributors, ordered by commits landed on `main`.
+Each avatar links to that contributor's GitHub profile.
 
-Thanks to our community contributors, ordered by contributions:
-[@Adhi1-2](https://github.com/Adhi1-2), [@abyyxhek](https://github.com/abyyxhek),
-[@Amiirhosseini](https://github.com/Amiirhosseini), [@yuki-fuyutsuki](https://github.com/yuki-fuyutsuki),
-[@vjymisal0](https://github.com/vjymisal0), [@adity982](https://github.com/adity982),
-[@dchaudhari7177](https://github.com/dchaudhari7177), [@tasodoufu](https://github.com/tasodoufu),
-[@anya-research](https://github.com/anya-research), [@lesbass](https://github.com/lesbass),
-[@Parthipashok04](https://github.com/Parthipashok04), [@Samearth17](https://github.com/Samearth17),
-[@stoppo22](https://github.com/stoppo22),
-[@timothyanderson096-ocdealcheck](https://github.com/timothyanderson096-ocdealcheck),
-[@unmoha](https://github.com/unmoha), [@aastha-m22](https://github.com/aastha-m22),
-[@as950118](https://github.com/as950118), [@asarakhatun17-lgtm](https://github.com/asarakhatun17-lgtm),
-[@challenge456](https://github.com/challenge456),
-[@gouthamkrishnak2003](https://github.com/gouthamkrishnak2003), [@ItzSaurav](https://github.com/ItzSaurav),
-[@mhaye9545](https://github.com/mhaye9545), [@Newer1107](https://github.com/Newer1107),
-[@okestroHjJeong](https://github.com/okestroHjJeong), [@quangshuynh](https://github.com/quangshuynh), [@Rahul-pamula](https://github.com/Rahul-pamula),
-[@Shaisolaris](https://github.com/Shaisolaris), [@VedantMadane](https://github.com/VedantMadane),
-[@zynx-real](https://github.com/zynx-real).
+<a href="https://github.com/Adhi1-2"><img src="https://wsrv.nl/?url=github.com/Adhi1-2.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Adhi1-2" /></a><a href="https://github.com/thezeesj"><img src="https://wsrv.nl/?url=github.com/thezeesj.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="thezeesj" /></a><a href="https://github.com/abyyxhek"><img src="https://wsrv.nl/?url=github.com/abyyxhek.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="abyyxhek" /></a>
+
 
 ## Sponsor
 
