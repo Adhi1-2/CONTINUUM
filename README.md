@@ -576,6 +576,10 @@ Open an issue before submitting large PRs. See [CONTRIBUTING.md](CONTRIBUTING.md
 
 ### Contributors
 
+<a href="https://github.com/Cyrax321/CONTINUUM/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Cyrax321/CONTINUUM" />
+</a>
+
 Thanks to our contributors, ordered by commits landed on `main`.
 Each avatar links to that contributor's GitHub profile.
 
@@ -589,8 +593,10 @@ Each avatar links to that contributor's GitHub profile.
 <a href="https://github.com/chshiv"><img src="https://wsrv.nl/?url=github.com/chshiv.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="chshiv" /></a><a href="https://github.com/Shaisolaris"><img src="https://wsrv.nl/?url=github.com/Shaisolaris.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Shaisolaris" /></a><a href="https://github.com/Gambit-Checkmate"><img src="https://wsrv.nl/?url=github.com/Gambit-Checkmate.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Gambit-Checkmate" /></a><a href="https://github.com/Newer1107"><img src="https://wsrv.nl/?url=github.com/Newer1107.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Newer1107" /></a>
 <a href="https://github.com/Rahul-pamula"><img src="https://wsrv.nl/?url=github.com/Rahul-pamula.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Rahul-pamula" /></a><a href="https://github.com/quangshuynh"><img src="https://wsrv.nl/?url=github.com/quangshuynh.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="quangshuynh" /></a><a href="https://github.com/theluckystrike"><img src="https://wsrv.nl/?url=github.com/theluckystrike.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="theluckystrike" /></a><a href="https://github.com/Diogo-Damasceno"><img src="https://wsrv.nl/?url=github.com/Diogo-Damasceno.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Diogo-Damasceno" /></a>
 <a href="https://github.com/InnoxCodes"><img src="https://wsrv.nl/?url=github.com/InnoxCodes.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="InnoxCodes" /></a><a href="https://github.com/Bipin583"><img src="https://wsrv.nl/?url=github.com/Bipin583.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Bipin583" /></a><a href="https://github.com/Ava-91"><img src="https://wsrv.nl/?url=github.com/Ava-91.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="Ava-91" /></a><a href="https://github.com/asarakhatun17-lgtm"><img src="https://wsrv.nl/?url=github.com/asarakhatun17-lgtm.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="asarakhatun17-lgtm" /></a>
-<a href="https://github.com/challenge456"><img src="https://wsrv.nl/?url=github.com/challenge456.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="challenge456" /></a><a href="https://github.com/bernalalexis-try"><img src="https://wsrv.nl/?url=github.com/bernalalexis-try.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="bernalalexis-try" /></a>
+<a href="https://github.com/challenge456"><img src="https://wsrv.nl/?url=github.com/challenge456.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="challenge456" /></a><a href="https://github.com/bernalalexis-try"><img src="https://wsrv.nl/?url=github.com/bernalalexis-try.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="bernalalexis-try" /></a><a href="https://github.com/aastha-m22"><img src="https://wsrv.nl/?url=github.com/aastha-m22.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="aastha-m22" /></a><a href="https://github.com/okestroHjJeong"><img src="https://wsrv.nl/?url=github.com/okestroHjJeong.png&amp;w=64&amp;h=64&amp;mask=circle&amp;fit=cover&amp;maxage=1w" width="32" height="32" alt="okestroHjJeong" /></a>
 
+Order comes from the GitHub contributors API, excluding the creator and
+the automation accounts (`dependabot`, `github-actions`).
 
 ## Sponsor
 
