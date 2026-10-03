@@ -248,7 +248,10 @@ class RecoveryEngine:
         *,
         validator: StateValidator | None = None,
         strict_unknown: bool = True,
+        validation_rules: Iterable[ValidationRule] | None = None,
+        registry: Registry | None = None,
         ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
     ) -> None:
         """Build an engine.
 
@@ -269,6 +272,14 @@ class RecoveryEngine:
         self.ledger = ledger
         self.dependency_budgets = dependency_budgets
         self._manager = CheckpointManager(storage)
+        self._validation_rules: tuple[object, ...] = tuple(validation_rules or ())
+        if registry is not None:
+            registered = tuple(
+                service
+                for service in registry.all_matching(ValidationRule)
+                if isinstance(service, ValidationRule)
+            )
+            self._validation_rules = (*self._validation_rules, *registered)
         # Optional (issue #744): a recovery ledger to read the attempt budget
         # from. Absent it, contracts carry no budget line and every decision is
         # byte-identical to before. Present, it is only ever read here: spending
@@ -286,6 +297,8 @@ class RecoveryEngine:
         scope: Iterable[str] | None = None,
         source_graph: SourceDependencyGraph | None = None,
         validation_rules: Iterable[ValidationRule] | None = None,
+        ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
     ) -> RecoveryDecision:
         """Decide how ``run_id`` may resume, without changing anything.
 
@@ -464,6 +477,43 @@ class RecoveryEngine:
             validation = apply_rule_findings(
                 validation, rule_findings, strict_unknown=self.validator.strict_unknown
             )
+
+        active_ledger = ledger if ledger is not None else self.ledger
+        active_budgets = dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        if active_budgets is None and active_ledger is not None:
+            try:
+                from pathlib import Path
+
+                from continuum.budgets import DEFAULT_BUDGETS_PATH, load_budgets
+
+                active_budgets = load_budgets(Path(DEFAULT_BUDGETS_PATH))
+            except Exception:
+                active_budgets = None
+
+        exhausted_dependencies: set[str] = set()
+        run_budget_exhausted = False
+        if active_ledger is not None:
+            run_budget_exhausted = active_ledger.requires_human(
+                run_id, dependency_budgets=active_budgets
+            )
+            candidate_deps: set[str] = set()
+            if scope is not None:
+                candidate_deps.update(scope)
+            else:
+                from continuum.models import Component
+
+                for entry in validation.report.statuses:
+                    if entry.component == Component.EXTERNAL_DEPENDENCY and entry.component_id:
+                        candidate_deps.add(entry.component_id)
+                for a in uncertain:
+                    if a.dep_scope:
+                        candidate_deps.add(a.dep_scope)
+
+            for dep in candidate_deps:
+                if active_ledger.requires_human(
+                    run_id, dependency=dep, dependency_budgets=active_budgets
+                ):
+                    exhausted_dependencies.add(dep)
 
         plan = plan_repairs(
             validation.report.statuses,

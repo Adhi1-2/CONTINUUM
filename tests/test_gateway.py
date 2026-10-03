@@ -167,7 +167,7 @@ def test_a_truncated_upstream_reply_settles_the_claim_uncertain(
     class _TruncatedResponse:
         status = 200
 
-        def read(self) -> bytes:
+        def read(self, n: int = -1) -> bytes:
             raise http.client.IncompleteRead(b"partial", 512)
 
     class _TruncatedConn:
