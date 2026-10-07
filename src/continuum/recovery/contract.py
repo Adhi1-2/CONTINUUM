@@ -45,6 +45,8 @@ __all__ = [
     "ContractVerification",
     "SUPPORTED_CONTRACT_VERSIONS",
     "build_contract",
+    "canonical_digest_input",
+    "contract_digest",
     "render_budget",
     "render_contract",
     "seal_contract",
@@ -373,10 +375,21 @@ def verify_contract(contract: RecoveryContract) -> bool:
     """
     if contract.integrity_hash is None:
         return False
-    return any(
-        contract.integrity_hash == stable_hash(_hashable_payload(contract, excluded=group))
-        for group in _ADDITIVE_FIELDS
-    )
+    return verify_contract_detailed(contract).verified
+
+
+def _namespaced(entry: ComponentValidationEntry) -> str:
+    """A component's evidence name, qualified by id and by the rule that spoke.
+
+    A rule's findings are namespaced by its identifier so an operator reading
+    ``invalidated`` or ``evidence`` can tell a built-in finding from a domain
+    one, and can see *which* domain rule spoke (issue #761). Built-in findings
+    carry no suffix and read exactly as before.
+    """
+    ident = f"{entry.component.value}{f':{entry.component_id}' if entry.component_id else ''}"
+    if not entry.rule:
+        return ident
+    return f"{ident} [rule:{entry.rule}]"
 
 
 def build_contract(
