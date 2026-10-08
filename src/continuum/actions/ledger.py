@@ -847,7 +847,7 @@ class ActionLedger:
             ActionStatus.FAILED,
             ActionStatus.COMPENSATED,
         )
-        if foreign_settles:
+        if foreign is not None and foreign_settles:
             return IdempotencyKey(idem), foreign
         if not explicit_key:
             matched = self._identity_match(action_type, arguments, volatile)
