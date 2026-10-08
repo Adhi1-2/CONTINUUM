@@ -479,7 +479,9 @@ class RecoveryEngine:
             )
 
         active_ledger = ledger if ledger is not None else self.ledger
-        active_budgets = dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        active_budgets = (
+            dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        )
         if active_budgets is None and active_ledger is not None:
             try:
                 from pathlib import Path
@@ -493,27 +495,34 @@ class RecoveryEngine:
         exhausted_dependencies: set[str] = set()
         run_budget_exhausted = False
         if active_ledger is not None:
-            run_budget_exhausted = active_ledger.requires_human(
-                run_id, dependency_budgets=active_budgets
-            )
-            candidate_deps: set[str] = set()
-            if scope is not None:
-                candidate_deps.update(scope)
-            else:
-                from continuum.models import Component
+            try:
+                run_budget_exhausted = active_ledger.requires_human(
+                    run_id, scope=scope, dependency_budgets=active_budgets
+                )
+                candidate_deps: set[str] = set()
+                if scope is not None:
+                    candidate_deps.update(scope)
+                else:
+                    from continuum.models import Component
 
-                for entry in validation.report.statuses:
-                    if entry.component == Component.EXTERNAL_DEPENDENCY and entry.component_id:
-                        candidate_deps.add(entry.component_id)
-                for a in uncertain:
-                    if a.dep_scope:
-                        candidate_deps.add(a.dep_scope)
+                    for entry in validation.report.statuses:
+                        if entry.component == Component.EXTERNAL_DEPENDENCY and entry.component_id:
+                            candidate_deps.add(entry.component_id)
+                    for a in uncertain:
+                        if a.dep_scope:
+                            candidate_deps.add(a.dep_scope)
 
-            for dep in candidate_deps:
-                if active_ledger.requires_human(
-                    run_id, dependency=dep, dependency_budgets=active_budgets
-                ):
-                    exhausted_dependencies.add(dep)
+                for dep in candidate_deps:
+                    if active_ledger.requires_human(
+                        run_id, dependency=dep, dependency_budgets=active_budgets
+                    ):
+                        exhausted_dependencies.add(dep)
+            except Exception:
+                # A degraded ledger must not brick recovery: the contract is
+                # then emitted without the budget line rather than changing
+                # the verdict.
+                run_budget_exhausted = False
+                exhausted_dependencies.clear()
 
         plan = plan_repairs(
             validation.report.statuses,

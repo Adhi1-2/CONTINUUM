@@ -639,12 +639,20 @@ class RecoveryLedger:
         dependency gets its own scoped attempt entry, and its own ceiling from
         ``dependency_budgets`` when present.
         """
-        deps = derive_recovery_dependencies(
-            dependency=dependency,
-            dependencies=dependencies,
-            contract=contract,
-            action=action,
-            scope=scope if isinstance(scope, Iterable) and not isinstance(scope, (str, bytes)) else None,
+        deps = (
+            derive_recovery_dependencies(
+                dependency=dependency,
+                dependencies=dependencies,
+                contract=contract,
+                action=action,
+            )
+            if (
+                dependency is not None
+                or dependencies is not None
+                or contract is not None
+                or action is not None
+            )
+            else []
         )
         if deps:
             if dependency_budgets is None:
@@ -772,18 +780,27 @@ class RecoveryLedger:
         recorded as an anchored GATE entry (see ``record_attempt``) rather than
         inferred from the number.
         """
-        deps = derive_recovery_dependencies(
-            dependency=dependency,
-            dependencies=dependencies,
-            contract=contract,
-            action=action,
-            scope=scope if isinstance(scope, Iterable) and not isinstance(scope, (str, bytes)) else None,
+        deps = (
+            derive_recovery_dependencies(
+                dependency=dependency,
+                dependencies=dependencies,
+                contract=contract,
+                action=action,
+            )
+            if (
+                dependency is not None
+                or dependencies is not None
+                or contract is not None
+                or action is not None
+            )
+            else []
         )
         if deps:
             return sum(
                 1
                 for e in self.entries(run_id)
-                if e.kind == LedgerEntryKind.ATTEMPT.value and e.scope in {_normalize_scope(d) for d in deps}
+                if e.kind == LedgerEntryKind.ATTEMPT.value
+                and e.scope in {_normalize_scope(d) for d in deps}
             )
         resolved = resolve_scope(scope)
         return sum(
@@ -813,12 +830,20 @@ class RecoveryLedger:
         answers the run-wide query, because an unknown-ownership caller cannot
         assume some other dependency's escalation is not its own (issue #744).
         """
-        deps = derive_recovery_dependencies(
-            dependency=dependency,
-            dependencies=dependencies,
-            contract=contract,
-            action=action,
-            scope=scope if isinstance(scope, Iterable) and not isinstance(scope, (str, bytes)) else None,
+        deps = (
+            derive_recovery_dependencies(
+                dependency=dependency,
+                dependencies=dependencies,
+                contract=contract,
+                action=action,
+            )
+            if (
+                dependency is not None
+                or dependencies is not None
+                or contract is not None
+                or action is not None
+            )
+            else []
         )
         if deps:
             if dependency_budgets is None:
@@ -829,9 +854,7 @@ class RecoveryLedger:
                 except Exception:
                     dependency_budgets = None
             for dep in deps:
-                limit = max_attempts_for_dependency(
-                    dependency_budgets, dep, fallback=max_attempts
-                )
+                limit = max_attempts_for_dependency(dependency_budgets, dep, fallback=max_attempts)
                 if limit is not None:
                     limit = _ceiling(limit, global_max_attempts)
                 resolved = _normalize_scope(dep)
