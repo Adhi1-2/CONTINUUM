@@ -52,7 +52,6 @@ from continuum.storage.blob import (
     load_blob_payload,
     maybe_offload_payload,
 )
-from continuum.storage.compaction import resolve_compaction_bound
 from continuum.storage.migrations import SCHEMA_VERSION, migrate_schema
 
 __all__ = ["SQLiteStorage", "SCHEMA_VERSION"]
@@ -647,7 +646,13 @@ class SQLiteStorage(Storage):
 
         return {"archived": max(archived, 0)}
 
-    def read_archived_events(self, run_id: str, *, upto: int | None = None) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Compacted events from the archive, oldest first."""
         query = "SELECT * FROM events_archive WHERE run_id = ?"
         params: list[Any] = [run_id]
@@ -657,13 +662,13 @@ class SQLiteStorage(Storage):
         query += " ORDER BY sequence ASC"
         with self._read() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [self._row_to_event(row) for row in rows]
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
 
     def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
         """Indexed cross-run ledger lookup (issue #216).
 
         O(log n) via the primary key instead of folding every run's events.
-        The newest row wins, matching the fold's last-write-per-key rule.
+        The newest row wins, matching the fold last-write-per-key rule.
         """
         with self._read() as conn:
             row = conn.execute(
@@ -685,7 +690,7 @@ class SQLiteStorage(Storage):
 
         The projection is keyed globally, so drift is a store-wide property:
         a run-scoped comparison would falsely flag rows owned by another
-        run's later write of the same key.
+        run later write of the same key.
         """
         expected = {
             key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
@@ -703,7 +708,7 @@ class SQLiteStorage(Storage):
         """Recompute the whole index from the log; returns corrected rows.
 
         Always global by design: keys live in one store-wide namespace, so a
-        per-run rewrite could collide with another run's legitimate row of
+        per-run rewrite could collide with another run legitimate row of
         the same key. A correction is any key whose stored row was missing,
         stale or spurious.
         """
@@ -735,14 +740,14 @@ class SQLiteStorage(Storage):
 
         The archive and the live log are one stream, not two segments.
         Compaction (#239) moves a run's prefix into ``events_archive`` while
-        other runs keep appending, so "everything archived is older than
-        everything live" holds only within a single run. Across runs it
+        other runs keep appending, so everything archived is older than
+        everything live holds only within a single run. Across runs it
         inverted write order and the fold stopped reproducing the number the
         incremental writer stored (#1322). The stream is now merged on
         ``(timestamp, run_id, sequence)``: ``timestamp`` is assigned at append
         time and copied into the archive verbatim, so it is global write order
         in every state of the store. The order value is
-        :func:`index_order_for` of the winning row's own timestamp -- the same
+        :func:`index_order_for` of the winning row own timestamp -- the same
         number the writer stored, not a position that rowid reuse or a fresh
         ``nextval`` can invalidate.
         """
@@ -974,9 +979,9 @@ class SQLiteStorage(Storage):
     def _audit_archive(
         self, conn: sqlite3.Connection, run_id: str, *, deep: bool = False
     ) -> tuple[list[IntegrityViolation], tuple[int, str] | None]:
-        """Deep-audit one run's archived prefix (issue #239).
+        """Deep-audit one run archived prefix (issue #239).
 
-        The archive holds the run's verbatim beginning, so it can be held to
+        The archive holds the run verbatim beginning, so it can be held to
         the full genesis standard: sequence 1 with no predecessor, unbroken
         sequencing and hash linkage throughout, and every stored hash equal
         to the recomputed digest. Returns the violations found plus the

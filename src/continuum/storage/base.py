@@ -192,8 +192,18 @@ class Storage(ABC):
                 f" at sequence {anchor_sequence}: the live log must retain its anchor"
             )
 
-    def read_archived_events(self, run_id: str, *, upto: int | None = None) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Read events moved into ``events_archive``, oldest first.
+
+        ``rehydrate`` forwards to the engine's payload rehydration path, so a
+        caller can inspect the raw offload descriptor instead of the blob it
+        names.
 
         Engines without an archive return an empty sequence, so a caller that
         wants "the whole recorded history" can concatenate this with
@@ -206,10 +216,16 @@ class Storage(ABC):
         it. Compaction exists to bound replay cost; an unbounded archive read
         would undo that.
         """
-        del run_id, upto
+        del run_id, upto, rehydrate
         return []
 
-    def read_all_events(self, run_id: str, *, upto: int | None = None) -> Sequence[Event]:
+    def read_all_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Full history including archived prefix, sorted by sequence.
 
         After compaction the live log holds only the anchor and tail; any
@@ -232,8 +248,8 @@ class Storage(ABC):
         keeps a windowed caller (``replay --upto``) from loading a month of
         archived history to look at its first event.
         """
-        archived = list(self.read_archived_events(run_id, upto=upto))
-        live = list(self.read_events(run_id, upto=upto))
+        archived = list(self.read_archived_events(run_id, upto=upto, rehydrate=rehydrate))
+        live = list(self.read_events(run_id, upto=upto, rehydrate=rehydrate))
         if not archived:
             return live
         if not live:

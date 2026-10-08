@@ -715,7 +715,13 @@ class PostgresStorage(Storage):
 
         return {"archived": max(archived, 0)}
 
-    def read_archived_events(self, run_id: str, *, upto: int | None = None) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Compacted events from the archive, oldest first."""
         query = "SELECT * FROM events_archive WHERE run_id = %s"
         params: list[Any] = [run_id]
@@ -725,7 +731,7 @@ class PostgresStorage(Storage):
         query += " ORDER BY sequence ASC"
         with self._read():
             rows = self._connection.execute(query, params).fetchall()
-        return [self._row_to_event(row) for row in rows]
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
 
     def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
         """Indexed cross-run ledger lookup (issue #216)."""
