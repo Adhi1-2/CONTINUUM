@@ -94,7 +94,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI 入口
 continuum-mcp --help             # MCP 服务器入口（需要 [mcp] 或 [dev]）
-pytest -q                        # 最小环境中约 2,460 个收集，约 2,361 个通过，约 41 个跳过（具体数量因环境而异）
+pytest -q                        # 最小环境中约 3,325 个收集，约 3,325 个通过，约 41 个跳过（具体数量因环境而异）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI 强制的三扇门禁
 ```
@@ -191,7 +191,7 @@ python demo-run/generate_crash_visual.py
 | 框架适配器 | 通用 Python、OpenAI Agents SDK、LangGraph 和 LangChain 集成 |
 | 安全规划循环 | 双信号观测验证将高风险分支提升至 REQUIRES_REVIEW |
 | 周期性重验证 | 按计划重新检查环境，在一个周期内捕获运行中漂移 |
-| 防篡改日志 | 哈希链事件日志（51 种事件类型）带完整性验证 |
+| 防篡改日志 | 哈希链事件日志（55 种事件类型）带完整性验证 |
 | 强制门控 | 未声明的副作用调用在触发前被拒绝，拒绝信息会教授声明协议 |
 | 观测钩子 | 编码 CLI 写入的每个文件都会成为摘要验证的证据，位于模型控制之外 |
 | 会话简报 | 全新会话在开始时确定性地学习运行状态，包括上一会话的推理摘要 |
@@ -399,7 +399,7 @@ Schema v6。SQLite 为主，Postgres 经 CI 验证。单一日志，多重投影
 
 | 表 | 用途 |
 |:--|:--|
-| `events` | 哈希链仅追加日志（51 种事件类型） |
+| `events` | 哈希链仅追加日志（55 种事件类型） |
 | `runs` | Run 元数据，带 `parent_run_id` 用于多智能体 |
 | `versions` | 每个检查点的 SemanticState 快照 |
 | `checkpoints` | 带 `RECOVERY` 锚点的密封检查点记录 |
@@ -513,7 +513,7 @@ CONTINUUM 位于持久执行、幂等副作用追踪和针对 LLM 智能体的�
 
 ## 状态与局限
 
-- **已测试**：在 2026-08-24 对本树的完整运行中为 1,360 通过 + 23 跳过，CI 在 Python 3.11、3.12 和 3.13 上强制执行套件，计数因平台和 Postgres 等可选服务而异（见 [STATUS.md](STATUS.md)）。MCP 面也已在真实协议上被对抗性审计，见 [test.md](test.md)。
+- **已测试**：在 2026-08-24 对本树的完整运行中为 3,325 通过 + 23 跳过，CI 在 Python 3.11、3.12 和 3.13 上强制执行套件，计数因平台和 Postgres 等可选服务而异（见 [STATUS.md](STATUS.md)）。MCP 面也已在真实协议上被对抗性审计，见 [test.md](test.md)。
 - **在 PyPI 上为 `continuum-agent` 0.1.2**（`pip install continuum-agent`，克隆仍可通过 `pip install .` 见 Quick Start）。
 - **MCP 调用者认证按部署可选。** 当设置 `CONTINUUM_MCP_TOKEN` 时，服务器会拒绝每个变更工具，除非调用者在 `initialize` 握手的 `_meta.authToken` 中出示该共享密钥，通过 `CONTINUUM_MCP_CLIENT_TOKENS`（`name:secret` 对）支持按调用者的密钥。未配置任何 token 时，鉴权仅按声明身份（历史默认值，为本地单用户使用保留）。
 - **通过 MCP 确认自我报告状态需要单独的密钥。** `continuum_confirm` 会拒绝每个调用者，直至操作员设置 `CONTINUUM_MCP_CONFIRM_TOKEN`，因为被允许记录进度的智能体不能同时被允许确认它。默认路径保持人类驱动：在主机上运行 `continuum confirm <run_id>`。

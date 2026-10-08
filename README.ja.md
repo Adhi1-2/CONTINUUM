@@ -95,7 +95,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI エントリーポイント
 continuum-mcp --help             # MCP サーバーエントリーポイント（[mcp] または [dev] が必要）
-pytest -q                        # 最小環境で約 2,460 件収集、約 2,361 件通過、約 41 件スキップ（正確な数は異なる）
+pytest -q                        # 最小環境で約 3,325 件収集、約 3,325 件通過、約 41 件スキップ（正確な数は異なる）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI が強制する三つのゲート
 ```
@@ -192,7 +192,7 @@ python demo-run/generate_crash_visual.py
 | フレームワークアダプター | 汎用 Python、OpenAI Agents SDK、LangGraph、LangChain 統合 |
 | 安全な計画ループ | 二信号の観測検証が高リスク分岐を REQUIRES_REVIEW に昇格させる |
 | 周期的な再検証 | 環境はスケジュールに従って再チェックされ、実行中のドリフトを一周期以内に捉える |
-| 改ざん証跡ログ | ハッシュチェーンイベントログ（51 種のイベントタイプ）と完全性検証 |
+| 改ざん証跡ログ | ハッシュチェーンイベントログ（55 種のイベントタイプ）と完全性検証 |
 | 強制ゲート | 未請求の副作用呼び出しは実行前に拒否され、拒否メッセージがクレームプロトコルを教える |
 | 観測フック | コーディング CLI が書き込むすべてのファイルはダイジェスト検証された証拠となり、モデル制御の外にある |
 | セッションブリーフィング | 新しいセッションは開始時に実行状態を決定的に学ぶ。前のセッションの推論サマリーを含む |
@@ -384,7 +384,7 @@ RESUME < REPAIR_AND_RESUME < REPLAN < WAIT < REQUEST_HUMAN < ROLLBACK < ABORT
 
 | テーブル | 目的 |
 |:--|:--|
-| `events` | ハッシュチェーンの追記専用ログ（51 種のイベントタイプ） |
+| `events` | ハッシュチェーンの追記専用ログ（55 種のイベントタイプ） |
 | `runs` | 親子用の `parent_run_id` を持つ実行メタデータ |
 | `versions` | チェックポイントごとの SemanticState スナップショット |
 | `checkpoints` | `RECOVERY` アンカーを持つ密封されたチェックポイント記録 |
@@ -498,7 +498,7 @@ CONTINUUM は耐久実行、冪等な副作用追跡、LLM エージェントの
 
 ## ステータスと制限
 
-- **テスト済み**：このツリーの 2026-08-24 監査での完全な実行で 1,360 合格 + 23 スキップ。CI は Python 3.11、3.12、3.13 でスイートを強制し、カウントはプラットフォームや Postgres などのオプションサービスにより異なる（[STATUS.md](STATUS.md) を参照）。MCP 面もライブプロトコル上で敵対的に監査済み。[test.md](test.md) を参照。
+- **テスト済み**：このツリーの 2026-08-24 監査での完全な実行で 3,325 合格 + 23 スキップ。CI は Python 3.11、3.12、3.13 でスイートを強制し、カウントはプラットフォームや Postgres などのオプションサービスにより異なる（[STATUS.md](STATUS.md) を参照）。MCP 面もライブプロトコル上で敵対的に監査済み。[test.md](test.md) を参照。
 - **PyPI では `continuum-agent` 0.1.2**（`pip install continuum-agent`、クローンは `pip install .` で依然として動作。クイックスタートを参照）。
 - **MCP 呼び出し元認証はデプロイごとに任意。** `CONTINUUM_MCP_TOKEN` が設定されているとき、サーバーは呼び出し元が `initialize` ハンドシェイクの `_meta.authToken` でその共有秘密を提示しない限り、すべての変更ツールを拒否する。呼び出し元ごとの秘密は `CONTINUUM_MCP_CLIENT_TOKENS`（`name:secret` ペア）経由で利用可能。トークンが何も設定されていない場合、認可は宣言されたアイデンティティのみによる（歴史的なデフォルト、ローカルな単一ユーザー利用のために保持）。
 - **MCP 経由で自己報告された状態を確認するには別の秘密が必要。** `continuum_confirm` はオペレーターが `CONTINUUM_MCP_CONFIRM_TOKEN` を設定するまで、すべての呼び出し元を拒否する。進捗を記録することを許されたエージェントがそれを確認することも許されてはならないからである。デフォルトのパスは人間に導かれたままである。ホストで `continuum confirm <run_id>` を実行する。
