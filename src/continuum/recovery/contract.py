@@ -215,7 +215,9 @@ def _liveness_digest_value(liveness: Any) -> Any:
     return liveness
 
 
-def _hashable_payload(contract: RecoveryContract, *, excluded: frozenset[str] = frozenset()) -> dict[str, Any]:
+def _hashable_payload(
+    contract: RecoveryContract, *, excluded: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """Payload the integrity hash covers.
 
     ``created_at`` is wall-clock metadata, not terms. ``liveness`` is reduced

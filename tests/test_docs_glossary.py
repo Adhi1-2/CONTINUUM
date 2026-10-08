@@ -53,7 +53,7 @@ EXPECTED: dict[tuple[str, int], tuple[str, str]] = {
     ("src/continuum/recovery/ledger.py", 220): ("anchor", "assign"),
     ("src/continuum/recovery/ledger.py", 504): ("RecoveryLedger", "decl"),
     ("src/continuum/recovery/ledger.py", 511): ("LeaseCoordinator", "ref"),
-    ("src/continuum/recovery/contract.py", 377): ("build_contract", "decl"),
+    ("src/continuum/recovery/contract.py", 395): ("build_contract", "decl"),
     ("src/continuum/recovery/engine.py", 464): ("check_admissibility", "ref"),
     ("src/continuum/recovery/impact.py", 53): ("DependencyGraph", "decl"),
     ("src/continuum/recovery/planner.py", 121): ("RepairPlan", "decl"),
