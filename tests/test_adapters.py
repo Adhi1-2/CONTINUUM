@@ -5,7 +5,7 @@ import pytest
 from continuum.adapters import AgentAdapter, GenericAgentAdapter
 from continuum.environment import StaticProvider, capture
 from continuum.events import EventType
-from continuum.models import Goal, Progress, RecoveryMode, SemanticState
+from continuum.models import Goal, Progress, RecoveryMode, Run, SemanticState
 from continuum.storage import SQLiteStorage
 
 
@@ -74,10 +74,18 @@ def test_start_run_produces_a_resumable_run(store: SQLiteStorage) -> None:
 def test_start_run_backfills_run_started_after_compaction(store: SQLiteStorage) -> None:
     # Compaction moves RUN_STARTED into events_archive, so the empty-log check
     # must read the archive first: a live-tail-only check would see an empty
-    # log and append a second RUN_STARTED, misordering the run's history.
+    # live log and append a second RUN_STARTED, misordering the run's history.
     adapter = GenericAgentAdapter(store)
     adapter.start_run(goal="Analyze documents", run_id="run_101c")
-    adapter.compact_context(run_id="run_101c", keep_last=0)
+    store.append_event("run_101c", EventType.TASK_UPDATED, {"note": "work began"})
+
+    assert store.compact_run("run_101c", through_sequence=1)["archived"] >= 1
+    live = store.read_events("run_101c")
+    assert not any(e.type is EventType.RUN_STARTED for e in live), (
+        "fixture: RUN_STARTED must be archived out of the live tail, which is "
+        "exactly the shape that defeats a live-tail-only check"
+    )
+    assert store.read_archived_events("run_101c")[0].type.value == "RUN_STARTED"
 
     run = adapter.start_run(goal="Analyze documents", run_id="run_101c")
 
@@ -89,9 +97,10 @@ def test_start_run_backfills_run_started_after_compaction(store: SQLiteStorage) 
 def test_start_run_refuses_to_misorder_an_existing_log(store: SQLiteStorage) -> None:
     # A log that already begins with something else cannot have its start
     # backfilled after the fact without lying about the run's history; fail
-    # loudly rather than projecting a state built on a misordered log.
+    # loudly rather than projecting a state built on a misordered log. The run
+    # row is created directly so the log's first event is not RUN_STARTED.
     adapter = GenericAgentAdapter(store)
-    adapter.start_run(goal="Analyze documents", run_id="run_101d")
+    store.create_run(Run(goal="Analyze documents", run_id="run_101d"))
     store.append_event("run_101d", EventType.TASK_UPDATED, {"note": "work began"})
 
     with pytest.raises(ValueError, match="does not begin with RUN_STARTED"):
