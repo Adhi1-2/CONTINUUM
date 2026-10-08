@@ -31,6 +31,21 @@ All notable changes to this project are documented here. The format follows
   budget read-only; without one every decision is unchanged.
 ### Fixed
 
+- **A probe that prints `occurred:false` is now told the separator is the
+  problem.** A command probe's verdict contract was documented only in the
+  module docstring, so the place an operator met it was the error, and the
+  error said `probe could not determine the outcome from output 'occurred:false'`
+  -- which sends someone hunting in their probe's logic when the cause is one
+  character away. `occurred:false` is the natural shape for a shell `echo` and
+  for most config formats, and it reads as unknown rather than as a verdict,
+  because the separator is `=`. The message now names the colon and shows the
+  line to print instead, and every other unparseable output carries the accepted
+  forms with it. The output contract is documented next to the registry schema
+  in `docs/api/cli.md` (the three verdicts, the JSON alternatives, the
+  last-non-empty-line rule, and the colon trap), and the authority probe's
+  `valid=` parser, which had the identical opaque message, gets the same
+  diagnosis.
+
 - **The gateway can finally reach a plain-HTTP upstream.** The transport was
   hardcoded: every route opened an `HTTPSConnection` and the recorded evidence
   stamped `https://` on the path, so an upstream that does not terminate TLS
