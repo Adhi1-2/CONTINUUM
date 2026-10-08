@@ -25,7 +25,6 @@ from typing import Any
 from continuum.models import (
     CONTRACT_VERSION,
     Component,
-    ComponentValidationEntry,
     RecoveryContract,
     RecoverySafety,
     StateStatus,
