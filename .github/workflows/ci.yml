@@ -161,10 +161,10 @@ jobs:
       - name: Ruff - lint
         # Issue #1118: scripts/ and demo-run/ were the last Python
         # directories outside every lint gate.
-        run: ruff check src/ tests/ examples/ scripts/ demo-run/
+        run: ruff check src/ tests/ examples/ scripts/ demo-run/ benchmarks/
 
       - name: Ruff - format check
-        run: ruff format --check src/ tests/ examples/ scripts/ demo-run/
+        run: ruff format --check src/ tests/ examples/ scripts/ demo-run/ benchmarks/
 
       - name: mypy, strict type-check
         run: mypy src/continuum
