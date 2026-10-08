@@ -843,11 +843,10 @@ class ActionLedger:
         # mid-flight on, already settles this claim. A foreign failure only
         # means nothing stands in the way of this run's own slot, so the
         # drift-tolerant lookup still gets its turn.
-        foreign_settles = foreign is not None and foreign.status not in (
+        if foreign is not None and foreign.status not in (
             ActionStatus.FAILED,
             ActionStatus.COMPENSATED,
-        )
-        if foreign_settles:
+        ):
             return IdempotencyKey(idem), foreign
         if not explicit_key:
             matched = self._identity_match(action_type, arguments, volatile)

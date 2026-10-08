@@ -17,14 +17,17 @@ shared.
 
 from __future__ import annotations
 
-from continuum.models import SemanticState
+from continuum.models import EnvironmentSnapshot, SemanticState
 from continuum.storage.base import Storage
 
 __all__ = ["resolve_compaction_bound"]
 
 
 def resolve_compaction_bound(
-    storage: Storage, run_id: str, through_sequence: int | None
+    storage: Storage,
+    run_id: str,
+    through_sequence: int | None,
+    environment: EnvironmentSnapshot | None = None,
 ) -> tuple[SemanticState, int]:
     """Anchor the run if needed, then return ``(version, through)``.
 
@@ -33,6 +36,14 @@ def resolve_compaction_bound(
     ``ValueError`` when the run cannot be anchored, when an explicit
     ``through_sequence`` would reach the anchor, or when there is nothing to
     archive.
+
+    The forced anchor records ``environment`` when supplied, else the
+    environment the run's newest checkpoint already recorded (#1049): an
+    environment-blind anchor becomes the newest checkpoint and the next
+    assessment marks every pinned dependency UNKNOWN, silently downgrading a
+    clean run to REQUEST_HUMAN. ``environment=None`` still inherits, matching
+    the SQLite engine's ``_anchor_environment``; pass an explicit ``None``
+    through ``compact_run`` only when inheriting is wrong.
     """
     # Local import: checkpoint.manager imports storage, so a module-level
     # import here would cycle.
@@ -43,7 +54,11 @@ def resolve_compaction_bound(
     needs_fresh_anchor = lv is None or through_sequence is not None or lv.source_sequence < head
     if needs_fresh_anchor:
         try:
-            CheckpointManager(storage).checkpoint(run_id, force_version=True)
+            CheckpointManager(storage).checkpoint(
+                run_id,
+                force_version=True,
+                environment=storage._anchor_environment(run_id, environment),
+            )
         except Exception as exc:
             raise ValueError(f"run {run_id!r} could not be anchored: {exc}") from exc
         lv = storage.latest_version(run_id)

@@ -687,7 +687,9 @@ class PostgresStorage(Storage):
         explicit ``through_sequence`` at or above the anchor marker is
         rejected here too instead of archiving and deleting it (issue #1078).
         """
-        storage_version, through = resolve_compaction_bound(self, run_id, through_sequence)
+        storage_version, through = resolve_compaction_bound(
+            self, run_id, through_sequence, environment=environment
+        )
 
         with self._write(), self._connection.transaction():
             self._append_chained(
