@@ -64,6 +64,7 @@ from continuum.gate import (
 from continuum.gate import (
     decide as gate_decide,
 )
+from continuum.mcp.install import HOST_PROFILES as MCP_HOST_PROFILES
 from continuum.models import (
     ActionStatus,
     EnvironmentSnapshot,
@@ -2994,6 +2995,190 @@ def cmd_gateway(args: argparse.Namespace, storage: Storage, out: Any, err: Any) 
     return ExitCode.OK
 
 
+def cmd_daemon(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Run CONTINUUM as a background daemon (gateway + watch).
+
+    Starts the enforcing HTTP gateway as a long-running process. Use
+    ``--detach`` to fork into the background and write a PID file.
+    """
+    import signal
+    import sys
+
+    from continuum.gateway import (
+        DEFAULT_GATEWAY_CONFIG_PATH,
+        GatewayConfigError,
+        GatewayServer,
+        load_gateway_config,
+        load_gateway_tenant,
+    )
+
+    config_path = Path(args.config) if args.config else Path(DEFAULT_GATEWAY_CONFIG_PATH)
+    try:
+        routes = load_gateway_config(config_path)
+    except GatewayConfigError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    if not routes:
+        print(
+            f"error: no upstreams registered in {config_path}; "
+            "the gateway refuses to start as an open relay",
+            file=err,
+        )
+        return ExitCode.ERROR
+
+    bound_tenant = getattr(args, "tenant", None) or load_gateway_tenant(config_path)
+    active = storage.get_active_run()
+    run_id = args.run_id or (active.run_id if active else None)
+    server = GatewayServer(
+        lambda: open_storage(args.db), run_id, routes, port=args.port, bound_tenant=bound_tenant
+    )
+
+    pid_file = Path(args.pid_file) if args.pid_file else Path(".continuum/daemon.pid")
+
+    if args.detach:
+        pid = os.fork()
+        if pid > 0:
+            print(f"CONTINUUM daemon started (pid {pid})", file=out)
+            print(f"  pid file: {pid_file}", file=out)
+            print(f"  gateway: 127.0.0.1:{server.port}", file=out)
+            return ExitCode.OK
+        os.setsid()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    print(
+        f"CONTINUUM daemon listening on 127.0.0.1:{server.port} "
+        f"({len(routes)} upstream route(s), run={run_id or 'dynamic'})",
+        file=err,
+    )
+    if args.detach:
+        print(f"  pid file: {pid_file}", file=err)
+
+    def _shutdown(signum: int, frame: Any) -> None:
+        server.shutdown()
+        if args.detach:
+            pid_file.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        if args.detach:
+            pid_file.unlink(missing_ok=True)
+    return ExitCode.OK
+
+
+def _mcp_settings_path(args: argparse.Namespace) -> Path:
+    """The file a ``mcp install``/``mcp remove`` acts on, per host and scope."""
+    profile = MCP_HOST_PROFILES[args.host]
+    if args.settings:
+        return Path(args.settings)
+    if args.scope == "project":
+        return Path(profile["project_settings"])
+    if args.scope == "user":
+        return Path(profile["user_settings"]).expanduser()
+    return Path(profile["local_settings"]).expanduser()
+
+
+def cmd_mcp_install(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Register the MCP server with a host, baking resolved values (issue #834)."""
+    from continuum.mcp.install import (
+        INSTALL_COMMAND,
+        SERVER_NAME,
+        display_command,
+        install_server,
+        resolve_command,
+        verify_sdk,
+    )
+
+    command, form = resolve_command()
+    sdk_ok, detail = verify_sdk(form)
+    if not sdk_ok:
+        print(
+            f"error: the mcp SDK is not importable by {sys.executable} ({detail}). "
+            "Refusing to register a server that cannot start.",
+            file=err,
+        )
+        print(f"Install it with: {INSTALL_COMMAND}", file=err)
+        return ExitCode.ERROR
+
+    db = Path(args.db or Path.cwd() / "continuum.db").resolve()
+    settings_path = _mcp_settings_path(args)
+    try:
+        status = install_server(
+            settings_path,
+            scope=args.scope,
+            project_root=Path.cwd(),
+            command=command,
+            db=db,
+            host=args.host,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+
+    lines = [
+        f"MCP server registered with {args.host} ({args.scope} scope)",
+        f"  [{status}] {SERVER_NAME} in {settings_path}",
+        f"    command: {display_command([*command, '--db', str(db)])}",
+        f"    form: {form} (resolved at install time, independent of the host's PATH)",
+    ]
+    _emit(
+        {
+            "host": args.host,
+            "scope": args.scope,
+            "settings": str(settings_path),
+            "server": SERVER_NAME,
+            "status": status,
+            "command": command,
+            "db": str(db),
+            "form": form,
+        },
+        "\n".join(lines),
+        as_json=args.json,
+        stream=out,
+        palette=getattr(args, "_palette", None),
+    )
+    return ExitCode.OK
+
+
+def cmd_mcp_remove(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Remove the MCP registration ``mcp install`` wrote (issue #834)."""
+    from continuum.mcp.install import SERVER_NAME, remove_server
+
+    settings_path = _mcp_settings_path(args)
+    try:
+        removed = remove_server(settings_path, scope=args.scope, project_root=Path.cwd())
+    except ValueError as exc:
+        print(f"error: {exc}", file=err)
+        return ExitCode.ERROR
+    text = (
+        f"Removed {SERVER_NAME} from {settings_path}"
+        if removed
+        else f"No CONTINUUM-registered {SERVER_NAME} in {settings_path}"
+    )
+    _emit(
+        {
+            "host": args.host,
+            "scope": args.scope,
+            "settings": str(settings_path),
+            "server": SERVER_NAME,
+            "removed": removed,
+        },
+        text,
+        as_json=args.json,
+        stream=out,
+        palette=getattr(args, "_palette", None),
+    )
+    return ExitCode.OK
+
+
 def cmd_hooks_install(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
     """Wire a coding CLI's tool events into observe (and optionally gate).
 
@@ -3781,7 +3966,7 @@ def cmd_replay(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             matches = state_fingerprint(at_stored) == state_fingerprint(stored)
             where = f"checkpoint v{stored.version} at sequence {stored.source_sequence}"
             verification = (
-                f"anchored run: {'matches' if matches else 'DOES NOT match'} stored {where}; "
+                f"anchored run: {'matches stored version' if matches else 'DOES NOT match stored version'} at {where}; "
                 f"{len(tail)} tail event(s) folded, prefix audited in events_archive"
             )
             payload = {
@@ -3794,7 +3979,8 @@ def cmd_replay(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             }
             _emit(
                 payload,
-                f"Anchored replay: folded {where} + {len(tail)} tail event(s)\n"
+                f"Replayed {len(events)} events -> {state.progress.completed} completed, "
+                f"{len(state.decisions)} decision(s), {len(state.findings)} finding(s)\n"
                 f"Verification: {verification}",
                 as_json=args.json,
                 stream=out,
@@ -4649,6 +4835,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the hook payload from this file instead of stdin.",
     )
 
+    mcp = add("mcp", cmd_mcp_install, "Register the MCP server with a host.")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", metavar="ACTION", required=True)
+
+    def mcp_options(p: argparse.ArgumentParser, func: Any) -> None:
+        p.add_argument(
+            "--host",
+            choices=tuple(MCP_HOST_PROFILES),
+            default="claude-code",
+            help="which host to configure (claude-code, gemini, cursor, vscode).",
+        )
+        p.add_argument(
+            "--scope",
+            choices=("local", "project", "user"),
+            default="local",
+            help=(
+                "where to register: 'local' is the per-user file for this project "
+                "(default, wins over the committed .mcp.json); 'project' is the "
+                "shared .mcp.json in the project root; 'user' is the global "
+                "user config that applies to all projects."
+            ),
+        )
+        p.add_argument(
+            "--settings",
+            default=None,
+            help="path to the host's settings file (default: per host and scope).",
+        )
+        p.set_defaults(func=func)
+
+    mcp_install = mcp_sub.add_parser(
+        "install", help="Register the MCP server. Mutates host config."
+    )
+    mcp_install.add_argument(
+        "--db",
+        default=None,
+        help="database path to bake, stored absolute (default: ./continuum.db).",
+    )
+    mcp_options(mcp_install, cmd_mcp_install)
+
+    mcp_remove = mcp_sub.add_parser(
+        "remove", help="Remove the registration mcp install wrote. Mutates host config."
+    )
+    mcp_options(mcp_remove, cmd_mcp_remove)
+
+    daemon_cmd = add(
+        "daemon",
+        cmd_daemon,
+        "Run CONTINUUM as a background daemon (gateway).",
+    )
+    daemon_cmd.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="gateway port (default: 8765).",
+    )
+    daemon_cmd.add_argument(
+        "--config",
+        default=None,
+        help="gateway config path (default: .continuum/gateway.json).",
+    )
+    daemon_cmd.add_argument(
+        "--tenant",
+        default=None,
+        help="tenant bound to the gateway.",
+    )
+    daemon_cmd.add_argument(
+        "--run-id",
+        default=None,
+        help="run ID to bind (default: active run).",
+    )
+    daemon_cmd.add_argument(
+        "--detach",
+        action="store_true",
+        help="fork into the background and write a PID file.",
+    )
+    daemon_cmd.add_argument(
+        "--pid-file",
+        default=None,
+        help="PID file path (default: .continuum/daemon.pid).",
+    )
+
     gateway_cmd = add(
         "gateway",
         cmd_gateway,
@@ -5090,7 +5356,15 @@ def main(
 
     # hooks never touches a run, so it must not create an empty database as a
     # side effect of editing a settings file.
-    if args.command in ("benchmark", "attest-keygen", "serve", "hooks", "notify-test"):
+    if args.command in (
+        "benchmark",
+        "attest-keygen",
+        "serve",
+        "hooks",
+        "notify-test",
+        "mcp",
+        "daemon",
+    ):
         return int(args.func(args, None, out, err))
 
     # A lineage token can be checked with no access to the source store at all:
