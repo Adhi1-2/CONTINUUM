@@ -806,8 +806,6 @@ _NON_PROJECTING = frozenset(
         # liveness (issue #302): silence detection and recovery, never state
         EventType.LIVENESS_SILENCE_DETECTED,
         EventType.LIVENESS_RECOVERED,
-        # risk (issue #303): real-time risk signal, never state
-        EventType.RISK_OBSERVED,
         # restore/merge lineage (issue #1169): markers that a run's history was
         # spliced, read by the CLI lineage views; the splice itself replays
         # events that carry the state change, the marker carries none.
@@ -841,6 +839,9 @@ _NON_PROJECTING = frozenset(
         # context compaction: a marker the validator reads to report what a
         # compaction kept; the fold reads its effect off the log boundary.
         EventType.PRECOMPACT_HOOK,
+        # memory: a tombstone records that something was deleted from the
+        # projected memory index, not that the assistant's state changed.
+        EventType.MEMORY_TOMBSTONED,
     }
 )
 
