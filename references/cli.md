@@ -36,9 +36,11 @@ continuum notify-test [run_id]                  # probe webhook wiring without a
 continuum gate                                   # pre-tool-use verdict: allow or deny
 continuum briefing                               # session-start context injection
 continuum gateway --port 8765                    # enforcing proxy for registered upstreams. mutates
+continuum daemon --port 8765                     # background gateway daemon
 continuum hooks install <client> [--with-gate]   # wire a coding CLI (claude-code, gemini, codex)
 continuum mcp install [--scope project]          # register the MCP server, resolved absolute. mutates
 continuum mcp remove                             # remove the registration install wrote. mutates
+continuum mcp doctor --timeout 15                 # diagnose host connection failures. read-only
 continuum health <run_id>                        # advisory prefix-trust health check
 continuum policy-review [run_id]                 # advisory recovery-history report by action type
 continuum impact <run_id> --evidence <id>        # downstream impact of an evidence item
