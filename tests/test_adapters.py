@@ -4,6 +4,7 @@ import pytest
 
 from continuum.adapters import AgentAdapter, GenericAgentAdapter
 from continuum.environment import StaticProvider, capture
+from continuum.events import EventType
 from continuum.models import Goal, Progress, RecoveryMode, SemanticState
 from continuum.storage import SQLiteStorage
 
@@ -40,6 +41,82 @@ def test_start_run_and_capture_restore_round_trip(store: SQLiteStorage) -> None:
     assert restored_state.run_id == "run_101"
     assert restored_state.progress.completed == 25
     assert restored_state.goal.description == "Analyze documents"
+
+
+def test_start_run_records_the_run_started_event_a_resume_needs(
+    store: SQLiteStorage,
+) -> None:
+    # The run row alone is not a resumable run: projection folds the event log
+    # and raises "the log never recorded RUN_STARTED" without this event, so
+    # resume() sees a run indistinguishable from one that crashed before
+    # writing anything. start_run is the adapter's documented entry point, so
+    # it must hand back a run that can actually be recovered.
+    adapter = GenericAgentAdapter(store)
+    run = adapter.start_run(goal="Analyze documents", run_id="run_101a")
+
+    events = store.read_events(run.run_id)
+    assert [e.type.value for e in events] == ["RUN_STARTED"]
+    assert events[0].payload["goal"] == "Analyze documents"
+
+
+def test_start_run_produces_a_resumable_run(store: SQLiteStorage) -> None:
+    adapter = GenericAgentAdapter(store)
+    run = adapter.start_run(goal="Analyze documents", run_id="run_101b")
+
+    restored = adapter.restore_state(run.run_id)
+    assert restored.run_id == run.run_id
+    assert restored.goal.description == "Analyze documents"
+
+    decision = adapter.resume(run.run_id)
+    assert decision.run_id == run.run_id
+
+
+def test_start_run_backfills_run_started_after_compaction(store: SQLiteStorage) -> None:
+    # Compaction moves RUN_STARTED into events_archive, so the empty-log check
+    # must read the archive first: a live-tail-only check would see an empty
+    # log and append a second RUN_STARTED, misordering the run's history.
+    adapter = GenericAgentAdapter(store)
+    adapter.start_run(goal="Analyze documents", run_id="run_101c")
+    adapter.compact_context(run_id="run_101c", keep_last=0)
+
+    run = adapter.start_run(goal="Analyze documents", run_id="run_101c")
+
+    assert run.run_id == "run_101c"
+    starts = [e for e in store.read_all_events(run.run_id) if e.type.value == "RUN_STARTED"]
+    assert len(starts) == 1
+
+
+def test_start_run_refuses_to_misorder_an_existing_log(store: SQLiteStorage) -> None:
+    # A log that already begins with something else cannot have its start
+    # backfilled after the fact without lying about the run's history; fail
+    # loudly rather than projecting a state built on a misordered log.
+    adapter = GenericAgentAdapter(store)
+    adapter.start_run(goal="Analyze documents", run_id="run_101d")
+    store.append_event("run_101d", EventType.TASK_UPDATED, {"note": "work began"})
+
+    with pytest.raises(ValueError, match="does not begin with RUN_STARTED"):
+        adapter.start_run(goal="Analyze documents", run_id="run_101d")
+
+
+def test_start_run_is_idempotent_for_an_existing_resumable_run(store: SQLiteStorage) -> None:
+    # Re-entering (a retry, or a second adapter instance on the same storage)
+    # must not append a second RUN_STARTED.
+    adapter = GenericAgentAdapter(store)
+    adapter.start_run(goal="Analyze documents", run_id="run_101e")
+
+    run = adapter.start_run(goal="Analyze documents", run_id="run_101e")
+
+    assert run.run_id == "run_101e"
+    starts = [e for e in store.read_all_events(run.run_id) if e.type.value == "RUN_STARTED"]
+    assert len(starts) == 1
+
+
+def test_start_run_generates_a_run_id_when_none_is_given(store: SQLiteStorage) -> None:
+    adapter = GenericAgentAdapter(store)
+    run = adapter.start_run(goal="Analyze documents")
+
+    assert run.run_id
+    assert store.read_events(run.run_id)
 
 
 def test_intercept_action_deduplicates_repeated_call(store: SQLiteStorage) -> None:
@@ -246,7 +323,6 @@ def test_generic_adapter_declares_dependencies_as_deterministic(
     store: SQLiteStorage,
 ) -> None:
     """GenericAgentAdapter writes trusted DETERMINISTIC state, including dependencies (issue #1391)."""
-    from continuum.events import EventType
     from continuum.models import Origin
     from continuum.state.semantic import project
 
@@ -313,7 +389,6 @@ def test_a_non_canonical_result_does_not_wedge_the_action(store: SQLiteStorage) 
 def test_a_non_canonical_result_does_not_break_recovery(store: SQLiteStorage) -> None:
     from decimal import Decimal
 
-    from continuum.events import EventType
 
     adapter = GenericAgentAdapter(store)
     adapter.start_run(goal="Charge card", run_id="run_108")

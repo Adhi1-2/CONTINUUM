@@ -19,17 +19,8 @@ class TestGenericCrashResumeParity:
     def test_generic_crash_mid_action_blocks_resume_and_dedupes_on_retry(
         self, store: SQLiteStorage
     ) -> None:
-        from continuum.events import EventType
-
         adapter = GenericAgentAdapter(store)
-        # Generic start_run does not backfill RUN_STARTED, so ensure it exists
-        from continuum.models import Run
-
-        try:
-            store.get_run("generic_crash_1")
-        except Exception:
-            store.create_run(Run(run_id="generic_crash_1", goal="generic crash"))
-            store.append_event("generic_crash_1", EventType.RUN_STARTED, {"goal": "generic crash"})
+        adapter.start_run(goal="generic crash", run_id="generic_crash_1")
         state = SemanticState(run_id="generic_crash_1", goal=Goal(description="generic crash"))
         env0 = capture("generic_crash_1", StaticProvider(gateway="v1"))
         adapter.capture_state("generic_crash_1", state, environment=env0)
