@@ -398,7 +398,6 @@ def test_a_non_canonical_result_does_not_wedge_the_action(store: SQLiteStorage) 
 def test_a_non_canonical_result_does_not_break_recovery(store: SQLiteStorage) -> None:
     from decimal import Decimal
 
-
     adapter = GenericAgentAdapter(store)
     adapter.start_run(goal="Charge card", run_id="run_108")
     store.append_event("run_108", EventType.RUN_STARTED, {"goal": "Charge card", "total": 1})
