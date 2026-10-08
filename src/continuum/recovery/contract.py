@@ -42,6 +42,8 @@ __all__ = [
     "CURRENT_CONTRACT_VERSION",
     "ContractVersionSpec",
     "ContractVerification",
+    "canonical_digest_input",
+    "contract_digest",
     "SUPPORTED_CONTRACT_VERSIONS",
     "build_contract",
     "render_budget",
