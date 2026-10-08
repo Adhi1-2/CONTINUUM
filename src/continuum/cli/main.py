@@ -3524,6 +3524,7 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
     un-settles what a probe decided, only advises on what it left open.
     """
     from continuum.actions.ledger import ActionLedger
+    from continuum.plugins import ReconciliationOutcome, settle_with_reconcilers
     from continuum.reconcilers import (
         DEFAULT_RECONCILERS_PATH,
         ReconcilerConfigError,
@@ -3582,6 +3583,12 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         )
         return ExitCode.OK if authority_report.valid is True else ExitCode.REQUIRES_HUMAN
 
+    plugin_report = (
+        settle_with_reconcilers(storage, args.run_id, plugins, dry_run=args.dry_run)
+        if plugins
+        else None
+    )
+
     pending = ActionLedger(storage, args.run_id).pending()
     report = settle_run(storage, args.run_id, probes, dry_run=args.dry_run, strict=args.strict)
     # Discrepancy pass (issue #268): evidence that contradicts the ledger is a
@@ -3597,6 +3604,8 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         **report.as_dict(),
         "discrepancies": [d.as_dict() for d in discrepancies],
     }
+    if plugin_report is not None:
+        payload["plugins"] = plugin_report.as_dict()
     lines = [
         f"pending actions: {len(pending)}, "
         f"settled: {report.settled} "
@@ -3604,6 +3613,20 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         f"unresolved: {len(report.unresolved)}, "
         f"no probe registered: {len(report.skipped_no_probe)}"
     ]
+    if plugin_report is not None:
+        lines.append(f"plugin reconcilers: {len(plugins)} registered")
+        lines.append(
+            f"settled: {plugin_report.settled} "
+            f"(occurred {len(plugin_report.settled_true)}, not-occurred {len(plugin_report.settled_false)})"
+        )
+        for item in plugin_report.assessments:
+            if item.outcome in (
+                ReconciliationOutcome.CONFIRMED_OCCURRED,
+                ReconciliationOutcome.CONFIRMED_NOT_OCCURRED,
+            ):
+                lines.append(f"  [ok] {item.action_type}: {item.reason}")
+            else:
+                lines.append(f"  [!!] {item.action_type}: {item.reason}")
     for action_type, detail in report.unresolved:
         lines.append(f"  [!!] {action_type}: {detail}")
     for finding in discrepancies:
@@ -3618,6 +3641,12 @@ def cmd_reconcile_auto(args: argparse.Namespace, storage: Storage, out: Any, err
         palette=getattr(args, "_palette", None),
     )
     remaining = len(pending) - report.settled
+    if plugin_report is not None:
+        if args.dry_run:
+            return ExitCode.OK
+        if plugin_report.escalated:
+            return ExitCode.REQUIRES_HUMAN
+        remaining -= plugin_report.settled
     if discrepancies:
         return ExitCode.REQUIRES_HUMAN
     return ExitCode.OK if remaining <= 0 else ExitCode.REQUIRES_HUMAN
