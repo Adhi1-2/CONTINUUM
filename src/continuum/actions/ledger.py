@@ -831,14 +831,24 @@ class ActionLedger:
             key=key,
         )
         existing = self.get(idem)
-        if existing is None and not scoped_to_run:
+        if existing is not None:
+            return IdempotencyKey(idem), existing
+
+        foreign: Action | None = None
+        if not scoped_to_run:
             # The local log has no such action, but an unscoped key claims
             # global identity, so another run may already hold it.
             foreign = self._foreign_action(idem)
-            if foreign is not None:
-                return IdempotencyKey(idem), foreign
-        if existing is not None:
-            return IdempotencyKey(idem), existing
+        # A foreign record that completed, or that another run is still
+        # mid-flight on, already settles this claim. A foreign failure only
+        # means nothing stands in the way of this run's own slot, so the
+        # drift-tolerant lookup still gets its turn.
+        foreign_settles = foreign is not None and foreign.status not in (
+            ActionStatus.FAILED,
+            ActionStatus.COMPENSATED,
+        )
+        if foreign_settles:
+            return IdempotencyKey(idem), foreign
         if not explicit_key:
             matched = self._identity_match(action_type, arguments, volatile)
             if matched is not None:
@@ -1322,13 +1332,15 @@ class ActionLedger:
 
         # STARTED or UNKNOWN: a previous attempt was interrupted.
         if on_unknown is not None:
-            resolved = on_unknown(existing)
-            if resolved is not None:
+            resolved_outcome = on_unknown(existing)
+            if resolved_outcome is not None:
                 # The resolution is a real decision and must outlive this call:
                 # persist it so the next claim (or intercept_action) and
                 # ledger.pending() reflect it instead of re-raising UnknownSideEffect.
-                self._record(resolved.key, resolved.action, EventType.ACTION_RECONCILED)
-                return resolved
+                self._record(
+                    resolved_outcome.key, resolved_outcome.action, EventType.ACTION_RECONCILED
+                )
+                return resolved_outcome
 
         uncertain = existing.model_copy(
             update={"status": ActionStatus.UNKNOWN, "side_effect_uncertain": True}
