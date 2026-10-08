@@ -3179,6 +3179,26 @@ def cmd_mcp_remove(args: argparse.Namespace, storage: Storage, out: Any, err: An
     return ExitCode.OK
 
 
+def _mcp_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a usable timeout") from exc
+    if not (timeout == timeout and timeout > 0 and timeout < float("inf")):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a usable timeout")
+    return timeout
+
+
+def cmd_mcp_doctor(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
+    """Diagnose why a host cannot connect to the MCP server."""
+    from continuum.mcp.doctor import render_doctor, run_doctor
+
+    report = run_doctor(timeout=args.timeout)
+    text = render_doctor(report)
+    _emit(report, text, as_json=args.json, stream=out, palette=getattr(args, "_palette", None))
+    return ExitCode.OK if report["healthy"] else ExitCode.ERROR
+
+
 def cmd_hooks_install(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -> int:
     """Wire a coding CLI's tool events into observe (and optionally gate).
 
@@ -4877,6 +4897,15 @@ def build_parser() -> argparse.ArgumentParser:
         "remove", help="Remove the registration mcp install wrote. Mutates host config."
     )
     mcp_options(mcp_remove, cmd_mcp_remove)
+
+    mcp_doctor = mcp_sub.add_parser("doctor", help="Diagnose MCP connection failures.")
+    mcp_doctor.add_argument(
+        "--timeout",
+        type=_mcp_timeout,
+        default=15.0,
+        help="handshake read timeout in seconds (default: 15).",
+    )
+    mcp_doctor.set_defaults(func=cmd_mcp_doctor)
 
     daemon_cmd = add(
         "daemon",
