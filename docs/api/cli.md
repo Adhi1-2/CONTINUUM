@@ -42,8 +42,10 @@ continuum --json <command>                    # machine-readable output
 | `briefing [--run-id <id>] [--raw-summary]` | Session-start context, curated by provenance: verified contract facts and system-derived lessons before agent-authored summaries, stale items quarantined with reasons. Read-only; `--raw-summary` is the diagnostic path to the verbatim agent summary (#742). |
 | `gate` | Decide whether a tool call may proceed (pre-tool-use hook). Read-only. |
 | `hooks` | Manage host-side observation hooks. |
+| `daemon` | Run CONTINUUM as a background gateway daemon. Mutates storage if detached. |
 | `mcp install` | Register the MCP server with a host, baking resolved absolute paths (issue #834). Mutates host config. |
 | `mcp remove` | Remove the registration `mcp install` wrote. Mutates host config. |
+| `mcp doctor` | Diagnose why a host cannot connect to the MCP server. Read-only. |
 | `verify <run_id>` | Re-audit the event chain for tampering. |
 | `reconcile <run_id>` | Settle uncertain actions with registered probes. Mutates storage. |
 | `actions <run_id>` | List recorded side effects and flag uncertain outcomes. |
@@ -72,7 +74,6 @@ continuum --json <command>                    # machine-readable output
 | `rewind` | Rewind workspace and projection to a checkpoint. |
 | `watch` | Watch a run for liveness breach, optionally notify via webhook. See [liveness watch](../guides/liveness-watch.md). |
 | `notify-test [run_id]` | POST a test notification to every endpoint in the webhook registry. Verifies wiring without a real blockage. See [webhooks](../guides/webhooks.md). |
-| `providers <ACTION> <run_id>` | Configure the environment providers a run trusts at resume (`add`, `remove`, `list`, `check`). `add`/`remove` mutate storage; `check` resolves exactly as resume would. See [configured providers](../guides/environment-providers.md). |
 
 ## Examples
 
