@@ -50,7 +50,7 @@ Every term here is used in issues and in code. Definitions point to the implemen
   The `.continuum/escalation.json` file that budgets human attention instead of spending it: an `hourly_prompt_cap`, a `batch_window_seconds` buffering window, a `blast_radius_threshold` above which an item skips batching and interrupts at once, and `risk_weights` per action type or resource class. Loaded by `load_escalation_policy` and scored by `evaluate_action_risk` in `src/continuum/recovery/escalation.py`. A missing file means the fail-safe default; a present but invalid file raises `EscalationPolicyError` rather than guessing a risk posture the operator never chose. Nothing reads it yet: the deferred review queue (#1410) and the fatigue telemetry (#1411) are its consumers.
 
 - **Authority probes**
-  External subprocess checks that settle whether a consumed authority is still valid. Configured in `reconcilers.json` and executed by `probe_authority_verdict` in `src/continuum/reconcilers.py:440`, fed the recorded consumption payload on stdin so verification never depends on the agent being assessed.
+  External subprocess checks that settle whether a consumed authority is still valid. Configured in `reconcilers.json` and executed by `probe_authority_verdict` in `src/continuum/reconcilers.py:498`, fed the recorded consumption payload on stdin so verification never depends on the agent being assessed.
 
 - **EXTERNAL_MONITOR**
   The `Origin` value (`src/continuum/models.py:255`) for facts observed by outside systems rather than asserted by the agent: risk witnesses, probe verdicts, liveness readings. Marks data the run consumes but no agent self-certified.
