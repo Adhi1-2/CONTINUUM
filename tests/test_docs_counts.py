@@ -165,6 +165,76 @@ def test_readme_module_and_file_counts_match_the_tree() -> None:
     )
 
 
+#: Prose forms of the fault-injection suite's size ("7-fault", "7 fault").
+#: ``faults.py`` is the ground truth and it imports nothing from ``continuum``
+#: (``dataclasses`` only), so the guard reads the corpus directly instead of
+#: trusting the generated bench block: the block is regenerated on demand and
+#: the prose is what a reader meets first (#1389).
+_FAULT_SUITE_RES = re.compile(r"(\d[\d,]*)\s*[- ]\s*fault\b")
+
+
+def _fault_class_count() -> int:
+    """``len(FAULT_CLASSES)``, read without importing the library.
+
+    The corpus module is stdlib-only, but its package ``__init__`` pulls in the
+    benchmark stack, so importing it the usual way would couple a docs guard to
+    the library being importable. The other guards here already prefer static
+    reads over imports (``_tree_module_count`` walks the tree, ``live_total``
+    shells out), and a doc guard that itself cannot run when the library is
+    broken would be the one moment a stale figure slips through.
+    """
+    import importlib.util
+
+    path = ROOT / "benchmarks" / "fault_injection" / "faults.py"
+    spec = importlib.util.spec_from_file_location("_fi_faults", path)
+    assert spec and spec.loader, f"could not load {path}"
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: the corpus is dataclasses, and ``@dataclass`` looks
+    # up ``sys.modules[cls.__module__]`` on Python 3.11+.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return len(module.FAULT_CLASSES)
+
+
+def test_readme_fault_suite_count_matches_the_corpus() -> None:
+    """The README's fault-injection figures are pinned to ``FAULT_CLASSES``.
+
+    The prose called the suite 8-fault while ``faults.py`` defined 7 and the
+    README's own generated bench block printed "7 scenarios" (#1389): an
+    over-count that survived the suite settling at 7, invisible to the
+    collected-total guard because it is not a test count. The same class of
+    drift as #688, in the opposite direction.
+    """
+    expected = _fault_class_count()
+    # A translation is free to state no count at all; one that states a wrong
+    # one fails, the same convention as OPTIONAL_FILES.
+    scanned = [ROOT / "README.md", *sorted(ROOT.glob("README.*.md"))]
+    for path in scanned:
+        text = path.read_text(encoding="utf-8")
+        stated = {int(m.replace(",", "")) for m in _FAULT_SUITE_RES.findall(text)}
+        for count in stated:
+            assert count == expected, (
+                f"{path.name} describes a {count}-fault risk-injection suite, but "
+                f"benchmarks/fault_injection/faults.py defines {expected} "
+                "FAULT_CLASSES: re-sync the prose, and regenerate the bench "
+                "block if the corpus itself changed"
+            )
+
+    # The generated ``<!-- BENCH:START -->`` block prints the runtime count, so
+    # the prose and the block must agree even before the corpus is touched.
+    bench_block = re.search(
+        r"Fault-injection:\s*(\d[\d,]*)\s*scenarios",
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+    )
+    assert bench_block, "README's generated bench block states no fault-injection count"
+    assert int(bench_block.group(1).replace(",", "")) == expected, (
+        f"README's generated bench block reports {bench_block.group(1)} "
+        f"fault-injection scenarios but faults.py defines {expected} "
+        "FAULT_CLASSES: regenerate the block (benchmarks/run.py) or re-sync "
+        "the corpus"
+    )
+
+
 def test_required_files_state_a_total() -> None:
     stated = {f.name: documented_total(f) for f in REQUIRED_FILES}
     missing = [name for name, total in stated.items() if total is None]
@@ -178,36 +248,6 @@ def test_documented_counts_agree() -> None:
         if total is not None:
             stated[f.name] = total
     assert len(set(stated.values())) == 1, f"documented counts disagree: {stated}"
-
-
-def test_readme_module_and_file_counts_match_the_tree() -> None:
-    """The README module-map summary must count the tree, not a stale snapshot.
-
-    The line read ``130 modules`` and ``182 test files`` while the tree held
-    132 and 186: every PR landing a module or a test file moves both figures,
-    and nothing re-measured them (#1108). The ``cli/`` row of the same table
-    is already guarded against the parser; this covers the two figures beside
-    it the same way, so a stale count fails CI instead of quietly misstating
-    the size of the project. The basis is every ``.py`` under ``src/continuum``
-    and every ``test_*.py`` under ``tests/``.
-    """
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    match = re.search(
-        r"one library \(`src/continuum`, (\d+) modules\) plus a large test suite \((\d+) test files",
-        readme,
-    )
-    assert match, (
-        "README module map no longer states module/test-file counts where this guard expects them"
-    )
-    documented_modules, documented_files = int(match.group(1)), int(match.group(2))
-    live_modules = len(list((ROOT / "src" / "continuum").rglob("*.py")))
-    live_files = len(list((ROOT / "tests").rglob("test_*.py")))
-    assert documented_modules == live_modules, (
-        f"README says {documented_modules} modules but src/continuum holds {live_modules}"
-    )
-    assert documented_files == live_files, (
-        f"README says {documented_files} test files but tests/ holds {live_files}"
-    )
 
 
 def test_documented_narrative_count_forms(tmp_path: Path) -> None:
