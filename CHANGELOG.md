@@ -197,6 +197,43 @@ All notable changes to this project are documented here. The format follows
   `except EditPreconditionError` handlers are unaffected; only `type(exc)`
   becomes observable.
 
+- **A probe that prints `occurred:false` is now told the separator is the
+  problem.** A command probe's verdict contract was documented only in the
+  module docstring, so the place an operator met it was the error, and the
+  error said `probe could not determine the outcome from output 'occurred:false'`
+  -- which sends someone hunting in their probe's logic when the cause is one
+  character away. `occurred:false` is the natural shape for a shell `echo` and
+  for most config formats, and it reads as unknown rather than as a verdict,
+  because the separator is `=`. The message now names the colon and shows the
+  line to print instead, and every other unparseable output carries the accepted
+  forms with it. The output contract is documented next to the registry schema
+  in `docs/api/cli.md` (the three verdicts, the JSON alternatives, the
+  last-non-empty-line rule, and the colon trap), and the authority probe's
+  `valid=` parser, which had the identical opaque message, gets the same
+  diagnosis.
+
+- **The gateway can finally reach a plain-HTTP upstream.** The transport was
+  hardcoded: every route opened an `HTTPSConnection` and the recorded evidence
+  stamped `https://` on the path, so an upstream that does not terminate TLS
+  itself -- a local service on `localhost`, an internal address behind a
+  TLS-terminating load balancer -- was unreachable at all. The handshake to its
+  cleartext port failed as `WRONG_VERSION_NUMBER` before a byte was forwarded,
+  the claim settled `UNKNOWN` (uncertain), and no `TOOL_COMPLETED` evidence was
+  recorded, which is the worst answer the gateway can give: the effect looked
+  unaccountable when the truth was that the proxy never tried.
+
+  A route's upstream scheme is now data. `http://` on the host, or a `scheme`
+  field naming it, selects the plain transport, and the recorded path reports
+  the scheme the request actually travelled. A route without either still means
+  `https`, so an existing `gateway.json` keeps the transport it was built for.
+  The two spellings must agree and only `http`/`https` are accepted, both
+  rejected at load time where the operator still has the file open. The scheme
+  is stored off the host, which stays a bare authority, and the scheme's default
+  port folds to absent so a client that spells it still reaches the route. The
+  suite now drives a live plain-HTTP upstream through the real stack -- its
+  module docstring had claimed one for a year while every upstream was either
+  unreachable `example.com` or a canned connection that replaced the very class
+  that chose the transport.
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
   arguments are caller-controlled noise plus the real resource, so keeping the
