@@ -56,6 +56,7 @@ def gate_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 import io  # noqa: E402
+import os  # noqa: E402
 
 
 @pytest.mark.parametrize("client", ("claude-code", "gemini", "codex"))
@@ -123,7 +124,9 @@ def test_with_gate_refuses_when_no_registry(
     )
 
     assert code == ExitCode.ERROR
-    assert ".continuum/gate.json" in err
+    # The registry path renders with the platform's own separator; assert the
+    # constant rather than a literal so this pins the message on Windows too.
+    assert str(Path(".continuum") / "gate.json") in err
     assert "does not exist" in err
     # Nothing is wired: a half-installed settings file would leave the operator
     # with observation hooks and a gate that silently allows, the exact belief
@@ -146,10 +149,17 @@ def test_with_gate_names_the_starter_command(
     )
     assert code == ExitCode.ERROR
 
-    # Pull the `mkdir -p ... && echo '...' > .continuum/gate.json` line out of
-    # the message and run it, then retry the install it blocked.
-    recipe = next(line.strip() for line in err.splitlines() if line.strip().startswith("mkdir "))
-    subprocess.run(["/bin/sh", "-c", recipe], check=True, cwd=tmp_path)
+    # Pull the create-the-registry line out of the message and run it, then
+    # retry the install it blocked. The recipe is written for the operator's
+    # own shell (cmd has no mkdir -p), so it is executed the same way: on
+    # Windows a POSIX /bin/sh is absent and the line would not even start.
+    recipe = next(
+        line.strip() for line in err.splitlines() if "echo" in line and "gate.json" in line
+    )
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", recipe], check=True, cwd=tmp_path)
+    else:
+        subprocess.run(["/bin/sh", "-c", recipe], check=True, cwd=tmp_path)
     assert (tmp_path / ".continuum" / "gate.json").exists()
 
     code, out, err = run(

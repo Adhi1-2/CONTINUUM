@@ -3253,14 +3253,22 @@ def cmd_hooks_install(args: argparse.Namespace, storage: Storage, out: Any, err:
             print(f"error: --with-gate needs a readable gate registry: {exc}", file=err)
             return ExitCode.ERROR
         if tools is None:
+            # The recipe has to run as printed on the operator's shell, so it is
+            # built per platform: cmd has no mkdir -p and does not strip quotes
+            # from echo, and the registry path renders with its own separator.
+            starter = '{"tools": {"Write": {"key_template": "{file_path}"}}}'
+            if os.name == "nt":
+                recipe = (
+                    f"  if not exist .continuum mkdir .continuum && echo {starter} > {registry}\n"
+                )
+            else:
+                recipe = f"  mkdir -p .continuum && echo '{starter}' > {registry}\n"
             print(
                 f"error: --with-gate was passed but {registry} does not exist, so the "
                 "installed gate would allow every tool call: the gate reads a missing "
                 'registry as "no gate configured" and returns exit 0. Create one, '
                 "register your side-effecting tools, then re-run this command:\n"
-                "  mkdir -p .continuum && echo "
-                '\'{"tools": {"Write": {"key_template": "{file_path}"}}}\' '
-                f"> {registry}\n"
+                f"{recipe}"
                 "Each entry names the tool as the harness sees it and the key template "
                 "that identifies the operation; see docs/guides/embed-claude-code.md and "
                 "docs/guides/memory_governance.md.",
