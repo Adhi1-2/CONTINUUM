@@ -181,6 +181,37 @@ def test_with_gate_refuses_when_no_registry(
     assert not settings.exists()
 
 
+def test_with_gate_recipe_matches_the_operators_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The printed recipe is written for the shell the operator actually has.
+
+    ``cmd`` has no ``mkdir -p`` and does not strip quotes from ``echo``, so the
+    line has to be built per platform: an operator on Windows given the POSIX
+    form cannot run it at all. The branch is exercised here rather than left to
+    the Windows matrix, so a recipe that regresses on either side fails on every
+    runner instead of only the one nobody watches.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = tmp_path / "settings.json"
+    registry = str(Path(".continuum") / "gate.json")
+
+    # ``continuum.cli.main`` the attribute is the re-exported entry-point
+    # function, which shadows the module of the same name, so the module has to
+    # be pulled out of sys.modules to reach the ``os`` its code actually reads.
+    cli_module = sys.modules["continuum.cli.main"]
+
+    for flavour, mkdir in (("posix", "mkdir -p .continuum"), ("nt", "if not exist .continuum")):
+        monkeypatch.setattr(cli_module, "os", _OsFlavour(flavour))
+        code, _, err = run(
+            "hooks", "install", "claude-code", "--with-gate", "--settings", str(settings)
+        )
+        assert code == ExitCode.ERROR
+        assert mkdir in err, f"{flavour}: recipe is not written for that shell"
+        assert registry in err
+        assert not settings.exists()
+
+
 def test_with_gate_names_the_starter_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
