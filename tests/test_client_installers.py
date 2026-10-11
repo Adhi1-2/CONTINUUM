@@ -198,16 +198,21 @@ def test_with_gate_names_the_starter_command(
 
     # Pull the create-the-registry line out of the message and run it, then
     # retry the install it blocked. The recipe is written for the operator's
-    # own shell (cmd has no mkdir -p), so it is executed the same way: on
-    # Windows a POSIX /bin/sh is absent and the line would not even start.
+    # own shell (cmd has no mkdir -p), so it is executed through that shell.
+    # It has to go in as one string rather than an argv list: on Windows the
+    # list form quotes the argument and backslash-escapes the JSON's inner
+    # quotes, and cmd does not parse those escapes, so the file would land as
+    # {\"tools\": ...} and the retry would reject it as invalid JSON.
     recipe = next(
         line.strip() for line in err.splitlines() if "echo" in line and "gate.json" in line
     )
-    if os.name == "nt":
-        subprocess.run(["cmd", "/c", recipe], check=True, cwd=tmp_path)
-    else:
-        subprocess.run(["/bin/sh", "-c", recipe], check=True, cwd=tmp_path)
-    assert (tmp_path / ".continuum" / "gate.json").exists()
+    subprocess.run(recipe, check=True, cwd=tmp_path, shell=True)
+    registry = tmp_path / ".continuum" / "gate.json"
+    assert registry.exists()
+    # The retry reads this file back as JSON, so the shell did not just create
+    # the file, it wrote parseable content: the failure this guards against is
+    # a recipe that lands mangled quotes.
+    assert "tools" in json.loads(registry.read_text())
 
     code, out, err = run(
         "--json", "hooks", "install", "claude-code", "--with-gate", "--settings", str(settings)
