@@ -9,7 +9,9 @@ flag hint.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -53,10 +55,6 @@ def gate_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
     write_gate_registry(tmp_path)
     return tmp_path
-
-
-import io  # noqa: E402
-import os  # noqa: E402
 
 
 @pytest.mark.parametrize("client", ("claude-code", "gemini", "codex"))
@@ -524,3 +522,63 @@ def test_a_command_of_no_known_kind_is_appended_never_matched(tmp_path: Path) ->
         status = install_client_hook(settings, command, event_name="SessionStart", matcher="")
         assert status == "installed"
     assert _installed_commands(settings, "SessionStart") == [unknown, malformed, unknown]
+
+
+def test_with_gate_refuses_an_absent_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--with-gate`` with no registry installs a guard that disarms itself.
+
+    The gate reads a *missing* registry as "no gate configured" and returns exit 0
+    for an unclaimed side-effecting call, so wiring the hook in that state looks
+    armed to the operator and allows every call. Failing before touching settings
+    is the honest outcome; the message names the file the flag needs.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = tmp_path / "settings.json"
+    code, _, err = run(
+        "--json", "hooks", "install", "claude-code", "--with-gate", "--settings", str(settings)
+    )
+    assert code == ExitCode.ERROR
+    # The message prints DEFAULT_GATE_CONFIG_PATH, which is a forward-slash
+    # relative path on POSIX and a backslash one on Windows; the registry name
+    # is what the assertion cares about, not the separator.
+    assert ".continuum" + (os.sep == "\\" and "\\" or "/") + "gate.json does not exist" in err
+    assert not settings.exists(), "nothing should have been written to settings"
+
+
+def test_with_gate_refuses_an_unreadable_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry that fails to load is reported, not installed against."""
+    monkeypatch.chdir(tmp_path)
+    registry = write_gate_registry(tmp_path)
+    registry.write_text("{not json")
+    settings = tmp_path / "settings.json"
+    code, _, err = run(
+        "--json", "hooks", "install", "claude-code", "--with-gate", "--settings", str(settings)
+    )
+    assert code == ExitCode.ERROR
+    assert "--with-gate needs a readable gate registry" in err
+    assert not settings.exists()
+
+
+def test_with_gate_warns_when_the_registry_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty registry is a warning, not an error: it is a valid starting state.
+
+    A registry with a ``tools`` map and no entries still installs a working gate;
+    the operator just has not named anything yet. Telling them and continuing is
+    right, unlike the two cases above where the installed hook could not enforce.
+    """
+    monkeypatch.chdir(tmp_path)
+    registry = write_gate_registry(tmp_path)
+    registry.write_text(json.dumps({"tools": {}}))
+    settings = tmp_path / "settings.json"
+    code, _, err = run(
+        "--json", "hooks", "install", "claude-code", "--with-gate", "--settings", str(settings)
+    )
+    assert code == ExitCode.OK, err
+    assert "registers no tools" in err
+    assert "gate" in _installed_kinds(settings)
