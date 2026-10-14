@@ -139,7 +139,7 @@ def smoke_counts_are_absolute_from_creation() -> None:
 
 
 def smoke_crash_before_commit_leaves_no_partial_write() -> None:
-    print("\n== a Crash inside a write leaves no partial write (rollback) ==")
+    print("\n== a Crash before a write commits leaves no partial write ==")
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "s.db")
         st = CrashingStorage(path)
@@ -156,7 +156,7 @@ def smoke_crash_before_commit_leaves_no_partial_write() -> None:
         finally:
             st2.close()
         check(
-            "the crashed write did not land",
+            "the pre-write crashed call did not land",
             EventType.RUN_COMPLETED not in types,
             str([t.value for t in types]),
         )
