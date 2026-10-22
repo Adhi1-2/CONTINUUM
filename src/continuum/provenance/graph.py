@@ -136,6 +136,33 @@ class ProvenanceGraph:
         }
 
 
+def _apply_invalidation(
+    graph: ProvenanceGraph,
+    id_map: dict[str, str],
+    target_id: object,
+    payload: dict[str, Any],
+) -> None:
+    """Update node status and reason when an invalidation event matches."""
+    if not isinstance(target_id, str):
+        return
+    node_id = id_map.get(target_id)
+    if node_id is None or node_id not in graph.nodes:
+        return
+    status = StateStatus.INVALID
+    raw_status = payload.get("status")
+    if raw_status:
+        with contextlib.suppress(ValueError, TypeError):
+            status = StateStatus(raw_status)
+    reason = payload.get("reason")
+    if reason is None:
+        reason = payload.get("invalidated_reason")
+    graph.nodes[node_id] = replace(
+        graph.nodes[node_id],
+        status=status,
+        invalidated_reason=str(reason) if reason is not None else None,
+    )
+
+
 def build_provenance_graph(events: Any) -> ProvenanceGraph:
     """Fold events into a DAG.
 
@@ -156,61 +183,15 @@ def build_provenance_graph(events: Any) -> ProvenanceGraph:
         pld: dict[str, Any] = ev.payload if isinstance(ev.payload, dict) else {}
 
         if ev.type == EventType.DECISION_INVALIDATED:
-            target_id = pld.get("decision_id") or pld.get("event_id")
-            if isinstance(target_id, str):
-                node_id = decision_map.get(target_id)
-                if node_id is None and target_id in graph.nodes:
-                    node_id = target_id
-                if node_id is None:
-                    for n in graph.nodes.values():
-                        if n.payload.get("decision_id") == target_id:
-                            node_id = n.event_id
-                            break
-                if node_id is not None and node_id in graph.nodes:
-                    target_node = graph.nodes[node_id]
-                    raw_status = pld.get("status")
-                    try:
-                        status = StateStatus(raw_status) if raw_status else StateStatus.INVALID
-                    except (ValueError, TypeError):
-                        status = StateStatus.INVALID
-                    raw_reason = pld.get("reason")
-                    if raw_reason is None:
-                        raw_reason = pld.get("invalidated_reason")
-                    reason = str(raw_reason) if raw_reason is not None else None
-                    graph.nodes[node_id] = replace(
-                        target_node,
-                        status=status,
-                        invalidated_reason=reason,
-                    )
+            _apply_invalidation(
+                graph, decision_map, pld.get("decision_id") or pld.get("event_id"), pld
+            )
             continue
 
         if ev.type == EventType.FINDING_INVALIDATED:
-            target_id = pld.get("finding_id") or pld.get("event_id")
-            if isinstance(target_id, str):
-                node_id = finding_map.get(target_id)
-                if node_id is None and target_id in graph.nodes:
-                    node_id = target_id
-                if node_id is None:
-                    for n in graph.nodes.values():
-                        if n.payload.get("finding_id") == target_id:
-                            node_id = n.event_id
-                            break
-                if node_id is not None and node_id in graph.nodes:
-                    target_node = graph.nodes[node_id]
-                    raw_status = pld.get("status")
-                    try:
-                        status = StateStatus(raw_status) if raw_status else StateStatus.INVALID
-                    except (ValueError, TypeError):
-                        status = StateStatus.INVALID
-                    raw_reason = pld.get("reason")
-                    if raw_reason is None:
-                        raw_reason = pld.get("invalidated_reason")
-                    reason = str(raw_reason) if raw_reason is not None else None
-                    graph.nodes[node_id] = replace(
-                        target_node,
-                        status=status,
-                        invalidated_reason=reason,
-                    )
+            _apply_invalidation(
+                graph, finding_map, pld.get("finding_id") or pld.get("event_id"), pld
+            )
             continue
 
         if ev.type not in _NODE_TYPES:

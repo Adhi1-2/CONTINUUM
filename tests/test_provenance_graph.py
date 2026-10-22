@@ -246,6 +246,38 @@ def test_synthetic_event_id_invalidation_and_payload_initial_status():
                 "invalidated_reason": "rejected on entry",
             },
         ),
+        Event(
+            run_id="r_syn",
+            sequence=4,
+            type=EventType.FINDING_ADDED,
+            event_id="f_syn2",
+            payload={"finding_id": "f_syn2", "claim": "finding to override"},
+        ),
+        Event(
+            run_id="r_syn",
+            sequence=5,
+            type=EventType.FINDING_INVALIDATED,
+            event_id="f_inv2",
+            payload={
+                "finding_id": "f_syn2",
+                "status": "requires_review",
+                "invalidated_reason": "flagged for review",
+            },
+        ),
+        Event(
+            run_id="r_syn",
+            sequence=6,
+            type=EventType.DECISION_INVALIDATED,
+            event_id="d_inv_unknown",
+            payload={"decision_id": "unknown_decision", "reason": "noop"},
+        ),
+        Event(
+            run_id="r_syn",
+            sequence=7,
+            type=EventType.FINDING_INVALIDATED,
+            event_id="f_inv_no_id",
+            payload={"reason": "missing id"},
+        ),
     ]
 
     graph = build_provenance_graph(events)
@@ -253,3 +285,5 @@ def test_synthetic_event_id_invalidation_and_payload_initial_status():
     assert graph.nodes["d_syn"].invalidated_reason == "superseded"
     assert graph.nodes["f_syn"].status == StateStatus.INVALID
     assert graph.nodes["f_syn"].invalidated_reason == "rejected on entry"
+    assert graph.nodes["f_syn2"].status == StateStatus.REQUIRES_REVIEW
+    assert graph.nodes["f_syn2"].invalidated_reason == "flagged for review"
