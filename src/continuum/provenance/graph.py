@@ -13,8 +13,9 @@ Staleness propagation (issue #553) will later mark downstream nodes via BFS.
 
 from __future__ import annotations
 
+import contextlib
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from continuum.events import EventType
@@ -49,6 +50,7 @@ class ProvenanceNode:
     type: EventType
     origin: Origin
     status: StateStatus = StateStatus.VALID
+    invalidated_reason: str | None = None
     caused_by: tuple[str, ...] = ()
     payload: dict[str, Any] = field(default_factory=dict)
 
@@ -116,6 +118,7 @@ class ProvenanceGraph:
                     "type": n.type.value,
                     "origin": n.origin.value,
                     "status": n.status.value,
+                    "invalidated_reason": n.invalidated_reason,
                     "caused_by": list(n.caused_by),
                     "payload": dict(n.payload),
                     "parents": list(self.reverse_edges.get(n.event_id, [])),
@@ -144,25 +147,115 @@ def build_provenance_graph(events: Any) -> ProvenanceGraph:
     The fold is deterministic and hash-stable: same events yield same graph.
     """
     graph = ProvenanceGraph()
-    # First pass: nodes
+    # Tracking maps for payload identifiers to node event_ids
+    decision_map: dict[str, str] = {}
+    finding_map: dict[str, str] = {}
+
+    # First pass: nodes and invalidation folding
     for ev in sorted(events, key=lambda e: e.sequence):
+        pld: dict[str, Any] = ev.payload if isinstance(ev.payload, dict) else {}
+
+        if ev.type == EventType.DECISION_INVALIDATED:
+            target_id = pld.get("decision_id") or pld.get("event_id")
+            if isinstance(target_id, str):
+                node_id = decision_map.get(target_id)
+                if node_id is None and target_id in graph.nodes:
+                    node_id = target_id
+                if node_id is None:
+                    for n in graph.nodes.values():
+                        if n.payload.get("decision_id") == target_id:
+                            node_id = n.event_id
+                            break
+                if node_id is not None and node_id in graph.nodes:
+                    target_node = graph.nodes[node_id]
+                    raw_status = pld.get("status")
+                    try:
+                        status = StateStatus(raw_status) if raw_status else StateStatus.INVALID
+                    except (ValueError, TypeError):
+                        status = StateStatus.INVALID
+                    raw_reason = pld.get("reason")
+                    if raw_reason is None:
+                        raw_reason = pld.get("invalidated_reason")
+                    reason = str(raw_reason) if raw_reason is not None else None
+                    graph.nodes[node_id] = replace(
+                        target_node,
+                        status=status,
+                        invalidated_reason=reason,
+                    )
+            continue
+
+        if ev.type == EventType.FINDING_INVALIDATED:
+            target_id = pld.get("finding_id") or pld.get("event_id")
+            if isinstance(target_id, str):
+                node_id = finding_map.get(target_id)
+                if node_id is None and target_id in graph.nodes:
+                    node_id = target_id
+                if node_id is None:
+                    for n in graph.nodes.values():
+                        if n.payload.get("finding_id") == target_id:
+                            node_id = n.event_id
+                            break
+                if node_id is not None and node_id in graph.nodes:
+                    target_node = graph.nodes[node_id]
+                    raw_status = pld.get("status")
+                    try:
+                        status = StateStatus(raw_status) if raw_status else StateStatus.INVALID
+                    except (ValueError, TypeError):
+                        status = StateStatus.INVALID
+                    raw_reason = pld.get("reason")
+                    if raw_reason is None:
+                        raw_reason = pld.get("invalidated_reason")
+                    reason = str(raw_reason) if raw_reason is not None else None
+                    graph.nodes[node_id] = replace(
+                        target_node,
+                        status=status,
+                        invalidated_reason=reason,
+                    )
+            continue
+
         if ev.type not in _NODE_TYPES:
             continue
-        caused_by = ev.payload.get("caused_by") if isinstance(ev.payload, dict) else None
+
+        caused_by = pld.get("caused_by")
         if not isinstance(caused_by, list):
             caused_by = []
-        # filter to strings only
         caused_by_t = tuple(str(x) for x in caused_by if isinstance(x, str) and x)
+
+        initial_status = StateStatus.VALID
+        raw_status = pld.get("status")
+        if raw_status:
+            with contextlib.suppress(ValueError, TypeError):
+                initial_status = StateStatus(raw_status)
+
+        initial_reason = None
+        raw_reason = pld.get("invalidated_reason") or (
+            pld.get("reason") if initial_status is StateStatus.INVALID else None
+        )
+        if raw_reason is not None:
+            initial_reason = str(raw_reason)
+
         node = ProvenanceNode(
             event_id=ev.event_id,
             sequence=ev.sequence,
             type=ev.type,
             origin=ev.source,
-            status=StateStatus.VALID,
+            status=initial_status,
+            invalidated_reason=initial_reason,
             caused_by=caused_by_t,
-            payload=dict(ev.payload) if isinstance(ev.payload, dict) else {},
+            payload=dict(pld),
         )
         graph.add_node(node)
+
+        if ev.type == EventType.DECISION_CREATED:
+            dec_id = pld.get("decision_id")
+            if isinstance(dec_id, str) and dec_id:
+                decision_map[dec_id] = ev.event_id
+            decision_map[ev.event_id] = ev.event_id
+        elif ev.type == EventType.FINDING_ADDED:
+            find_id = pld.get("finding_id")
+            if isinstance(find_id, str) and find_id:
+                finding_map[find_id] = ev.event_id
+            finding_map[ev.event_id] = ev.event_id
     # Second pass: edges
     for node in list(graph.nodes.values()):
         for parent_id in node.caused_by:
