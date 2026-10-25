@@ -12,12 +12,15 @@ package).
 
 ```python
 from continuum.security.attestation import (
-    generate_keypair, sign_chain, verify_attestation, Attestation,
+    generate_keypair,
+    sign_chain,
+    verify_attestation,
+    Attestation,
 )
 
 priv_pem, pub_pem = generate_keypair()
 attest = sign_chain(priv_pem, run_id, trusted_through_seq, chain_hash, signer="ci")
-verify_attestation(attest)                              # True
+verify_attestation(attest)  # True
 verify_attestation(attest, expected_chain_hash=chain_hash)  # True
 ```
 
@@ -76,6 +79,17 @@ handshake's `_meta.authToken`; a replayed or unknown secret is refused.
 Resolve the allowlist: explicit argument, then `CONTINUUM_MCP_MUTATING_CLIENTS`
 (or its alias), then `.continuum/mcp-policy.json`, then deny. Only listed callers
 may use mutating tools; read-only tools stay open.
+
+### Client names are matched case-insensitively
+
+Both halves of the handshake key off the same `clientInfo.name` string, and
+clients do not agree on their own capitalisation — the same editor reports
+`Cursor` in one release and `cursor` in the next. Every name the allowlist and
+the per-client token map compare is normalised first (whitespace-stripped and
+case-folded), so a grant written as `Cursor` covers a caller naming itself
+`cursor`, and a secret registered under `cursor` answers a caller sending
+`Cursor`. One spelling of a client name is one identity across both halves
+(#1598); the secrets themselves are still compared exactly.
 
 ### `AuthorizationPolicy`, `NotAuthorized`, `UnknownCaller`, `NotAuthenticated`
 
