@@ -459,6 +459,58 @@ def test_an_empty_database_says_so(tmp_path: Path) -> None:
     assert "No runs recorded" in out
 
 
+def test_the_default_db_is_resolved_against_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1575: the default was a bare ``continuum.db``.
+
+    A bare filename is read relative to the process cwd, so the same command
+    opened a different store from a different directory and nothing in the
+    output named a directory. The default must be the absolute file that will
+    actually be opened.
+    """
+    from continuum.cli.main import _DEFAULT_DB_NAME, build_parser
+
+    monkeypatch.chdir(tmp_path)
+    parser = build_parser()
+    (action,) = [a for a in parser._actions if "--db" in (a.option_strings or [])]
+
+    assert Path(action.default).is_absolute()
+    assert action.default == str(tmp_path.joinpath(_DEFAULT_DB_NAME).resolve())
+    # The help text an operator reads has to name the same file.
+    assert action.default in action.help
+
+
+def test_init_reports_an_absolute_database_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1575: ``init`` reported a bare ``continuum.db`` and named no
+    directory, so an operator could not tell where the store had been created.
+    """
+    monkeypatch.chdir(tmp_path)
+    code, out, _ = run("--json", "init")
+    assert code == ExitCode.OK
+
+    database = json.loads(out)["database"]
+    assert Path(database).is_absolute()
+    assert Path(database) == tmp_path.joinpath("continuum.db").resolve()
+
+
+def test_an_empty_listing_names_the_database_it_queried(tmp_path: Path) -> None:
+    """Issue #1575: an empty ``runs`` listing returned a bare ``{"runs": []}``.
+
+    With no indication of which store was queried, a healthy database looked
+    empty purely because of the caller's working directory.
+    """
+    path = str(tmp_path / "empty.db")
+    code, out, _ = run("--db", path, "--json", "runs")
+    assert code == ExitCode.OK
+
+    payload = json.loads(out)
+    assert payload["database"] == path
+    assert payload["runs"] == []
+
+
 def test_runs_refuses_a_zero_limit_instead_of_looking_empty(db: str) -> None:
     """Issue #1354: --limit 0 must not misreport a populated store as empty.
 
@@ -1498,6 +1550,30 @@ def test_status_provenance_json(db: str) -> None:
     assert any(row["who"] == "observed" for row in data["provenance"])
 
 
+def test_status_json_honours_global_flag(db: str) -> None:
+    code, out, _ = run("--db", db, "--json", "status", "run_1")
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["run_id"] == "run_1"
+    assert payload["goal"]["description"] == "Analyze 100 documents"
+    assert payload["goal"]["version"] == 1
+    assert payload["version"] == 0
+    assert payload["progress"]["completed"] == 60
+    assert payload["progress"]["pending"] == 40
+    assert payload["progress"]["failed"] == 0
+    assert payload["progress"]["total"] == 100
+    assert payload["decisions"]["valid"] == 0
+    assert payload["decisions"]["total"] == 0
+
+
+def test_status_json_honours_subcommand_flag(db: str) -> None:
+    code, out, _ = run("--db", db, "status", "run_1", "--json")
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["run_id"] == "run_1"
+    assert payload["goal"]["description"] == "Analyze 100 documents"
+
+
 # --- scoped recovery CLI smoke (issue #110) --------------------------------- #
 
 
@@ -1732,6 +1808,23 @@ def test_status_on_an_unprojectable_run_names_the_break_and_fails(db: str) -> No
     assert code == ExitCode.CORRUPTED
     assert "PROJECTION FAILURE" in out
     assert "TASK_UPDATED" in out
+    assert "Traceback" not in out and "Traceback" not in err
+
+
+def test_status_json_degraded_run_includes_failure_and_exits_corrupted(db: str) -> None:
+    _poison(db)
+    code, out, err = run("--db", db, "--json", "status", "run_1")
+
+    assert code == ExitCode.CORRUPTED
+    payload = json.loads(out)
+    assert payload["run_id"] == "run_1"
+    assert "projection_failed_at" in payload
+    failure = payload["projection_failed_at"]
+    assert failure["type"] == "TASK_UPDATED"
+    with SQLiteStorage(db) as store:
+        poisoned = list(store.read_events("run_1"))[-1]
+    assert failure["sequence"] == poisoned.sequence
+    assert "exceeds total" in failure["reason"]
     assert "Traceback" not in out and "Traceback" not in err
 
 

@@ -71,6 +71,10 @@ from continuum.mcp.authz import (
     load_policy,
     token_from,
 )
+from continuum.mcp.observation import (
+    declared_client_name,
+    record_observed_client,
+)
 from continuum.models import (
     ActionStatus,
     EnvironmentSnapshot,
@@ -541,6 +545,37 @@ class ContinuumMCP:
         return ActionLedger(self.storage, run_id, source=AGENT_SOURCE)
 
 
+class _ClientNameObserver:
+    """Record the ``clientInfo.name`` every connection declares.
+
+    The server already reads that name to authorize a mutating call and then
+    throws it away, which is why a wrong guess in a registration stays
+    invisible. This wraps the inbound message chain so the value is captured
+    on the one message where it first exists, the ``initialize`` request.
+
+    The SDK documents that ``initialize`` is observed but not rewritable by
+    middleware, which is precisely the property needed here: this records what
+    a host said and structurally cannot change what the server does with it.
+    Authorization continues to be decided by ``policy.require`` from the
+    session's own handshake, and nothing in this class is consulted there.
+
+    It is deliberately not where authorization happens. A recorded name is a
+    claim by whoever connected, so honoring one would let any client claim to
+    be an allowlisted host and become one.
+    """
+
+    __slots__ = ("_database",)
+
+    def __init__(self, database: str) -> None:
+        self._database = database
+
+    async def __call__(self, ctx: Any, call_next: Any) -> Any:
+        """Observe one inbound message, then hand it on unchanged."""
+        if ctx.method == "initialize":
+            record_observed_client(self._database, declared_client_name(ctx.params) or "")
+        return await call_next(ctx)
+
+
 def build_server(
     database: str | None = None,
     *,
@@ -621,6 +656,11 @@ def build_server(
         ),
     )
 
+    # Observation only. It records the name each connection declares so the
+    # doctor can compare what a host sends against what the registration
+    # authorizes; it never contributes to an authorization decision.
+    server.middleware.append(_ClientNameObserver(ctx.database))
+
     read_only = ToolAnnotations(read_only_hint=True)
     mutating = ToolAnnotations(read_only_hint=False)
 
@@ -700,6 +740,22 @@ def build_server(
                 ),
             ]
         )
+        return wrapper
+
+    def refusals(fn: Callable[..., str]) -> Callable[..., str]:
+        """Let a read-only tool's refusal reach the caller with its reason.
+
+        ``guard`` and ``confirm_gate`` already do this for the tools they wrap.
+        The read-only tools carry neither, so without this a mistyped run id
+        reached the caller as the bare "Error executing tool <name>" instead of
+        "no such run". This performs no authorization check.
+        """
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> str:
+            with _refusal_reaches_the_caller():
+                return fn(*args, **kwargs)
+
         return wrapper
 
     # -- progress --------------------------------------------------------- #
@@ -974,12 +1030,16 @@ def build_server(
         ),
         annotations=read_only,
     )
+    @refusals
     def continuum_validate(
         run_id: str,
         env: dict[str, str] | None = None,
         expected_model: str | None = None,
     ) -> str:
         """Validate a run's state against the current environment."""
+        # Fetch the row first so an unknown id is refused as RunNotFound
+        # ("no such run") rather than as the restore's CheckpointError.
+        ctx.storage.get_run(run_id)
         decision = ctx.adapter.resume(
             run_id,
             current_environment=_environment(run_id, env),
@@ -1036,6 +1096,7 @@ def build_server(
         ),
         annotations=read_only,
     )
+    @refusals
     def continuum_resume(
         run_id: str | None = None,
         env: dict[str, str] | None = None,
@@ -1057,6 +1118,8 @@ def build_server(
                     }
                 )
             run_id = active.run_id
+        # Same as continuum_validate: refuse an unknown id as "no such run".
+        run = ctx.storage.get_run(run_id)
         decision = ctx.adapter.resume(
             run_id,
             current_environment=_environment(run_id, env),
@@ -1065,7 +1128,7 @@ def build_server(
         # Return the goal so a resumed session knows what to continue without
         # any external task file. The run's goal is the single source of truth
         # for "what was this task?" across interruptions.
-        goal = ctx.storage.get_run(run_id).goal
+        goal = run.goal
         tail_evidence = decision.tail_evidence
         # Executable next steps (issue: actionable guidance). Derived from
         # the plan plus whatever automation this project has registered, so
@@ -1574,6 +1637,7 @@ def build_server(
         ),
         annotations=read_only,
     )
+    @refusals
     def continuum_list_actions(run_id: str) -> str:
         """List ledger entries for a run."""
         # Read-only: do not call `ensure_run`, which backfills RUN_STARTED when

@@ -66,7 +66,7 @@ class HorizonRun:
     #: ``duplicate_side_effects`` goes positive.
     effects_performed_keys: set[str] = field(default_factory=set)
     #: How many post-reconstruction re-attempts were correctly recognised as
-    #: already done and refused. This is *not* duplicated work — it is the work
+    #: already done and refused. This is *not* duplicated work, it is the work
     #: the substrate saved. It is reported separately as
     #: ``duplicate_work_avoided`` so the published zero for duplicate work can
     #: be seen as a real measurement rather than a vacuous one.
@@ -115,7 +115,7 @@ class HorizonRun:
         outcome = ledger.claim("horizon_work", {"cycle": cycle}, key=key_of(cycle))
         if outcome.fresh:
             # The ledger lost the completion. A resumed agent cannot tell, so it
-            # does the work again — exactly the failure the benchmark exists to
+            # does the work again, exactly the failure the benchmark exists to
             # catch. Record it so duplicate_work is measured, not assumed.
             with contextlib.suppress(Exception):
                 ledger.complete(outcome.key, result={"cycle": cycle, "duplicate_of": cycle})

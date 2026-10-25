@@ -29,6 +29,7 @@ continuum merge <run_id> --reason "..."          # merge child run into parent a
 continuum restore <run_id> --reason "..."        # restore run to anchor checkpoint. mutates
                                                  #   [--to <id|version|seq> | --anchor N | --to-recovery-anchor]
 continuum compact <run_id>                       # archive pre-anchor log prefix. mutates
+continuum conformance --url <endpoint>          # wire protocol conformance runner against HTTP endpoint
 continuum precompact <run_id>                    # checkpoint before context compaction. mutates
 continuum rewind <run_id> --to <checkpoint>      # revert workspace and projection [--force] [--dry-run]
 continuum observe                                # record one tool completion (hook). mutates
@@ -38,6 +39,11 @@ continuum briefing                               # session-start context injecti
 continuum gateway --port 8765                    # enforcing proxy for registered upstreams. mutates
 continuum daemon --port 8765                     # background gateway daemon
 continuum hooks install <client> [--with-gate]   # wire a coding CLI (claude-code, gemini, codex)
+continuum agents install --target <ide>          # render IDE instruction files from one source
+continuum agents check [--all]                   # fail when a target drifted from its source
+continuum agents remove --target <ide>           # remove only generated targets. mutates
+continuum agents list                            # list targets and the file each IDE reads
+continuum doctor [--deep]                        # per-IDE wiring, staleness and read-only state
 continuum mcp install [--scope project]          # register the MCP server, resolved absolute. mutates
 continuum mcp remove                             # remove the registration install wrote. mutates
 continuum mcp doctor --timeout 15                 # diagnose host connection failures. read-only
