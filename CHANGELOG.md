@@ -89,6 +89,17 @@ Test counts: ~3950 collected on a minimal env.
   that moves while the queue is built.
 ### Fixed
 
+- **Provenance invalidations now reach the node they target (#1850).**
+  An invalidation event names a `decision_id` or `finding_id`, but
+  `build_provenance_graph` looked that id up in `graph.nodes`, which is keyed
+  by `event_id` — the key never matched, so every invalidation was silently
+  dropped and nodes stayed `VALID` with no `invalidated_reason`. Nodes are now
+  indexed by domain id as the graph is folded, so a decision or finding
+  invalidation marks its target node `INVALID` and records the reason. The
+  shipped test for this path passed only because its event ids happened to
+  equal their domain ids; invalidations naming an id with no recorded node are
+  ignored, as before.
+
 - **Benchmark report timestamps are timezone-aware UTC (#1823).** The Phase 6,
   fault-injection, and horizon benchmark runners now use the shared `utcnow()`
   helper, keeping report timestamps comparable across benchmark suites.

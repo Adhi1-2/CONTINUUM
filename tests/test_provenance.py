@@ -279,3 +279,87 @@ def test_decision_and_finding_invalidation_updates_graph_nodes() -> None:
     assert "f1" in graph.nodes
     assert graph.nodes["f1"].status == StateStatus.INVALID
     assert graph.nodes["f1"].invalidated_reason == "false positive report"
+
+
+def test_invalidation_reaches_a_node_whose_event_id_is_not_the_domain_id() -> None:
+    """The lookup must key on domain id, not event id (#1850).
+
+    An invalidation names a ``decision_id`` / ``finding_id``, while the graph
+    is keyed by ``event_id``, and in real runs the two differ. The old lookup
+    asked ``dec_id in graph.nodes`` -- always false -- so every invalidation
+    was silently dropped. The test above could not catch this because its
+    event ids happen to equal their domain ids.
+    """
+    from continuum.events import Event, EventType
+    from continuum.provenance.graph import StateStatus, build_provenance_graph
+
+    events = [
+        Event(
+            run_id="run_1",
+            sequence=1,
+            type=EventType.DECISION_CREATED,
+            event_id="ev_1",
+            payload={"decision_id": "dec_42", "summary": "deploy"},
+        ),
+        Event(
+            run_id="run_1",
+            sequence=2,
+            type=EventType.FINDING_ADDED,
+            event_id="ev_3",
+            payload={"finding_id": "find_7", "title": "flaky test"},
+        ),
+        Event(
+            run_id="run_1",
+            sequence=3,
+            type=EventType.DECISION_INVALIDATED,
+            event_id="ev_2",
+            payload={"decision_id": "dec_42", "reason": "config change"},
+        ),
+        Event(
+            run_id="run_1",
+            sequence=4,
+            type=EventType.FINDING_INVALIDATED,
+            event_id="ev_4",
+            payload={"finding_id": "find_7", "invalidated_reason": "false positive"},
+        ),
+    ]
+
+    graph = build_provenance_graph(events)
+
+    assert "ev_1" in graph.nodes
+    assert "dec_42" not in graph.nodes
+    assert graph.nodes["ev_1"].status == StateStatus.INVALID
+    assert graph.nodes["ev_1"].invalidated_reason == "config change"
+    assert graph.nodes["ev_3"].status == StateStatus.INVALID
+    assert graph.nodes["ev_3"].invalidated_reason == "false positive"
+    # The invalidation events themselves are not graph nodes.
+    assert "ev_2" not in graph.nodes
+
+
+def test_invalidation_for_an_unknown_domain_id_is_ignored() -> None:
+    """An invalidation with no recorded target must not raise or add a node."""
+    from continuum.events import Event, EventType
+    from continuum.provenance.graph import StateStatus, build_provenance_graph
+
+    events = [
+        Event(
+            run_id="run_1",
+            sequence=1,
+            type=EventType.DECISION_CREATED,
+            event_id="ev_1",
+            payload={"decision_id": "dec_42", "summary": "deploy"},
+        ),
+        Event(
+            run_id="run_1",
+            sequence=2,
+            type=EventType.DECISION_INVALIDATED,
+            event_id="ev_2",
+            payload={"decision_id": "dec_missing", "reason": "reversed"},
+        ),
+    ]
+
+    graph = build_provenance_graph(events)
+
+    assert list(graph.nodes) == ["ev_1"]
+    assert graph.nodes["ev_1"].status == StateStatus.VALID
+    assert graph.nodes["ev_1"].invalidated_reason is None
