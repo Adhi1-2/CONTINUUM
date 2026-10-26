@@ -138,6 +138,7 @@ def test_run_job_builds_the_expected_action_and_returns_stdout(
         "continuum-job-0786df27ca76",
         "-n",
         "jobs",
+        "--attach",
         "--rm",
         "--image",
         "example/app:latest",
@@ -237,6 +238,30 @@ def test_pod_name_stays_a_valid_label_when_the_run_id_is_not(
     assert _pod_name("Run_K8s_2026", "example/app:latest", "python worker.py").startswith(
         "continuum-job-"
     )
+
+
+def test_run_job_runs_attached_so_kubectl_accepts_the_cleanup_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--rm`` must be paired with an attach flag (#1849).
+
+    ``kubectl run`` rejects ``--rm`` in detached mode with "--rm should only
+    be used for attached containers" before it creates any pod, so a job whose
+    argv carried ``--rm`` without ``--attach``, ``-i`` or ``-t`` failed on a
+    live cluster with exit code 1 on every call. ``--attach`` also keeps
+    kubectl streaming the job's stdout until it finishes, which is where the
+    returned output comes from. The flags must precede the ``--`` separator
+    to be read as kubectl flags rather than part of the command.
+    """
+    adapter, argvs = _adapter(monkeypatch, namespace="jobs")
+
+    adapter.run_job("run_k8s", "example/app:latest", "python worker.py")
+
+    (argv,) = argvs
+    assert "--rm" in argv
+    assert "--attach" in argv
+    # every kubectl flag, the attach pair included, sits before the "--" separator
+    assert argv.index("--attach") < argv.index("--") < argv.index("python worker.py")
 
 
 def _pod_name_matches_dns1123(name: str) -> bool:

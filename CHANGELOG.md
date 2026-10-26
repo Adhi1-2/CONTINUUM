@@ -89,6 +89,17 @@ Test counts: ~3950 collected on a minimal env.
   that moves while the queue is built.
 ### Fixed
 
+- **Kubernetes jobs run attached so kubectl accepts the cleanup flag (#1849).**
+  The unique-pod-name fix (#1807) added `--rm` without an attach flag, but
+  `kubectl run` rejects `--rm` in detached mode with "--rm should only be used
+  for attached containers" before it creates any pod, so every `run_job` on a
+  live cluster exited 1 and recorded `failed`. `run_job` now passes
+  `--attach`, which licenses the `--rm` cleanup and also keeps kubectl
+  streaming the pod's stdout until the job finishes — a detached `kubectl run`
+  returns as soon as the pod is scheduled and prints nothing, so
+  `AdapterResult.output` is now the job's actual output instead of an empty
+  string.
+
 - **Benchmark report timestamps are timezone-aware UTC (#1823).** The Phase 6,
   fault-injection, and horizon benchmark runners now use the shared `utcnow()`
   helper, keeping report timestamps comparable across benchmark suites.

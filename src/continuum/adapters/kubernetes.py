@@ -73,26 +73,35 @@ class KubernetesAdapter(GenericAgentAdapter):
     ) -> AdapterResult:
         """Run ``sh -c command`` as a one-shot pod from ``image``.
 
-        Executes ``kubectl run <pod-name> -n <namespace> --rm --image <image>``
-        in the adapter's namespace and returns the pod's stdout as
-        ``AdapterResult.output``. The pod name is derived from the run id and
-        the action's idempotency basis (its image and command), so two
-        different jobs in one namespace get distinct names and stop
+        Executes ``kubectl run <pod-name> -n <namespace> --attach --rm
+        --image <image>`` in the adapter's namespace and returns the pod's
+        stdout as ``AdapterResult.output``. The pod name is derived from the
+        run id and the action's idempotency basis (its image and command), so
+        two different jobs in one namespace get distinct names and stop
         colliding, while a replay of the same job reuses its own name.
-        ``--rm`` deletes the pod when it completes, the same cleanup the
-        container adapter gets from ``docker run --rm``; without it every
-        completed pod stays behind and blocks its own name from ever being
-        used again (issue #1807). A non-zero exit or a kubectl failure is
-        captured into the result (status ``failed`` with ``error`` set)
-        rather than raised, because the attempt is already recorded in the
-        ledger. Raises ``RuntimeError`` up front when kubectl or the
-        kubernetes client is missing. ``dep_scope`` names the dependency the
-        action should be scoped to for recovery.
+        ``--attach`` makes kubectl wait for the job and stream its stdout --
+        a detached ``kubectl run`` returns as soon as the pod is scheduled and
+        prints nothing -- and it is also what licenses ``--rm``, which kubectl
+        rejects in detached mode. ``--rm`` then deletes the pod when it
+        completes, the same cleanup the container adapter gets from ``docker
+        run --rm``; without it every completed pod stays behind and blocks its
+        own name from ever being used again (issue #1807). A non-zero exit or
+        a kubectl failure is captured into the result (status ``failed`` with
+        ``error`` set) rather than raised, because the attempt is already
+        recorded in the ledger. Raises ``RuntimeError`` up front when kubectl
+        or the kubernetes client is missing. ``dep_scope`` names the dependency
+        the action should be scoped to for recovery.
         """
         if not self.available():
             raise RuntimeError("kubectl or the kubernetes client is not available")
 
         def _run() -> str:
+            # --attach is required for --rm: kubectl rejects "--rm should only
+            # be used for attached containers" before it creates any pod when
+            # neither --attach, -i nor -t is set (#1849). Attaching also makes
+            # kubectl stream the pod's stdout instead of returning as soon as
+            # the pod is scheduled, so AdapterResult.output really is the job's
+            # output rather than an empty string.
             completed = subprocess.run(
                 [
                     "kubectl",
@@ -100,6 +109,7 @@ class KubernetesAdapter(GenericAgentAdapter):
                     _pod_name(run_id, image, command),
                     "-n",
                     self.namespace,
+                    "--attach",
                     "--rm",
                     "--image",
                     image,
