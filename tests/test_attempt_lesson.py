@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from continuum.events import EventType
 from continuum.interchange import export_semantic_state, import_semantic_state
@@ -370,6 +371,149 @@ def test_lesson_size_bounded() -> None:
         assert total <= 2048
     finally:
         storage.close()
+
+
+def _synthetic_decision_with(oversize: str, status_count: int) -> Any:
+    """A RecoveryDecision whose validation statuses carry ``oversize`` details."""
+    from continuum.checkpoint.manager import RestoredRun
+    from continuum.environment.diff import EnvironmentDiff
+    from continuum.models import (
+        Component,
+        ComponentValidationEntry,
+        RecoveryContract,
+        RecoverySafety,
+        StateStatus,
+        StateValidationResult,
+    )
+    from continuum.recovery.engine import RecoveryDecision
+    from continuum.recovery.planner import RepairPlan
+    from continuum.state.validator import ValidationOutcome
+
+    storage = _make_storage()
+    try:
+        state = project("run_1", storage.read_events("run_1"))
+    finally:
+        storage.close()
+    report = StateValidationResult(
+        run_id="run_1",
+        statuses=[
+            ComponentValidationEntry(
+                component=Component.GOAL,
+                component_id=f"g{i}",
+                status=StateStatus.STALE,
+                detail=oversize,
+            )
+            for i in range(status_count)
+        ],
+        safe_to_resume=False,
+        reason=oversize,
+    )
+    validation = ValidationOutcome(state=state, report=report, environment_diff=EnvironmentDiff())
+    decision = RecoveryDecision(
+        run_id="run_1",
+        mode="repair_and_resume",  # type: ignore[arg-type]
+        contract=RecoveryContract(
+            run_id="run_1",
+            checkpoint_version=0,
+            recovery_status=RecoverySafety.REQUIRES_REPAIR,
+            verified=[],
+            invalidated=[],
+            required_actions=[],
+        ),
+        plan=RepairPlan(steps=[]),
+        validation=validation,
+        restored=RestoredRun(
+            run_id="run_1", state=state, checkpoint=None, pending_events=0, replayed=False
+        ),
+        uncertain_actions=(),
+        rationale=(oversize, oversize),
+    )
+    return decision
+
+
+def test_build_attempt_lesson_trims_an_oversized_lesson_adaptively() -> None:
+    """The adaptive 2048-byte loop runs and converges (#1867).
+
+    Per-field capping to 512 does not by itself keep a lesson within budget:
+    several large statuses fill ``source_evidence`` past 2048 bytes, so the
+    loop has to halve the largest fields and then trim evidence. The lesson
+    it returns must fit, and at least one field must have been *halved*
+    rather than merely capped -- a capped field is exactly 512 long, and a
+    field the loop touched is strictly shorter.
+    """
+    from continuum.recovery.summary import build_attempt_lesson
+
+    oversize = "x" * 512
+    lesson = build_attempt_lesson(_synthetic_decision_with(oversize, status_count=8))
+
+    assert len(lesson.falsified) <= 512
+    assert len(lesson.env_delta) <= 512
+    assert len(lesson.next_avoid) <= 512
+    total = len(json.dumps(lesson.model_dump(mode="json"), sort_keys=True).encode())
+    assert total <= 2048
+    # The loop ran: eight 512-char evidence entries (~4 KiB) could not fit
+    # otherwise, and it halves fields past their 512 cap-down before it
+    # touches evidence.
+    assert len(lesson.source_evidence) < 8 or any(
+        len(f) < 512 for f in (lesson.falsified, lesson.env_delta, lesson.next_avoid)
+    )
+
+
+def test_build_attempt_lesson_halves_the_largest_field_first() -> None:
+    """A skirting-the-budget lesson halves its largest field, once, and keeps evidence (#1867)."""
+    from continuum.recovery.summary import build_attempt_lesson
+
+    oversize = "x" * 512
+    decision = _synthetic_decision_with(oversize, status_count=2)
+    lesson = build_attempt_lesson(decision)
+
+    # Without the loop the two 512-char evidence entries alone would sit the
+    # total above 2048; the halving is what brings it under.
+    total = len(json.dumps(lesson.model_dump(mode="json"), sort_keys=True).encode())
+    assert total <= 2048
+    assert len(lesson.source_evidence) == 2
+    assert any(len(f) < 512 for f in (lesson.falsified, lesson.env_delta, lesson.next_avoid))
+
+
+def test_render_attempt_lesson_accepts_a_raw_dictionary() -> None:
+    """A dict routes through the same formatter as a model instance."""
+    from continuum.recovery.summary import render_attempt_lesson
+
+    lines = render_attempt_lesson(
+        {
+            "attempt_id": "attempt_7",
+            "falsified": "db v1 -> v2 stale",
+            "env_delta": "db v1 -> v2",
+            "scar_action_ids": ["act_1", "act_2"],
+            "next_avoid": "re-pin --env before trusting cache",
+            "source_evidence": ["ledger shows the flip", "env probe disagrees"],
+        }
+    )
+    assert lines == [
+        "attempt attempt_7: db v1 -> v2 stale",
+        "env delta: db v1 -> v2",
+        "scar actions: act_1, act_2",
+        "next avoid: re-pin --env before trusting cache",
+        "evidence: ledger shows the flip",
+        "evidence: env probe disagrees",
+    ]
+
+
+def test_render_attempt_lesson_without_an_attempt_id_leads_with_falsified() -> None:
+    """An empty attempt id falls back to the falsified premise as the lead line."""
+    from continuum.recovery.summary import render_attempt_lesson
+
+    lines = render_attempt_lesson(
+        {
+            "attempt_id": "",
+            "falsified": "db v1 -> v2 stale",
+            "env_delta": "",
+            "scar_action_ids": [],
+            "next_avoid": "",
+            "source_evidence": [],
+        }
+    )
+    assert lines == ["falsified: db v1 -> v2 stale"]
 
 
 def test_briefing_includes_lessons_and_excludes_raw_tail(tmp_path=None) -> None:
