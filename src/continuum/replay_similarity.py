@@ -86,11 +86,29 @@ def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
 
 
 def _args_text(args: dict[str, Any]) -> str:
-    """Flatten arguments into comparable text."""
-    parts = []
-    for v in args.values():
-        parts.append(str(v))
-    return " ".join(parts)
+    """Flatten arguments into comparable text.
+
+    The flattened form is key-aware and order-insensitive (#1865): joining only
+    the values made ``{"recipient_account": "ACC-999", "amount": 100}`` and
+    ``{"sender_account": "ACC-999", "fee": 100}`` compare identical, so the
+    backends declared two distinct calls the same replay hit, while two
+    equal dicts written in a different insertion order flattened differently
+    and scored a false miss. Each argument is now ``key=value`` with the pairs
+    sorted by key, and nested containers are flattened the same way so a dict
+    nested at either side compares on content, not key order.
+    """
+
+    def _flatten(obj: Any) -> str:
+        if isinstance(obj, dict):
+            inner = ", ".join(
+                f"{k}: {_flatten(v)}" for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))
+            )
+            return "{" + inner + "}"
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return "[" + ", ".join(_flatten(v) for v in obj) + "]"
+        return str(obj)
+
+    return " ".join(f"{k}={_flatten(v)}" for k, v in sorted(args.items()))
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

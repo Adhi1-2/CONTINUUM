@@ -51,6 +51,43 @@ def test_exact_kind_still_works() -> None:
     assert similarity({"a": 1}, {"b": 2}, cfg) == 0.0
 
 
+def test_distinct_fields_with_identical_values_are_not_a_replay_hit() -> None:
+    # issue #1865: the flattened text joined only the argument values, so two
+    # calls over different fields with the same values -- a transfer to an
+    # account and a fee charged from one -- compared identical and the exact
+    # backend declared a replay, while the fuzzy backend scored 1.0. Keys are
+    # part of the flattened text now, so the two calls stay apart.
+    transfer_to = {"recipient_account": "ACC-999", "amount": 100}
+    transfer_from = {"sender_account": "ACC-999", "fee": 100}
+    exact = similarity(transfer_to, transfer_from, SimilarityConfig(kind="exact"))
+    assert exact == 0.0
+    fuzzy = similarity(
+        transfer_to, transfer_from, SimilarityConfig(kind="fuzzy", replay_threshold=0.90)
+    )
+    assert fuzzy < 0.5
+
+
+def test_equal_dicts_in_a_different_insertion_order_still_match() -> None:
+    # issue #1865, the false-miss side: two equal dicts flattened in insertion
+    # order produced different text, so the exact backend scored 0.0 for a call
+    # that is literally the same. The pairs are sorted, so insertion order no
+    # longer decides the score.
+    a = {"user": "alice", "repo": "continuum"}
+    b = {"repo": "continuum", "user": "alice"}
+    assert a == b
+    assert similarity(a, b, SimilarityConfig(kind="exact")) == 1.0
+    assert similarity(a, b, SimilarityConfig(kind="fuzzy")) == 1.0
+
+
+def test_nested_dicts_compare_on_content_not_key_order() -> None:
+    # The same #1865 loss happens one level down: a filter dict nested in the
+    # arguments flattened to a repr that kept insertion order, so equal nested
+    # dicts missed. Nested containers flatten key-aware and sorted too.
+    a = {"filter": {"status": "open", "tenant": "acme"}}
+    b = {"filter": {"tenant": "acme", "status": "open"}}
+    assert similarity(a, b, SimilarityConfig(kind="exact")) == 1.0
+
+
 # --- classify_call ---------------------------------------------------------------- #
 
 
@@ -89,6 +126,30 @@ def test_different_intent_returns_fresh() -> None:
         action_type="send_invoice",
         prior_actions=PRIOR,
         config=_cfg(),
+        run_id="run_1",
+    )
+    assert kind == "fresh"
+    assert match is None
+
+
+def test_distinct_fields_with_identical_values_do_not_replay_classify() -> None:
+    # issue #1865 at the classify_call level: a transfer to an account and a
+    # fee charged from one share their values, so the value-only flattening
+    # made the second call a replay hit on the first and returned the cached
+    # result of a different action.
+    prior = {
+        "action_1": {
+            "action_type": "transfer_funds",
+            "status": "completed",
+            "arguments": {"sender_account": "ACC-999", "fee": 100},
+        }
+    }
+    kind, match = classify_call(
+        new_key="k1",
+        new_args={"recipient_account": "ACC-999", "amount": 100},
+        action_type="transfer_funds",
+        prior_actions=prior,
+        config=SimilarityConfig(kind="fuzzy", replay_threshold=0.90),
         run_id="run_1",
     )
     assert kind == "fresh"
@@ -209,10 +270,12 @@ def test_cosine_clamps_negative_to_zero() -> None:
 
 
 def test_classify_call_embedding_ragged_vector_no_false_fork() -> None:
-    # Ragged embedding vectors must not misclassify as fork (issue #1608)
+    # Ragged embedding vectors must not misclassify as fork (issue #1608).
+    # The embedder sees the flattened argument text, key-aware since #1865, so
+    # it matches on a substring rather than the exact whole text.
     cfg = SimilarityConfig(
         kind="embedding",
-        embedder=lambda t: [1.0, 0.0] if t == "target" else [3.0, 4.0, 100.0],
+        embedder=lambda t: [1.0, 0.0] if "target" in t else [3.0, 4.0, 100.0],
     )
     kind, match = classify_call(
         new_key="k_new",
