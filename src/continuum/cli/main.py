@@ -3029,6 +3029,53 @@ def cmd_gateway(args: argparse.Namespace, storage: Storage, out: Any, err: Any) 
     return ExitCode.OK
 
 
+#: How long ``daemon --detach`` waits for the detached child to signal it is
+#: ready, in seconds. The detached child writes its own PID file once the
+#: gateway has bound. 500ms was routinely shorter than Python startup on a
+#: cold Windows machine, so the wait expired while the child was still healthy
+#: and the command reported success for a daemon that had not bound yet -- or
+#: that subsequently failed (#1855).
+DEFAULT_DAEMON_STARTUP_TIMEOUT = 10.0
+
+#: Upper bound on the override below: a deadline measured in minutes is a
+#: misconfiguration, not patience.
+_MAX_DAEMON_STARTUP_TIMEOUT = 300.0
+
+
+def _daemon_startup_timeout() -> float:
+    """The detached-start readiness deadline, overridable by environment.
+
+    ``CONTINUUM_DAEMON_STARTUP_TIMEOUT`` is read as seconds and clamped to a
+    sane range, so a typo or a negative value cannot make the wait instant or
+    unbounded. The default is deliberately realistic on a cold start.
+    """
+    raw = os.environ.get("CONTINUUM_DAEMON_STARTUP_TIMEOUT")
+    if raw is None:
+        return DEFAULT_DAEMON_STARTUP_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return DEFAULT_DAEMON_STARTUP_TIMEOUT
+    if timeout != timeout or timeout <= 0.0:  # NaN or non-positive
+        return DEFAULT_DAEMON_STARTUP_TIMEOUT
+    return min(timeout, _MAX_DAEMON_STARTUP_TIMEOUT)
+
+
+def _port_is_ready(port: int, timeout: float = 0.25) -> bool:
+    """True when something is accepting connections on the daemon port.
+
+    The detached child's PID file says the gateway *will* bind; a socket that
+    accepts a connection says it has (#1855).
+    """
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err: Any) -> int:
     """Run CONTINUUM as a background daemon (gateway + watch).
 
@@ -3037,7 +3084,6 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
     """
     import contextlib
     import signal
-    import sqlite3
     import subprocess
     import sys
     import threading
@@ -3050,7 +3096,6 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
         load_gateway_config,
         load_gateway_tenant,
     )
-    from continuum.storage.base import StorageError
     from continuum.storage.sqlite import _resolve_path
 
     config_path = Path(args.config) if args.config else Path(DEFAULT_GATEWAY_CONFIG_PATH)
@@ -3082,7 +3127,19 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
                 if db_path
                 else None
             )
-            if db_path and db_path != ":memory:" and probe_path and probe_path.exists():
+            # Only a SQLite database is a file on disk, so only it must exist
+            # before it is opened: guarding every URL with Path.exists() is
+            # never true for ``postgresql://...``, the probe was silently
+            # skipped, and the daemon started with no run bound even though a
+            # storage backend could have reported the active run (#1855).
+            db_is_sqlite_file = (
+                db_path is not None
+                and db_path != ":memory:"
+                and not str(db_path).startswith(("postgres://", "postgresql://"))
+            )
+            if db_path and (
+                not db_is_sqlite_file or (probe_path is not None and probe_path.exists())
+            ):
                 try:
                     probe_storage = open_storage(db_path)
                     try:
@@ -3090,7 +3147,12 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
                         run_id = active.run_id if active else None
                     finally:
                         probe_storage.close()
-                except (sqlite3.Error, StorageError, ValueError, OSError) as exc:
+                except Exception as exc:
+                    # The probe is best-effort: a storage backend that cannot
+                    # answer (no psycopg extra, an unreachable server, an
+                    # unsupported scheme) must not take the daemon down with
+                    # it, so the failure is a warning and the run stays
+                    # unbound rather than guessed.
                     print(
                         f"warning: failed to probe active run from {db_path}: {exc}",
                         file=err,
@@ -3179,7 +3241,7 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
         poll_fn = getattr(proc, "poll", None)
         child_pid: int | None = None
 
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + _daemon_startup_timeout()
         while time.monotonic() < deadline:
             if callable(poll_fn):
                 rc = poll_fn()
@@ -3218,6 +3280,34 @@ def cmd_daemon(args: argparse.Namespace, storage: Storage | None, out: Any, err:
 
         # Fallback for environments where child runs mock or does not write pid file.
         if child_pid is None:
+            # The deadline elapsed without the child's own PID file. Report
+            # success only when something can actually be verified: the child
+            # having exited is an error, and a port that still refuses
+            # connections means the gateway never bound, so the operator is
+            # told that readiness was not confirmed instead of being told the
+            # daemon is up (#1855).
+            exit_code: int | None = None
+            poll = poll_fn if callable(poll_fn) else None
+            if poll is not None:
+                rc = poll()
+                if isinstance(rc, int):
+                    exit_code = rc
+            if exit_code is not None:
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip() in (
+                        str(proc.pid),
+                        "",
+                    ):
+                        pid_file.unlink(missing_ok=True)
+                print(f"error: daemon exited during startup (code {exit_code})", file=err)
+                return ExitCode.ERROR
+            if args.port > 0 and not _port_is_ready(args.port):
+                print(
+                    "warning: the daemon did not signal readiness before the startup "
+                    "deadline; it may still be starting, or it may have failed. "
+                    "Check the log next to the pid file.",
+                    file=err,
+                )
             with contextlib.suppress(OSError, UnicodeDecodeError):
                 if not pid_file.exists() or pid_file.read_text(encoding="utf-8").strip() in (
                     initial_pid_content or "",

@@ -1610,7 +1610,7 @@ def test_cmd_daemon_resolves_active_run_when_storage_none(tmp_path: Path) -> Non
         assert mock_server.call_args.args[1] == "active_daemon_run"
 
 
-def test_cmd_daemon_detach_without_os_fork(tmp_path: Path) -> None:
+def test_cmd_daemon_detach_without_os_fork(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """cmd_daemon detach spawns background process when os.fork is unavailable (#1603)."""
     import argparse
     import io
@@ -1648,6 +1648,10 @@ def test_cmd_daemon_detach_without_os_fork(tmp_path: Path) -> None:
 
     mock_proc = MagicMock()
     mock_proc.pid = 99999
+
+    # The child is a mock that never writes its own PID file, so this test
+    # exercises the deadline-elapsed fallback and wants it fast (#1855).
+    monkeypatch.setenv("CONTINUUM_DAEMON_STARTUP_TIMEOUT", "0.05")
 
     orig_fork = getattr(os, "fork", None)
     if hasattr(os, "fork"):
@@ -1894,7 +1898,330 @@ def test_cmd_daemon_corrupt_database_probe_warns(tmp_path: Path) -> None:
         assert "warning: failed to probe active run" in err.getvalue()
 
 
-def test_cmd_daemon_detach_windows_creationflags(tmp_path: Path) -> None:
+def test_cmd_daemon_probes_postgres_url_directly(tmp_path: Path) -> None:
+    """The active-run probe must not require a path on disk for non-SQLite DBs (#1855).
+
+    Every URL was gated behind ``Path(db).exists()``, which is never true for
+    ``postgresql://...``, so the probe was skipped and the daemon started with
+    no run bound to the run a Postgres backend could have reported.
+    """
+    import argparse
+    import io
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db="postgresql://user:pass@localhost:5432/continuum",
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    probe = MagicMock()
+    probe.get_active_run.return_value = Run(run_id="pg_active_run", goal="g")
+    with (
+        patch("continuum.cli.main.open_storage", return_value=probe) as mock_open,
+        patch("continuum.gateway.GatewayServer") as mock_server,
+        patch("signal.signal"),
+    ):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        # The Postgres URL was opened and probed, not skipped as a nonexistent
+        # path, and the reported run is the one the backend answered with.
+        mock_open.assert_called_once_with("postgresql://user:pass@localhost:5432/continuum")
+        assert mock_server.call_args.args[1] == "pg_active_run"
+        assert "failed to probe" not in err.getvalue()
+
+
+def test_cmd_daemon_probes_unreachable_postgres_warns_and_starts_unbound(
+    tmp_path: Path,
+) -> None:
+    """A Postgres probe that cannot answer warns but does not abort startup (#1855)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db="postgresql://user:pass@unreachable.example.invalid:5432/db",
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    def _boom(_url: object) -> object:
+        raise OSError("connection refused")
+
+    with (
+        patch("continuum.cli.main.open_storage", side_effect=_boom),
+        patch("continuum.gateway.GatewayServer") as mock_server,
+        patch("signal.signal"),
+    ):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert mock_server.call_args.args[1] is None
+        assert "warning: failed to probe active run" in err.getvalue()
+
+
+def test_cmd_daemon_missing_sqlite_file_is_not_probed(tmp_path: Path) -> None:
+    """A SQLite path that does not exist yet is not probed or created (#1855).
+
+    The disk check is what keeps the probe from materializing a database the
+    operator never pointed at; it applies to SQLite only.
+    """
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(tmp_path / "never_created.db"),
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with (
+        patch("continuum.cli.main.open_storage") as mock_open,
+        patch("continuum.gateway.GatewayServer") as mock_server,
+        patch("signal.signal"),
+    ):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        mock_open.assert_not_called()
+        assert "failed to probe" not in err.getvalue()
+    assert not (tmp_path / "never_created.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 10.0),
+        ("0.05", 0.05),
+        ("3", 3.0),
+        ("not-a-number", 10.0),
+        ("-1", 10.0),
+        ("1e9", 300.0),
+    ],
+)
+def test_daemon_startup_timeout_is_clamped(
+    raw: str | None, expected: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    # ``continuum.cli.main`` the module is shadowed by the ``main`` function
+    # in the package namespace, so import it by name.
+    cli_main = importlib.import_module("continuum.cli.main")
+
+    if raw is None:
+        monkeypatch.delenv("CONTINUUM_DAEMON_STARTUP_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("CONTINUUM_DAEMON_STARTUP_TIMEOUT", raw)
+    assert cli_main._daemon_startup_timeout() == expected
+
+
+def test_port_is_ready_matches_a_listening_socket() -> None:
+    import socket
+
+    from continuum.cli.main import _port_is_ready
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        assert _port_is_ready(port) is True
+    assert _port_is_ready(port) is False
+
+
+def test_cmd_daemon_detach_child_exited_after_deadline_fails(
+    tmp_path: Path,
+) -> None:
+    """A child that exits without the loop noticing must not be reported as up (#1855).
+
+    The readiness wait used to report success as soon as its hardcoded 500ms
+    deadline elapsed, even when the child had died in that window. The exit is
+    re-checked after the deadline now.
+    """
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = 1
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with (
+            patch("continuum.cli.main._daemon_startup_timeout", return_value=0.0),
+            patch("continuum.cli.main._port_is_ready", return_value=False),
+            patch("subprocess.Popen", return_value=mock_proc),
+        ):
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: daemon exited during startup (code 1)" in err.getvalue()
+            assert not pid_file.exists()
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_deadline_elapsed_unready_warns(tmp_path: Path) -> None:
+    """A child that never signals readiness is reported as unconfirmed, not up (#1855)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = None
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with (
+            patch("continuum.cli.main._daemon_startup_timeout", return_value=0.0),
+            patch("continuum.cli.main._port_is_ready", return_value=False),
+            patch("subprocess.Popen", return_value=mock_proc),
+        ):
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            assert "did not signal readiness" in err.getvalue()
+            # The fallback PID is still recorded so the daemon can be stopped.
+            assert pid_file.read_text(encoding="utf-8") == "99999"
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_windows_creationflags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Windows detach passes DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP flags (#1640)."""
     import argparse
     import io
@@ -1932,6 +2259,8 @@ def test_cmd_daemon_detach_windows_creationflags(tmp_path: Path) -> None:
 
     mock_proc = MagicMock()
     mock_proc.pid = 88888
+
+    monkeypatch.setenv("CONTINUUM_DAEMON_STARTUP_TIMEOUT", "0.05")
 
     orig_fork = getattr(os, "fork", None)
     if hasattr(os, "fork"):
@@ -2279,7 +2608,9 @@ def test_cmd_daemon_detach_early_exit_preserves_foreign_pid(tmp_path: Path) -> N
             setattr(os, "fork", orig_fork)  # noqa: B010
 
 
-def test_cmd_daemon_detach_log_file_oserror_falls_back_to_devnull(tmp_path: Path) -> None:
+def test_cmd_daemon_detach_log_file_oserror_falls_back_to_devnull(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Non-fork detach falls back to DEVNULL if opening the log file fails (#1669)."""
     import argparse
     import builtins
@@ -2320,6 +2651,8 @@ def test_cmd_daemon_detach_log_file_oserror_falls_back_to_devnull(tmp_path: Path
     mock_proc = MagicMock()
     mock_proc.pid = 99999
     mock_proc.poll.return_value = None
+
+    monkeypatch.setenv("CONTINUUM_DAEMON_STARTUP_TIMEOUT", "0.05")
 
     orig_open = builtins.open
 
