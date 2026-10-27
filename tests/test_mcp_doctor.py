@@ -1408,3 +1408,60 @@ def test_find_registration_still_reads_the_committed_entry_without_a_local_one(
     assert found is not None
     assert found["scope"] == "project"
     assert found["baked_client"] == "committed-name"
+
+
+def test_find_registration_prefers_project_over_global_user_for_non_nesting_hosts(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """For hosts without a nested local scope, the project file must lead (#1853).
+
+    Only claude-code nests its per-user settings by project. For cursor the
+    profile's ``local_settings`` is the same global file as its
+    ``user_settings`` (``~/.cursor/mcp.json``), so yielding the local scope
+    first read that global file before the project's own committed one, and
+    the doctor reported the client name of a registration cursor ignores in
+    favour of the project's.
+    """
+    home = _isolated_home(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    global_dir = home / ".cursor"
+    global_dir.mkdir()
+    _write_registration(global_dir, "global-client", host_file="mcp.json")
+    project_dir = project / ".cursor"
+    project_dir.mkdir()
+    _write_registration(project_dir, "project-client", host_file="mcp.json")
+
+    found = find_registration(project)
+
+    assert found is not None
+    assert found["host"] == "cursor"
+    assert found["scope"] == "project"
+    assert found["baked_client"] == "project-client"
+    assert found["settings_path"] == project_dir / "mcp.json"
+
+
+def test_find_registration_reads_a_global_user_file_as_user_scope(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A global registration on a non-nesting host is found, and scoped honestly (#1853).
+
+    The global file is still read -- the bug was precedence, not detection --
+    but under the ``user`` scope it actually is, not a ``local`` label the
+    host has no a scope for.
+    """
+    home = _isolated_home(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    global_dir = home / ".cursor"
+    global_dir.mkdir()
+    _write_registration(global_dir, "global-client", host_file="mcp.json")
+
+    found = find_registration(project)
+
+    assert found is not None
+    assert found["host"] == "cursor"
+    assert found["scope"] == "user"
+    assert found["baked_client"] == "global-client"

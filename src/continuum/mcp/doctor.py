@@ -669,15 +669,24 @@ def _registration_sites(
 ) -> Iterator[tuple[str, Path, str, dict[str, Any] | None]]:
     """Every place a registration for this project could live, in the host's own precedence.
 
-    Local leads: it is the per-user file for this project, and the CLI's own
-    ``--scope`` help states local wins over the committed ``.mcp.json``, so
-    when both scopes hold a registration the one the host actually runs is
-    local. Reading project first made the permission probe declare the client
-    name of a registration the host ignores while the effective one bakes a
-    different one (#1764). Project follows, then user, the broadest scope
-    last. The scope travels with each site because a host whose per-user file
-    nests by project can only be read back once the checkout it belongs to is
-    named again.
+    Local leads, but only where ``local`` is a real scope: it is the per-user
+    file for this project, and the CLI's own ``--scope`` help states local
+    wins over the committed ``.mcp.json``, so when both scopes hold a
+    registration the one the host actually runs is local. Reading project
+    first made the permission probe declare the client name of a registration
+    the host ignores while the effective one bakes a different one (#1764).
+    Project follows, then user, the broadest scope last. The scope travels
+    with each site because a host whose per-user file nests by project can
+    only be read back once the checkout it belongs to is named again.
+
+    Only a host that nests its per-user settings by project has a ``local``
+    scope distinct from the global user file (``scope_available``). For every
+    other host -- cursor, gemini, vscode, codex, opencode, zed, continue --
+    the profile's ``local_settings`` *is* the user-wide file, so yielding it
+    under ``local`` ahead of project made a global registration shadow the
+    project's own committed one, and the doctor reported the client name of a
+    registration that host ignores (#1853). Those hosts' global file is still
+    read, under the ``user`` scope that already follows project.
     """
     for scope, key in (
         ("local", "local_settings"),
@@ -685,6 +694,8 @@ def _registration_sites(
         ("user", "user_settings"),
     ):
         for host, profile in HOST_PROFILES.items():
+            if scope == "local" and not profile.get("nested_by_project"):
+                continue
             path = Path(profile[key]).expanduser()
             if not path.is_absolute():
                 path = cwd / path
