@@ -10,6 +10,8 @@ family aggregation.
 from __future__ import annotations
 
 import io
+import json
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,7 @@ from continuum.actions import ActionLedger
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
 from continuum.gate import load_gate_config
-from continuum.models import Origin, Run
+from continuum.models import Action, Origin, Run
 from continuum.recovery.family import roll_up_children
 from continuum.recovery.fork import ForkNeighbour, approve_fork, detect_fork_candidates
 from continuum.storage import SQLiteStorage
@@ -84,6 +86,45 @@ def test_other_action_types_never_match(db: str) -> None:
         action_type="delete_record",
         tool_input={"path": "out/INV-001.pdf"},
         actions_by_key=fold(db),
+    )
+    assert candidates == []
+
+
+def test_a_call_naming_no_distinctive_resource_is_not_a_candidate(db: str) -> None:
+    # Values that cannot identify a resource -- a stopword key and a value
+    # shorter than three characters -- yield no identity tokens at all, so the
+    # call cannot overlap a journalled action even though the ledger holds one
+    # that mentions real tokens (issue #1870).
+    candidates = detect_fork_candidates(
+        action_type="send_invoice",
+        tool_input={"status": "ok"},
+        actions_by_key=fold(db),
+    )
+    assert candidates == []
+
+
+def test_a_tokenless_call_short_circuits_before_the_ledger_is_scanned() -> None:
+    # The early return is the whole point of the guard: a call with no tokens
+    # must not pay for, or react to, the journalled actions at all.
+    def _explode(*args: object, **kwargs: object) -> object:
+        raise AssertionError("tokenless calls must not scan actions_by_key")
+
+    class _Unscanned(Mapping[str, Action]):
+        items = _explode  # type: ignore[assignment]
+
+        def __getitem__(self, key: str) -> Action:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    candidates = detect_fork_candidates(
+        action_type="send_invoice",
+        tool_input={"status": "ok"},
+        actions_by_key=_Unscanned(),
     )
     assert candidates == []
 
@@ -218,6 +259,48 @@ def test_auto_named_children_do_not_collide(db: str) -> None:
         second = approve_fork(store, "run_1", reason="b")
     assert first.run_id != second.run_id
     assert first.run_id.startswith("run_1_fork")
+
+
+def test_approve_fork_trims_an_oversized_attempt_lesson(tmp_path: Path) -> None:
+    """The fork's persisted lesson must fit 2048 bytes no matter what it records (#1870).
+
+    Eight unsettled approvals, each with a 512-character subject, would put the
+    attempt lesson well past the budget. The adaptive loop has to shed evidence
+    entries until it fits -- and the reason is the audit, so the loop must cut
+    evidence, not the capped fork reason.
+    """
+    path = str(tmp_path / "f.db")
+    subject = "y" * 512
+    approvals = [f"ap_{i:02d}" for i in range(8)]
+    with SQLiteStorage(path) as store:
+        store.create_run(Run(run_id="run_1", goal="Send invoices"))
+        store.append_event("run_1", EventType.RUN_STARTED, {"goal": "Send invoices"})
+        for approval_id in approvals:
+            store.append_event(
+                "run_1",
+                EventType.APPROVAL_GRANTED,
+                {"approval_id": approval_id, "subject": subject},
+            )
+
+        child = approve_fork(
+            store,
+            "run_1",
+            reason="a" * 2000,
+            carry_forward=approvals,
+        )
+        assert child.parent_run_id == "run_1"
+
+        events = list(store.read_events("run_1"))
+        lessons = [e for e in events if e.type is EventType.ATTEMPT_LESSON]
+        assert len(lessons) == 1
+        payload = lessons[0].payload
+        # The same measure the loop itself uses, byte for byte.
+        total = len(json.dumps(payload, sort_keys=True).encode())
+        assert total <= 2048
+        # Evidence was shed to get there: the eight oversized approvals cannot
+        # all survive, and the fork reason keeps its full 512-character cap.
+        assert len(payload["source_evidence"]) < 8
+        assert len(payload["falsified"]) == 512
 
 
 def test_cli_fork_command_records_and_tree_marks_it(db: str) -> None:
