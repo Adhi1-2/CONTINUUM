@@ -22,7 +22,7 @@ from continuum.actions import ActionLedger
 from continuum.actions.idempotency import idempotency_key
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
-from continuum.models import ActionStatus, RunStatus
+from continuum.models import ActionStatus, Run, RunStatus
 from continuum.storage import SQLiteStorage
 from continuum.tui import TuiApp, run_tui
 from continuum.tui import model as tui_model
@@ -192,6 +192,101 @@ def test_family_lines_refuse_a_missing_run(store: SQLiteStorage) -> None:
 
     with pytest.raises(RunNotFound):
         tui_model.family_lines(store, "ghost")
+
+
+def test_overview_lines_report_a_projection_failure(store: SQLiteStorage) -> None:
+    """A poisoned log must surface its break in the overview, not fold silently (#1841).
+
+    ``overview_lines`` restores with ``on_unprojectable="degrade"``, so a run
+    whose tail does not fold still answers -- naming where the fold stopped,
+    which is what the operator needs to see before anything else.
+    """
+    store.create_run(Run(run_id="r1", goal="ship"))
+    store.append_event("r1", EventType.RUN_STARTED, {"goal": "ship", "total": 100})
+    store.append_event("r1", EventType.TASK_UPDATED, {"completed": 999, "failed": 0})
+
+    joined = "\n".join(tui_model.overview_lines(store, "r1"))
+
+    assert "PROJECTION FAILURE: the log stops folding at sequence 2 (TASK_UPDATED)" in joined
+    assert "exceeds total" in joined
+    assert "verify" in joined
+
+
+def test_recovery_lines_surf_a_reconciler_config_error(
+    db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken reconcilers registry is reported as an error step, not dropped (#1841)."""
+    import continuum.reconcilers as reconcilers
+
+    def _broken(path: object) -> list[str]:
+        raise reconcilers.ReconcilerConfigError("registry has no probe section")
+
+    run("--db", db, "start", "r1", "--goal", "g")
+    monkeypatch.setattr(reconcilers, "load_reconcilers", _broken)
+
+    joined = "\n".join(tui_model.recovery_lines(store, "r1"))
+
+    assert "error: registry has no probe section" in joined
+
+
+def test_recovery_lines_swallow_a_non_config_reconciler_error(
+    db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only config errors surface; a registry that raises anything else still yields steps (#1841).
+
+    The asymmetry is deliberate and worth pinning: a malformed registry is a
+    fixable operator-visible condition, while an arbitrary exception from a
+    probe plugin must not poison the verdict the operator came to read.
+    """
+    import continuum.reconcilers as reconcilers
+
+    def _crash(path: object) -> list[str]:
+        raise RuntimeError("probe plugin blew up")
+
+    run("--db", db, "start", "r1", "--goal", "g")
+    monkeypatch.setattr(reconcilers, "load_reconcilers", _crash)
+
+    joined = "\n".join(tui_model.recovery_lines(store, "r1"))
+
+    # The exception is swallowed and the verdict still renders in full: no
+    # error leaks into the prose, and the run is not reported as un-readable.
+    assert "error:" not in joined
+    assert "CONTINUUM RECOVERY" in joined
+    assert "assess error" not in joined
+
+
+def test_budget_rows_survive_a_broken_budget_registry(
+    db: str, store: SQLiteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry that cannot be parsed falls back to observed attempts only (#1841).
+
+    The fallback is the safety property: a broken ``budgets.json`` must not
+    take the dashboard down with it.
+    """
+    run("--db", db, "start", "r1", "--goal", "g")
+    ActionLedger(SQLiteStorage(db), "r1").claim("send_invoice", {}, key="invoice:I-1")
+
+    def _boom(path: object) -> dict[str, Any]:
+        raise RuntimeError("budgets.json is not valid JSON")
+
+    monkeypatch.setattr(tui_model, "load_budgets", _boom)
+
+    rows = {r.action_type: r for r in tui_model.budget_rows(store, "r1")}
+
+    # Only the observed type appears; configured-but-unused types come from the
+    # registry, which is gone. Limits fall back to the default allowance.
+    assert list(rows) == ["send_invoice"]
+    assert rows["send_invoice"].attempts == 1
+    assert rows["send_invoice"].max_attempts >= 1
+
+
+def test_completing_an_already_completed_run_says_so(db: str, store: SQLiteStorage) -> None:
+    """``complete`` is idempotent in prose: the second call names the state (#1841)."""
+    run("--db", db, "start", "r1", "--goal", "g")
+
+    assert tui_model.complete_run(store, "r1") == "run r1 completed"
+    assert tui_model.complete_run(store, "r1") == "run r1 is already completed"
+    assert store.get_run("r1").status is RunStatus.COMPLETED
 
 
 def test_recovery_lines_render_the_verdict_and_the_family_block(
