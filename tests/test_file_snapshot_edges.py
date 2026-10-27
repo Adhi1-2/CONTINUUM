@@ -84,6 +84,65 @@ def test_restore_file_returns_false_for_absent_snapshot(tmp_path: Path, monkeypa
     assert file_snapshot.restore_file(tmp_path / "restored.txt", digest) is False
 
 
+def test_restore_file_restores_snapshot_content_to_destination(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", tmp_path / "snapshots")
+    source = tmp_path / "src.txt"
+    source.write_bytes(b"snapshot me")
+    digest = hashlib.sha256(b"snapshot me").hexdigest()
+    assert file_snapshot.snapshot_file(source, sha256=digest) is not None
+
+    restored = tmp_path / "out" / "restored.txt"
+    assert file_snapshot.restore_file(restored, digest) is True
+    assert restored.read_bytes() == b"snapshot me"
+    # The atomic intermediate is replaced, not left beside the destination.
+    assert not restored.with_suffix(".tmp").exists()
+
+
+def test_restore_file_creates_missing_parent_directories(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", tmp_path / "snapshots")
+    source = tmp_path / "src.txt"
+    source.write_bytes(b"nested")
+    digest = hashlib.sha256(b"nested").hexdigest()
+    assert file_snapshot.snapshot_file(source, sha256=digest) is not None
+
+    deep = tmp_path / "new" / "nested" / "dir" / "restored.txt"
+    assert file_snapshot.restore_file(deep, digest) is True
+    assert deep.parent.is_dir()
+    assert deep.read_bytes() == b"nested"
+
+
+def test_restore_file_replaces_an_existing_destination(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", tmp_path / "snapshots")
+    source = tmp_path / "src.txt"
+    source.write_bytes(b"v2 content")
+    digest = hashlib.sha256(b"v2 content").hexdigest()
+    assert file_snapshot.snapshot_file(source, sha256=digest) is not None
+    destination = tmp_path / "dst.txt"
+    destination.write_bytes(b"stale content")
+
+    assert file_snapshot.restore_file(destination, digest) is True
+    assert destination.read_bytes() == b"v2 content"
+
+
+def test_restore_file_returns_false_when_the_destination_cannot_be_written(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A destination whose parent exists as a file cannot be created: mkdir
+    # raises, and restore must fail closed with False rather than propagate
+    # (the callers are adapters and embedding applications).
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", tmp_path / "snapshots")
+    source = tmp_path / "src.txt"
+    source.write_bytes(b"guarded")
+    digest = hashlib.sha256(b"guarded").hexdigest()
+    assert file_snapshot.snapshot_file(source, sha256=digest) is not None
+    blocker = tmp_path / "parent.txt"
+    blocker.write_bytes(b"i am not a directory")
+
+    assert file_snapshot.restore_file(blocker / "restored.txt", digest) is False
+
+
 def test_file_digest_returns_none_for_missing_source(tmp_path: Path) -> None:
     assert file_snapshot.file_digest(tmp_path / "missing.txt") is None
 
