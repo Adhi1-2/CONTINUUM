@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
+from types import ModuleType
+from typing import NoReturn
 
 import pytest
 
@@ -655,12 +658,40 @@ def test_storage_urls_are_accepted_in_several_forms(tmp_path: Path) -> None:
         assert memory.list_runs() == []
 
 
-def test_postgres_url_is_routed_to_postgres_backend() -> None:
+def test_postgres_url_is_routed_to_postgres_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     # A postgres URL is no longer refused with NotImplementedError; it is routed
     # to PostgresStorage. Without the driver installed that fails clearly
     # (RuntimeError mentioning psycopg) rather than silently falling back to
     # SQLite, which would mask a misconfiguration.
+    #
+    # The driver and a live local server are environmental, so the missing-driver
+    # path is forced: a None entry in sys.modules makes `import psycopg` raise
+    # ImportError, which keeps this assertion true on a machine that has the
+    # [postgres] extra installed (or a database actually listening) too (#1866).
+    monkeypatch.setitem(sys.modules, "psycopg", None)
     with pytest.raises(RuntimeError, match="psycopg"):
+        open_storage("postgresql://localhost/continuum")
+
+
+def test_postgres_url_attempts_a_connection_when_the_driver_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The routing must hand the URL to PostgresStorage, which reaches for a
+    # connection and reports the real failure. With psycopg installed but no
+    # server listening the raw connect error is wrapped rather than swallowed,
+    # and it must not be a silent SQLite fallback either (#1866).
+    psycopg = ModuleType("psycopg")
+
+    def _refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError("connection refused")
+
+    psycopg.connect = _refuse  # type: ignore[attr-defined]
+    rows = ModuleType("psycopg.rows")
+    rows.dict_row = object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", rows)
+
+    with pytest.raises(RuntimeError, match="could not connect to PostgreSQL"):
         open_storage("postgresql://localhost/continuum")
 
 
