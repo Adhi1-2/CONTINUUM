@@ -64,6 +64,22 @@ def run(*argv: str, tty: bool = False) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+@pytest.fixture(autouse=True)
+def _clean_terminal_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test a colour-permitting baseline (#1868).
+
+    `should_colour` reads the process environment, so an outer `NO_COLOR` (or
+    the `TERM=dumb` common to IDE test runners, Emacs and non-interactive CI
+    shells) leaks in and flips the tests that assert colour *is* emitted. The
+    suppression tests set those variables explicitly for their own cases, so
+    scrubbing them globally cannot broaden what they cover. Inherited by the
+    real-process subprocess test too, which is what makes that byte-for-byte
+    comparison deterministic as well.
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+
 # --- when colour is suppressed --------------------------------------------- #
 
 
