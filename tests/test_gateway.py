@@ -425,6 +425,51 @@ def test_a_body_that_is_not_utf8_is_refused_with_400(db: str, gateway: str) -> N
     assert "invalid JSON" in body["error"]
 
 
+def test_a_repeated_json_key_is_refused_with_400(db: str, gateway: str) -> None:
+    """A repeated object key must never reach the upstream raw (#1851).
+
+    The gateway checks the parsed body, where ``json.loads`` keeps the *last*
+    value of a repeated key, and forwards the caller's raw bytes verbatim. A
+    first-key-wins upstream therefore executes against a value the gateway
+    never saw, so ``{"id": "target", "id": "pre_claimed"}`` authorizes one
+    invoice and sends another. The same ambiguity bypasses the tenant check.
+    Refuse the request instead of guessing which duplicate the upstream
+    honours, and settle nothing.
+    """
+    claim(db, "invoice:seed")
+    status, body = _post_raw(gateway, "/v1/invoices", '{"id": "I-2", "id": "pre_claimed_invoice"}')
+    assert status == 400
+    assert "duplicate JSON object key" in body["error"]
+    # Nothing was forwarded or recorded as evidence.
+    with SQLiteStorage(db) as store:
+        events = [e for e in store.read_events("run_1") if e.type is EventType.TOOL_COMPLETED]
+    assert events == []
+
+
+def test_a_repeated_tenant_key_is_refused_with_400(db: str, gateway: str) -> None:
+    """The tenant bypass half of #1851: duplicate tenant keys disagree too."""
+    claim(db, "invoice:seed")
+    status, body = _post_raw(
+        gateway,
+        "/v1/invoices",
+        '{"id": "I-2", "tenant": "allowed", "tenant": "somebody_else"}',
+    )
+    assert status == 400
+    assert "duplicate JSON object key" in body["error"]
+
+
+def test_a_repeated_nested_json_key_is_refused_with_400(db: str, gateway: str) -> None:
+    """The hook walks nested objects, not just the top level (#1851)."""
+    claim(db, "invoice:seed")
+    status, body = _post_raw(
+        gateway,
+        "/v1/invoices",
+        '{"id": "I-2", "payload": {"account": "a", "account": "b"}}',
+    )
+    assert status == 400
+    assert "duplicate JSON object key" in body["error"]
+
+
 def test_an_empty_body_is_still_an_empty_mapping(db: str, gateway: str) -> None:
     """Only broken JSON becomes a 400; absent is not the same as malformed.
 

@@ -82,6 +82,30 @@ class _MalformedBody(Exception):
     """Internal signal: the request body could not be read as JSON (issue #323)."""
 
 
+class _DuplicateBodyKey(Exception):
+    """Internal signal: the request body repeats a JSON object key (#1851)."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that refuses a repeated key in a JSON object.
+
+    ``json.loads`` keeps the *last* value of a repeated key while other JSON
+    parsers -- standard Go and C++ services among them -- keep the *first*, and
+    the gateway forwards the caller's raw bytes verbatim. A body like
+    ``{"id": "target", "id": "pre_claimed"}`` therefore meant one thing to every
+    check the gate ran (the claim, the tenant, the authority scan) and another
+    to the upstream that executed the effect, so the duplicate key is a
+    smuggling channel between what was authorized and what ran. Refusing the
+    request beats guessing which duplicate the upstream will honour (#1851).
+    """
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateBodyKey(key)
+        obj[key] = value
+    return obj
+
+
 #: Requests larger than this are refused with 413 before the body is read.
 #: A proxy that reads unbounded bodies into memory is a denial-of-service
 #: surface against the very agent it protects.
@@ -718,7 +742,9 @@ class GatewayServer:
                 writes the refusal itself and raises, 413 with
                 :class:`_BodyTooLarge` when it is longer than ``max_bytes``, 400
                 with :class:`_MalformedBody` when it is not JSON this proxy can
-                decode (issue #323). Callers catch both and return, since the
+                decode (issue #323) or when it repeats a JSON object key, which
+                the raw forwarding would otherwise smuggle past the checks
+                (issue #1851). Callers catch both and return, since the
                 response is already on the wire.
                 """
                 transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
@@ -777,8 +803,8 @@ class GatewayServer:
                     # with no body at all.
                     return {}, b""
                 try:
-                    parsed = json.loads(raw)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+                except (_DuplicateBodyKey, json.JSONDecodeError, UnicodeDecodeError) as exc:
                     # Answering with an empty mapping instead would send the
                     # request on to be refused for a missing template field,
                     # naming the wrong problem: the body was never read as the
@@ -790,6 +816,25 @@ class GatewayServer:
                     # the parse. Left uncaught it escapes the handler entirely
                     # and the connection closes with no response at all, which
                     # is the same misreport as the missing field, only quieter.
+                    #
+                    # _DuplicateBodyKey is the half that *was* read and still
+                    # cannot be honoured: a repeated key names two values and
+                    # the raw bytes are what run upstream, so the gate's checks
+                    # and the executed effect would disagree on which value was
+                    # authorized (#1851). Refuse it before a claim is consulted
+                    # or a byte is forwarded.
+                    if isinstance(exc, _DuplicateBodyKey):
+                        self._respond(
+                            400,
+                            {
+                                "error": (
+                                    f"duplicate JSON object key {exc.args[0]!r} in request body: "
+                                    "the raw body is forwarded verbatim, so a repeated key would "
+                                    "mean one value to the gateway's checks and another to the upstream"
+                                )
+                            },
+                        )
+                        raise _MalformedBody from exc
                     self._respond(400, {"error": f"invalid JSON in request body: {exc}"})
                     raise _MalformedBody from exc
                 return parsed, raw
