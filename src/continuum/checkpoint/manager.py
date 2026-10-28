@@ -36,15 +36,16 @@ from continuum.checkpoint.policy import (
     PolicyContext,
     default_policy,
 )
-from continuum.events import EventType
+from continuum.events import Event, EventType
 from continuum.models import (
     EnvironmentSnapshot,
     SemanticState,
     StateCheckpoint,
+    StateStatus,
     utcnow,
 )
 from continuum.state.semantic import project
-from continuum.storage.base import Storage
+from continuum.storage.base import CorruptedRecord, Storage
 
 # Resume banner persistence (issue #394): written on every checkpoint so a
 # SessionStart hook can inject a banner without opening the database. The
@@ -58,6 +59,28 @@ __all__ = ["CheckpointManager", "RestoredRun", "CheckpointError", "RESUME_JSON"]
 
 class CheckpointError(RuntimeError):
     """A checkpoint could not be created or restored."""
+
+
+def _mark_corruption_refusal(state: SemanticState, refusal: CorruptedRecord) -> SemanticState:
+    """Stamp a folded prefix with the storage read that refused to continue.
+
+    Mirrors ``_Accumulator.build_degraded`` for a corruption the projection
+    never sees (the row could not be turned into an event at all), so the
+    recovery engine's existing INVALID handling turns the refusal into a
+    REQUEST_HUMAN verdict naming the sequence (issue #1907).
+    """
+
+    reason = str(refusal) or "unreadable event record"
+    if "\n" in reason:
+        reason = reason.splitlines()[0]
+    return state.model_copy(
+        update={
+            "status": StateStatus.INVALID,
+            "unprojectable_at_sequence": refusal.sequence,
+            "unprojectable_event_type": "unreadable",
+            "unprojectable_reason": f"corrupted event record: {reason}",
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,16 +314,39 @@ class CheckpointManager:
         of a ProjectionError, so a poisoned log produces a verdict rather than
         ending the assessment. Defaults to ``"raise"``: ``restore`` also feeds
         write paths that must never mistake a partial fold for state.
+
+        The same contract covers a log that cannot even be *read*: under
+        ``"degrade"`` a ``CorruptedRecord`` from storage is treated like an
+        unprojectable event -- the clean prefix preceding the damaged row is
+        folded and the state is marked INVALID at the refused sequence, rather
+        than the read error escaping to the caller (issue #1907). Under the
+        default the exception propagates unchanged, so write paths still fail
+        loudly on a log they cannot trust.
         """
         checkpoint = self.storage.latest_checkpoint(run_id)
 
         if checkpoint is None:
-            events = self.storage.read_events(run_id)
+            refusal = None
+            try:
+                events = self.storage.read_events(run_id)
+            except CorruptedRecord as exc:
+                if on_unprojectable != "degrade":
+                    raise
+                refusal = exc
+                events = self._clean_prefix(run_id, after_sequence=0, refusal=exc)
             if not events:
+                if refusal is not None:
+                    # Nothing readable survived the damage: there is no state
+                    # to report, matching build_degraded's guard for a prefix
+                    # with no RUN_STARTED.
+                    raise refusal
                 raise CheckpointError(f"run {run_id!r} has no checkpoint and no events")
+            state = project(run_id, events, on_unprojectable=on_unprojectable)
+            if refusal is not None:
+                state = _mark_corruption_refusal(state, refusal)
             return RestoredRun(
                 run_id=run_id,
-                state=project(run_id, events, on_unprojectable=on_unprojectable),
+                state=state,
                 checkpoint=None,
                 pending_events=len(events),
                 replayed=True,
@@ -312,12 +358,22 @@ class CheckpointManager:
             )
 
         cursor = self._cursor_for(checkpoint)
-        pending = self.storage.read_events(run_id, after_sequence=cursor)
+        refusal = None
+        try:
+            pending = self.storage.read_events(run_id, after_sequence=cursor)
+        except CorruptedRecord as exc:
+            if on_unprojectable != "degrade":
+                raise
+            refusal = exc
+            pending = self._clean_prefix(run_id, after_sequence=cursor, refusal=exc)
 
         if not replay or not pending:
+            state = checkpoint.state
+            if refusal is not None:
+                state = _mark_corruption_refusal(state, refusal)
             return RestoredRun(
                 run_id=run_id,
-                state=checkpoint.state,
+                state=state,
                 checkpoint=checkpoint,
                 pending_events=len(pending),
                 replayed=False,
@@ -328,12 +384,32 @@ class CheckpointManager:
         state, _ = project_incremental(
             run_id, pending, base=checkpoint.state, on_unprojectable=on_unprojectable
         )
+        if refusal is not None:
+            state = _mark_corruption_refusal(state, refusal)
         return RestoredRun(
             run_id=run_id,
             state=state,
             checkpoint=checkpoint,
             pending_events=len(pending),
             replayed=True,
+        )
+
+    def _clean_prefix(
+        self, run_id: str, *, after_sequence: int, refusal: CorruptedRecord
+    ) -> Sequence[Event]:
+        """Re-read the events up to the row that refused to parse.
+
+        The corruption location comes from the ``CorruptedRecord`` itself
+        (issue #1907): everything strictly before that sequence is readable,
+        so the window ``after_sequence < sequence <= refusal.sequence - 1``
+        holds the last-good prefix. When the refusal carries no sequence the
+        prefix cannot be separated from the damaged tail, so the refusal is
+        re-raised rather than folding an arbitrary boundary.
+        """
+        if refusal.sequence is None:
+            raise refusal
+        return self.storage.read_events(
+            run_id, after_sequence=after_sequence, upto=refusal.sequence - 1
         )
 
     def history(self, run_id: str) -> Sequence[StateCheckpoint]:
