@@ -274,7 +274,7 @@ class CheckpointManager:
             _write_resume_json(run_id, stored)
         return stored
 
-    def _cursor_for(self, checkpoint: StateCheckpoint) -> int:
+    def _cursor_for(self, checkpoint: StateCheckpoint, *, on_unprojectable: str = "raise") -> int:
         """How far into the log a checkpoint really covers.
 
         The ``STATE_CHECKPOINTED`` annotation is written *after* the state was
@@ -282,11 +282,23 @@ class CheckpointManager:
         as unreplayed work would make every freshly-checkpointed run look stale
         and would replay a no-op event on every restore. The annotation carries
         no state, so the cursor advances past it.
+
+        The annotation row can itself be the damaged one (#1907). Under
+        ``"degrade"`` the read takes the same fallback a *missing* annotation
+        already takes -- the checkpoint's own ``source_sequence`` -- and the
+        unreadable row is left for the guarded pending read to mark; under the
+        default the refusal propagates, as reads a write path trusts must.
         """
         cursor = checkpoint.state.source_sequence
-        for event in self.storage.read_events(
-            checkpoint.run_id, after_sequence=cursor, upto=cursor + 1
-        ):
+        try:
+            rows = self.storage.read_events(
+                checkpoint.run_id, after_sequence=cursor, upto=cursor + 1
+            )
+        except CorruptedRecord:
+            if on_unprojectable != "degrade":
+                raise
+            return cursor
+        for event in rows:
             if (
                 event.type is EventType.STATE_CHECKPOINTED
                 and event.payload.get("checkpoint_id") == checkpoint.checkpoint_id
@@ -357,7 +369,7 @@ class CheckpointManager:
                 f"checkpoint {checkpoint.checkpoint_id!r} failed its integrity check"
             )
 
-        cursor = self._cursor_for(checkpoint)
+        cursor = self._cursor_for(checkpoint, on_unprojectable=on_unprojectable)
         refusal = None
         try:
             pending = self.storage.read_events(run_id, after_sequence=cursor)

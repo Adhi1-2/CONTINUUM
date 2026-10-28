@@ -18,13 +18,14 @@ escape.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from continuum.checkpoint import CheckpointManager
 from continuum.environment import StaticProvider, capture
-from continuum.events import EventType
+from continuum.events import Event, EventType
 from continuum.models import RecoveryMode, Run, StateStatus
 from continuum.recovery import RecoveryEngine
 from continuum.storage import SQLiteStorage
@@ -48,12 +49,14 @@ def _build_log(tmp_path: Path, run_id: str = "damaged") -> Path:
     return db
 
 
-def _corrupt_event(db: Path, run_id: str, *, sequence: int) -> None:
+def _corrupt_event(
+    db: Path, run_id: str, *, sequence: int, payload: str = '{"broken": "trunc'
+) -> None:
     conn = sqlite3.connect(db)
     try:
         conn.execute(
             "UPDATE events SET payload = ? WHERE run_id = ? AND sequence = ?",
-            ('{"broken": "trunc', run_id, sequence),
+            (payload, run_id, sequence),
         )
         conn.commit()
     finally:
@@ -212,3 +215,172 @@ def test_assess_on_a_clean_log_is_unchanged(tmp_path: Path) -> None:
     decision = _engine(db).assess("r")
     assert decision.mode is RecoveryMode.RESUME
     assert decision.restored.state.status is StateStatus.VALID
+
+
+# --- the bound cases: located, unlocated, and unrecoverable refusals ------- #
+
+
+def _checkpointed_db(tmp_path: Path, *, run_id: str = "r") -> Path:
+    """A run sealed at sequence 2 (annotation at 3), with two live events after.
+
+    Two post-checkpoint events let the pending window be non-empty when the
+    corrupted row is not the first one after the annotation.
+    """
+    db = tmp_path / "checkpointed.db"
+    storage = SQLiteStorage(db)
+    storage.create_run(Run(run_id=run_id, goal="g"))
+    storage.append_event(run_id, EventType.RUN_STARTED, {"goal": "g", "total": 3})
+    storage.append_event(run_id, EventType.WORK_COMPLETED, {"doc": 0})
+    env = capture(run_id, StaticProvider(dataset="v1"))
+    CheckpointManager(storage).checkpoint(run_id, environment=env)
+    storage.append_event(run_id, EventType.WORK_COMPLETED, {"doc": 1})
+    storage.append_event(run_id, EventType.WORK_COMPLETED, {"doc": 2})
+    storage.close()
+    return db
+
+
+def test_restore_marks_the_checkpoint_itself_when_nothing_follows(tmp_path: Path) -> None:
+    """Damage on the checkpoint's own annotation row leaves an empty pending
+    window after the cursor falls back, so the sealed checkpoint's state
+    carries the refusal mark (#1907)."""
+    db = _checkpointed_db(tmp_path)
+    # seq 3 is the STATE_CHECKPOINTED annotation: an unguarded read of it in
+    # _cursor_for would escape before the pending read is ever attempted.
+    _corrupt_event(db, "r", sequence=3)
+
+    storage = SQLiteStorage(db)
+    try:
+        restored = CheckpointManager(storage).restore("r", on_unprojectable="degrade")
+    finally:
+        storage.close()
+    assert restored.state.status is StateStatus.INVALID
+    assert restored.state.unprojectable_at_sequence == 3
+    assert restored.replayed is False
+    assert restored.pending_events == 0
+
+
+def test_restore_marks_the_incrementally_folded_state_when_the_tail_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    """A readable event between the checkpoint and the damage still folds, and
+    the refusal marks the state the incremental projection produced."""
+    db = _checkpointed_db(tmp_path)
+    _corrupt_event(db, "r", sequence=5)  # seq 4 survives the clean prefix
+
+    storage = SQLiteStorage(db)
+    try:
+        restored = CheckpointManager(storage).restore("r", on_unprojectable="degrade")
+    finally:
+        storage.close()
+    assert restored.state.status is StateStatus.INVALID
+    assert restored.state.unprojectable_at_sequence == 5
+    assert restored.replayed is True
+    assert restored.pending_events == 1
+
+
+def test_restore_raises_by_default_when_the_annotation_row_is_corrupt(tmp_path: Path) -> None:
+    """The cursor fallback is degrade-only: write paths keep the loud failure."""
+    db = _checkpointed_db(tmp_path)
+    _corrupt_event(db, "r", sequence=3)
+
+    storage = SQLiteStorage(db)
+    try:
+        with pytest.raises(CorruptedRecord):
+            CheckpointManager(storage).restore("r")
+    finally:
+        storage.close()
+
+
+def test_restore_raises_by_default_when_a_checkpoint_exists(tmp_path: Path) -> None:
+    """The checkpointed pending read keeps the loud failure under the default."""
+    db = _checkpointed_db(tmp_path)
+    _corrupt_event(db, "r", sequence=4)
+
+    storage = SQLiteStorage(db)
+    try:
+        with pytest.raises(CorruptedRecord):
+            CheckpointManager(storage).restore("r")
+    finally:
+        storage.close()
+
+
+def test_restore_flattens_a_multiline_refusal_reason(tmp_path: Path) -> None:
+    """A schema validation error spans several lines; the state field may not.
+
+    ``unprojectable_reason`` is joined into single-line rationale strings, so
+    a pydantic ``ValidationError`` is folded to its first line at the mark.
+    """
+    db = _build_log(tmp_path)
+    # Valid JSON that is not a valid event payload: pydantic reports it over
+    # multiple lines, unlike the truncated-JSON corruption above.
+    _corrupt_event(db, "damaged", sequence=3, payload="[1, 2, 3]")
+
+    storage = SQLiteStorage(db)
+    try:
+        restored = CheckpointManager(storage).restore("damaged", on_unprojectable="degrade")
+    finally:
+        storage.close()
+    reason = restored.state.unprojectable_reason
+    assert reason is not None
+    assert "corrupted event record" in reason
+    assert "\n" not in reason
+
+
+class _UnlocatingStorage(SQLiteStorage):
+    """A real storage whose live read refuses without locating the row.
+
+    The bound case of a read failure: no sequence to fold up to, so no clean
+    prefix can be separated from the damaged tail.
+    """
+
+    def read_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
+        del run_id, after_sequence, upto, rehydrate
+        raise CorruptedRecord("unreadable page (no row context)")
+
+
+def test_restore_reraises_a_refusal_that_locates_no_row(tmp_path: Path) -> None:
+    """Degrade cannot invent a boundary the refusal did not name (#1907)."""
+    db = tmp_path / "refusing.db"
+    _UnlocatingStorage(db).create_run(Run(run_id="damaged", goal="g"))
+
+    with pytest.raises(CorruptedRecord):
+        CheckpointManager(_UnlocatingStorage(db)).restore("damaged", on_unprojectable="degrade")
+
+
+def test_assess_tolerates_an_unlocated_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the all-events scan cannot even name the damage, it sees no
+    history rather than a silently bounded one, and assess still answers."""
+    db = _build_log(tmp_path)
+    engine = _engine(db)
+
+    def refuse(*args: object, **kwargs: object) -> Sequence[Event]:
+        raise CorruptedRecord("unreadable page (no row context)")
+
+    monkeypatch.setattr(engine.storage, "read_all_events", refuse)
+    decision = engine.assess("damaged")
+    assert decision.mode is RecoveryMode.REQUEST_HUMAN
+
+
+def test_assess_tolerates_a_refusal_that_cannot_be_re_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The salvage re-read can itself fail: the scan degrades to empty and
+    assess still answers, because losing evidence never downgrades a verdict."""
+    db = _build_log(tmp_path)
+    engine = _engine(db)
+
+    def refuse(*args: object, **kwargs: object) -> Sequence[Event]:
+        raise CorruptedRecord("events table: unreadable page", sequence=2)
+
+    monkeypatch.setattr(engine.storage, "read_all_events", refuse)
+    decision = engine.assess("damaged")
+    assert decision.mode is RecoveryMode.REQUEST_HUMAN
