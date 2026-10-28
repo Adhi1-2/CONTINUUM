@@ -29,8 +29,8 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,13 @@ from continuum.storage.base import (
     CorruptedRecord,
     RunNotFound,
     Storage,
+)
+from continuum.storage.blob import (
+    audit_blob_descriptor,
+    get_payload_offload_threshold,
+    is_offload_descriptor,
+    load_blob_payload,
+    maybe_offload_payload,
 )
 from continuum.storage.compaction import resolve_compaction_bound
 
@@ -306,6 +313,35 @@ class PostgresStorage(Storage):
 
     def _read(self) -> Any:
         return self._lock
+
+    @contextmanager
+    def atomic_claim(self, run_id: str, key: str | None = None) -> Iterator[None]:
+        """Wrap resolve and append in an atomic Postgres transaction with advisory lock.
+
+        Uses pg_advisory_xact_lock on the action key or run_id inside an explicit
+        transaction to ensure strict mutual exclusion during claim resolution and write.
+        """
+        lock_target = key or run_id
+        with self._write():
+            txn = self._connection.transaction()
+            txn.__enter__()
+            commit_on_exit = False
+            try:
+                self._connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"continuum:claim:{lock_target}",),
+                )
+                yield
+                commit_on_exit = True
+            except BaseException as exc:
+                if type(exc).__name__ in ("UnknownSideEffect", "GrantDenied", "LedgerError"):
+                    commit_on_exit = True
+                raise
+            finally:
+                if commit_on_exit:
+                    txn.__exit__(None, None, None)
+                else:
+                    txn.__exit__(Exception, Exception("rollback"), None)
 
     def close(self) -> None:
         """Close the connection. Later use raises from the driver."""
@@ -680,52 +716,9 @@ class PostgresStorage(Storage):
         explicit ``through_sequence`` at or above the anchor marker is
         rejected here too instead of archiving and deleting it (issue #1078).
         """
-        from continuum.checkpoint.manager import CheckpointManager
-
-        lv = self.latest_version(run_id)
-        head = self.last_sequence(run_id)
-        needs_fresh_anchor = lv is None or through_sequence is not None or lv.source_sequence < head
-        if needs_fresh_anchor:
-            try:
-                manager = CheckpointManager(self)
-                # The anchor must project over full history: after an earlier
-                # compaction the live tail begins at the anchor markers with
-                # no RUN_STARTED, so a live-only fold would conclude the run
-                # never started (issue #648). Per-turn checkpoint evaluation
-                # deliberately keeps the cheaper live-tail read.
-                state = manager.project_current(run_id, full_history=True)
-                # The anchor becomes the newest checkpoint, so it inherits the
-                # environment the run validated against: writing it without one
-                # would leave a compacted run with no snapshot to diff a resumed
-                # capture against, and every resource would read as unknown
-                # (issue #762).
-                anchored = self.latest_checkpoint(run_id)
-                manager.checkpoint(
-                    run_id,
-                    state=state,
-                    force_version=True,
-                    environment=anchored.environment if anchored is not None else None,
-                )
-            except Exception as exc:
-                raise ValueError(f"run {run_id!r} could not be anchored: {exc}") from exc
-            lv = self.latest_version(run_id)
-        storage_version = lv
-        if storage_version is None:
-            raise ValueError(f"run {run_id!r} could not be anchored: no projectable state")
-        # The anchor marker is appended at the head of the log in the
-        # transaction below, so its sequence is the current head + 1. Without
-        # this bound the DELETE below would take the marker and every live
-        # row after it, and the next append would mint a fresh genesis that
-        # forks the live chain from the archive.
-        anchor_sequence = self.last_sequence(run_id) + 1
-        self._validate_compaction_bound(through_sequence, anchor_sequence)
-        through = (
-            through_sequence
-            if through_sequence is not None
-            else min(storage_version.source_sequence, self.last_sequence(run_id))
+        storage_version, through = resolve_compaction_bound(
+            self, run_id, through_sequence, environment=environment
         )
-        if through < 1:
-            raise ValueError("nothing to compact: anchor would be empty")
 
         with self._write(), self._connection.transaction():
             self._append_chained(
@@ -753,7 +746,13 @@ class PostgresStorage(Storage):
 
         return {"archived": max(archived, 0)}
 
-    def read_archived_events(self, run_id: str, *, upto: int | None = None) -> Sequence[Event]:
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
         """Compacted events from the archive, oldest first."""
         query = "SELECT * FROM events_archive WHERE run_id = %s"
         params: list[Any] = [run_id]
@@ -763,7 +762,7 @@ class PostgresStorage(Storage):
         query += " ORDER BY sequence ASC"
         with self._read():
             rows = self._connection.execute(query, params).fetchall()
-        return [self._row_to_event(row) for row in rows]
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
 
     def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
         """Indexed cross-run ledger lookup (issue #216)."""
@@ -979,6 +978,10 @@ class PostgresStorage(Storage):
         events or editing history in the archive fails here instead of
         minting a fresh genesis out of whatever live rows survive.
 
+        ``checked`` covers every row audited, archived and live alike, and
+        ``trusted_through`` keeps a fully verified archived prefix even when a
+        live event further down the chain fails (#1814).
+
         When deep=True, also audits all referenced out-of-band blobs across
         both live and archived events.
         """
@@ -1004,10 +1007,19 @@ class PostgresStorage(Storage):
                 is not None
             )
             if has_archive or any(r["type"] == "EVENT_LOG_ANCHORED" for r in rows):
-                archive_violations, archive_edge = self._audit_archive(run_id, deep=deep)
+                archive_violations, archive_edge, archive_checked = self._audit_archive(
+                    run_id, deep=deep
+                )
                 violations.extend(archive_violations)
+                checked += archive_checked
                 if archive_violations:
                     intact = False
+                elif archive_edge is not None:
+                    # The archived prefix verified in full, so it stays the
+                    # trusted prefix even when a live event later fails: the
+                    # report must describe the last verified sequence, not the
+                    # last verified live row (#1814).
+                    last_good = archive_edge[0]
 
         if archive_edge is not None:
             # The live chain must pick up exactly where the archive ends.
@@ -1100,18 +1112,20 @@ class PostgresStorage(Storage):
 
     def _audit_archive(
         self, run_id: str, *, deep: bool = False
-    ) -> tuple[list[IntegrityViolation], tuple[int, str] | None]:
+    ) -> tuple[list[IntegrityViolation], tuple[int, str] | None, int]:
         """Deep-audit one run's archived prefix (issue #239).
 
         The archive holds the run's verbatim beginning, so it can be held to
         the full genesis standard: sequence 1 with no predecessor, unbroken
         sequencing and hash linkage throughout, and every stored hash equal
-        to the recomputed digest. Returns the violations found plus the
-        ``(sequence, hash)`` edge the live chain must continue from, or
-        ``None`` when nothing is archived.
+        to the recomputed digest. Returns the violations found, the
+        ``(sequence, hash)`` edge the live chain must continue from (``None``
+        when nothing is archived), and how many archived rows were audited
+        so the caller can account for them in its own tally (#1814).
         """
         violations: list[IntegrityViolation] = []
         edge: tuple[int, str] | None = None
+        checked = 0
         prev_hash: str | None = None
         expected_sequence = 1
 
@@ -1119,6 +1133,7 @@ class PostgresStorage(Storage):
             "SELECT * FROM events_archive WHERE run_id = %s ORDER BY sequence ASC", (run_id,)
         ).fetchall()
         for row in rows:
+            checked += 1
             try:
                 event = self._row_to_event(row, rehydrate=False)
             except CorruptedRecord as exc:
@@ -1186,7 +1201,7 @@ class PostgresStorage(Storage):
             expected_sequence = event.sequence + 1
             edge = (event.sequence, event.hash) if event.hash is not None else None
 
-        return violations, edge
+        return violations, edge, checked
 
     # -- state versions --------------------------------------------------- #
 

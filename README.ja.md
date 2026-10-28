@@ -95,7 +95,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI エントリーポイント
 continuum-mcp --help             # MCP サーバーエントリーポイント（[mcp] または [dev] が必要）
-pytest -q                        # 最小環境で約 2,864 件収集、約 2,825 件通過、約 34 件スキップ（正確な数は異なる）
+pytest -q                        # 最小環境で約 3950 件収集、約 3,636 件通過、約 41 件スキップ（正確な数は異なる）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI が強制する三つのゲート
 ```
@@ -120,7 +120,9 @@ from continuum import EventType, Run, SQLiteStorage, project
 
 store = SQLiteStorage("agent.db")
 store.create_run(Run(run_id="run_4821", goal="10,000 ドキュメントを分析"))
-store.append_event("run_4821", EventType.RUN_STARTED, {"goal": "10,000 ドキュメントを分析", "total": 10_000})
+store.append_event(
+    "run_4821", EventType.RUN_STARTED, {"goal": "10,000 ドキュメントを分析", "total": 10_000}
+)
 
 for i, doc in enumerate(documents):
     analyze(doc)
@@ -128,7 +130,7 @@ for i, doc in enumerate(documents):
 
 # クラッシュ後、新しいプロセスは停止した場所から正確に再開する：
 state = project("run_4821", store.read_events("run_4821"))
-print(state.progress.completed)            # すでに完了、繰り返さない
+print(state.progress.completed)  # すでに完了、繰り返さない
 print(store.verify_events("run_4821").ok)  # True、クラッシュ後もチェーンは無傷
 ```
 
@@ -192,7 +194,7 @@ python demo-run/generate_crash_visual.py
 | フレームワークアダプター | 汎用 Python、OpenAI Agents SDK、LangGraph、LangChain 統合 |
 | 安全な計画ループ | 二信号の観測検証が高リスク分岐を REQUIRES_REVIEW に昇格させる |
 | 周期的な再検証 | 環境はスケジュールに従って再チェックされ、実行中のドリフトを一周期以内に捉える |
-| 改ざん証跡ログ | ハッシュチェーンイベントログ（51 種のイベントタイプ）と完全性検証 |
+| 改ざん証跡ログ | ハッシュチェーンイベントログ（55 種のイベントタイプ）と完全性検証 |
 | 強制ゲート | 未請求の副作用呼び出しは実行前に拒否され、拒否メッセージがクレームプロトコルを教える |
 | 観測フック | コーディング CLI が書き込むすべてのファイルはダイジェスト検証された証拠となり、モデル制御の外にある |
 | セッションブリーフィング | 新しいセッションは開始時に実行状態を決定的に学ぶ。前のセッションの推論サマリーを含む |
@@ -228,7 +230,7 @@ CONTINUUM はモックの単体テストだけでなく、実際の LLM エー�
 - **サードパーティクライアント**：Gemini CLI と Kilo Code が stdio JSON-RPC でライブ SQLite ストアに対して接続し、マルチエージェント共存と認可の分離を検証。
 - **プロトコル準拠**：`@modelcontextprotocol/inspector --cli` でプロセス死を跨いで端から端まで駆動。変更ツールはデフォルトで `CONTINUUM_MCP_MUTATING_CLIENTS` の背後で拒否され、外部クレームは `REQUIRES_REVIEW`（`safe: false`）に降格する。
 - **自己修復**：ハードキルされたサーバーは起動時に一度だけのリトライで孤立した SQLite `-wal`/`-shm` サイドカーをクリーンアップして回復する。
-- **スケール**：約 2,864 件のテストが収集され（約 2,825 が通過、残りはオプションサービスなしでスキップ）、Python 3.11、3.12、3.13 で実行（unit、`hypothesis` によるプロパティベース、並行性、敵対的）。CONTINUUM-Bench は五つのクラッシュシナリオに加え専用の argument-drift シナリオを実行し、CONTINUUM について 0 の重複作業と 0 の重複副作用を、単純な再生については完全な重複を測定する。さらに 14 シナリオのリカバリ正確性スイート（`continuum.benchmark.phase6`）が耐久実行サーベイのクラッシュポイントを実行可能なアサーションとして符号化する。
+- **スケール**：約 2,809 件のテストが収集され（約 2,775 が通過、残りはオプションサービスなしでスキップ）、Python 3.11、3.12、3.13 で実行（unit、`hypothesis` によるプロパティベース、並行性、敵対的）。CONTINUUM-Bench は五つのクラッシュシナリオに加え専用の argument-drift シナリオを実行し、CONTINUUM について 0 の重複作業と 0 の重複副作用を、単純な再生については完全な重複を測定する。さらに 14 シナリオのリカバリ正確性スイート（`continuum.benchmark.phase6`）が耐久実行サーベイのクラッシュポイントを実行可能なアサーションとして符号化する。
 - **敵対的監査**：完全な MCP 面がライブプロトコル上で監査され、三つの欠陥が見つかり修正された。手法と再現手順は [test.md](test.md) にある。
 
 ## MCP 統合
@@ -384,7 +386,7 @@ RESUME < REPAIR_AND_RESUME < REPLAN < WAIT < REQUEST_HUMAN < ROLLBACK < ABORT
 
 | テーブル | 目的 |
 |:--|:--|
-| `events` | ハッシュチェーンの追記専用ログ（51 種のイベントタイプ） |
+| `events` | ハッシュチェーンの追記専用ログ（55 種のイベントタイプ） |
 | `runs` | 親子用の `parent_run_id` を持つ実行メタデータ |
 | `versions` | チェックポイントごとの SemanticState スナップショット |
 | `checkpoints` | `RECOVERY` アンカーを持つ密封されたチェックポイント記録 |
@@ -394,7 +396,7 @@ RESUME < REPAIR_AND_RESUME < REPLAN < WAIT < REQUEST_HUMAN < ROLLBACK < ABORT
 
 ### モジュールマップ、一つのライブラリ、多くの面
 
-CONTINUUM は一つのライブラリ（`src/continuum`、131 モジュール）に加え大規模なテストスイート（185 テストファイル、約 2,864 テスト）である。すべてのモジュールは一つのハッシュチェーンイベントログに追記し再生する。
+CONTINUUM は一つのライブラリ（`src/continuum`、132 モジュール）に加え大規模なテストスイート（186 テストファイル、約 2,809 テスト）である。すべてのモジュールは一つのハッシュチェーンイベントログに追記し再生する。
 
 | モジュール | 役割 |
 |:--|:--|
@@ -416,7 +418,7 @@ CONTINUUM は一つのライブラリ（`src/continuum`、131 モジュール）
 | `mcp/` | 12 の stdio ツールに加え認可 `authz.py` トークン認証、allowlist、確認トークン |
 | `serve/` | Sidecar stdio JSON ワイヤ + HTTP `CONTINUUM_SERVE_TOKEN` |
 | `dashboard/` | Web ダッシュボード `app.py` `hitl.py` と HITL ボタン確認、照合、完了、接頭辞信頼助言、ピン留め |
-| `cli/` | 49 の argparse コマンド、終了コードが評決、`runs, start, inspect, resume, verify, health, tree, benchmark, attest, dashboard` |
+| `cli/` | 55 の argparse コマンド、終了コードが評決、`runs, start, inspect, resume, verify, health, tree, benchmark, attest, dashboard` |
 | `otel.py` | OpenTelemetry スパンプロセッサーブリッジ |
 | `benchmark/` | CONTINUUM-Bench ハーネス、5 つのクラッシュシナリオ + 引数ドリフト + 14 シナリオのリカバリスイート |
 
@@ -496,9 +498,33 @@ continuum tree <parent_run_id>                   # マルチエージェント�
 
 CONTINUUM は耐久実行、冪等な副作用追跡、LLM エージェントのためのクラッシュリカバリの交差点に位置する。最も近い隣接領域は機械検証された再開契約（Khan 2026）、制約で保護された入場を伴うエージェントトランザクション処理（Mnemosyne 2026）、チェックポイントロールバック攻撃分析（ACRFence 2026）、設計レベルのプロンプトインジェクション防御（CaMeL 2025）である。完全な注釈付きリスト、基礎、引用監査は [references/related-work.md](references/related-work.md) にある。
 
+## ドキュメントマップ
+
+`docs/` 配下のすべてのページと、それぞれが存在する理由：
+
+- **リファレンスと API**: [docs/api/README.md](docs/api/README.md) （ライブラリ、CLI、MCP、サイドカー）、
+  [docs/GLOSSARY.md](docs/GLOSSARY.md) （すべての復旧用語、それぞれが実装を指す）、
+  [references/api.md](references/api.md)、[references/cli.md](references/cli.md)。
+- **タスクガイド**: [docs/guides/README.md](docs/guides/README.md)、
+  [docs/recipes/README.md](docs/recipes/README.md)、[docs/concepts/README.md](docs/concepts/README.md)。
+- **セキュリティ**: [docs/threat_model.md](docs/threat_model.md) （何が保護され、何が検出され、何が明示的に保護されないか）、
+  [docs/signing_key_rotation.md](docs/signing_key_rotation.md) （鍵付き封印をローテーションしながら、古いハッシュのみの契約の検証を壊さない方法）。
+- **契約とスケール**: [docs/contract_compatibility.md](docs/contract_compatibility.md)
+  （別のビルドで検証される封印済みの約束）、
+  [docs/multi_agent_isolation.md](docs/multi_agent_isolation.md) （共有 `run_id` の分離）、
+  [docs/audit-provenance-compaction-294.md](docs/audit-provenance-compaction-294.md)
+  （圧縮を生き延びる来歴）。
+- **作成と運用**: [docs/adapters_guide.md](docs/adapters_guide.md) （アダプターの書き方）、
+  [docs/cloud_api.md](docs/cloud_api.md) （任意のデプロイ層）、
+  [docs/TESTING_MCP.md](docs/TESTING_MCP.md) （MCP 表面の敵対的監査）、
+  [docs/CONTRIBUTING_ONBOARDING.md](docs/CONTRIBUTING_ONBOARDING.md) （オンボーディング）。
+- **計画**: [docs/ARCHITECTURE_EVOLUTION.md](docs/ARCHITECTURE_EVOLUTION.md) （北極星）、
+  [docs/CONTINUUM_MASTER_PLAN.md](docs/CONTINUUM_MASTER_PLAN.md) （検証済みの現状と次の作業）、
+  [docs/research/README.md](docs/research/README.md) （それらの計画の原点となったノート）。
+
 ## ステータスと制限
 
-- **テスト済み**：このツリーの 2026-08-24 監査での完全な実行で 1,360 合格 + 23 スキップ。CI は Python 3.11、3.12、3.13 でスイートを強制し、カウントはプラットフォームや Postgres などのオプションサービスにより異なる（[STATUS.md](STATUS.md) を参照）。MCP 面もライブプロトコル上で敵対的に監査済み。[test.md](test.md) を参照。
+- **テスト済み**：このツリーの 2026-08-24 監査での完全な実行で 3,636 合格 + 23 スキップ。CI は Python 3.11、3.12、3.13 でスイートを強制し、カウントはプラットフォームや Postgres などのオプションサービスにより異なる（[STATUS.md](STATUS.md) を参照）。MCP 面もライブプロトコル上で敵対的に監査済み。[test.md](test.md) を参照。
 - **PyPI では `continuum-agent` 0.1.2**（`pip install continuum-agent`、クローンは `pip install .` で依然として動作。クイックスタートを参照）。
 - **MCP 呼び出し元認証はデプロイごとに任意。** `CONTINUUM_MCP_TOKEN` が設定されているとき、サーバーは呼び出し元が `initialize` ハンドシェイクの `_meta.authToken` でその共有秘密を提示しない限り、すべての変更ツールを拒否する。呼び出し元ごとの秘密は `CONTINUUM_MCP_CLIENT_TOKENS`（`name:secret` ペア）経由で利用可能。トークンが何も設定されていない場合、認可は宣言されたアイデンティティのみによる（歴史的なデフォルト、ローカルな単一ユーザー利用のために保持）。
 - **MCP 経由で自己報告された状態を確認するには別の秘密が必要。** `continuum_confirm` はオペレーターが `CONTINUUM_MCP_CONFIRM_TOKEN` を設定するまで、すべての呼び出し元を拒否する。進捗を記録することを許されたエージェントがそれを確認することも許されてはならないからである。デフォルトのパスは人間に導かれたままである。ホストで `continuum confirm <run_id>` を実行する。
@@ -512,7 +538,7 @@ CONTINUUM は耐久実行、冪等な副作用追跡、LLM エージェントの
 
 2026 年初頭、長時間実行されるエージェントが推論ではなくリカバリで失敗するのを見た。チェックポイントは検証すべき証拠ではなく、継続するための証明として扱われていた。Temporal、LangGraph、ACRFence 2603.20625、self conditioning 2509.09677 を調査し、ギャップが移植可能な検証基盤であることを見つけた。それは、時刻 T の状態と今の世界が与えられたとき、継続しても安全かを問うものである。
 
-三週間で私は一つの不変条件から CONTINUUM を構築した。すべての事実はその起源を持つ。結果は `verify()` を持つハッシュチェーンログ、安定したキー重複排除を持つ台帳、未請求の効果をブロックするゲートとゲートウェイ、そして契約を封印するリカバリエンジンである。五つの継ぎ目が同じログを Claude Code、LangGraph、LangChain、OpenAI、HTTP、OpenTelemetry に公開する。実際のキルと約 2,864 のテストで検証され、単純な再生が `50` と印字するところで `0 重複` と印字する。
+三週間で私は一つの不変条件から CONTINUUM を構築した。すべての事実はその起源を持つ。結果は `verify()` を持つハッシュチェーンログ、安定したキー重複排除を持つ台帳、未請求の効果をブロックするゲートとゲートウェイ、そして契約を封印するリカバリエンジンである。五つの継ぎ目が同じログを Claude Code、LangGraph、LangChain、OpenAI、HTTP、OpenTelemetry に公開する。実際のキルと約 2,809 のテストで検証され、単純な再生が `50` と印字するところで `0 重複` と印字する。
 
 CONTINUUM は **Anandhu P Shaji**（[@Cyrax321](https://github.com/Cyrax321) · [LinkedIn](https://www.linkedin.com/in/anandhupshaji/)）によって作成され、原作者によって保守されている。オープンソースであり [Apache-2.0](LICENSE) の下にある。コミュニティの貢献は [CONTRIBUTING.md](CONTRIBUTING.md) 経由で歓迎され、[AUTHORS.md](AUTHORS.md) と [graphs/contributors](https://github.com/Cyrax321/CONTINUUM/graphs/contributors) でクレジットされる。
 
@@ -520,7 +546,7 @@ CONTINUUM は **Anandhu P Shaji**（[@Cyrax321](https://github.com/Cyrax321) · 
 
 このプロジェクトは Apache 2.0 の下でオープンソースであり、意図的に拡張可能に構築されている。リカバリセマンティクスを検証する研究者、台帳や MCP サーバーを他のフレームワークや言語に移植するエンジニア、計画されたロードマップを現実にする誰にとっても拡張可能である。良い出発点は [issue トラッカー](https://github.com/Cyrax321/CONTINUUM/issues) の `good first issue` ラベル、または STATUS.md にリストされた未解決の正確性バグである。
 
-大きな PR を送信する前に issue を開いてください。完全なコントリビューションガイドは [CONTRIBUTING.md](CONTRIBUTING.md) を参照。 [Code of Conduct](CODE_OF_CONDUCT.md) を含む。
+大きな PR を送信する前に issue を開いてください。完全なコントリビューションガイドは [CONTRIBUTING.md](CONTRIBUTING.md) を参照。 [Code of Conduct](CODE_OF_CONDUCT.md) と [セキュリティポリシー](SECURITY.md) を含む。
 
 ### コントリビューター
 
@@ -560,3 +586,10 @@ Apache 2.0、[LICENSE](LICENSE) を参照。
 - [references/e2e.md](references/e2e.md) - 端から端の自律テストウォークスルー
 - [references/testing.md](references/testing.md) - テストスイートの配置と規約
 - [references/related-work.md](references/related-work.md) - 注釈付き関連研究と引用監査
+
+## クイックリンク
+
+- [Issues](https://github.com/Cyrax321/CONTINUUM/issues) バグ報告や新機能の要望
+- [Discussions](https://github.com/Cyrax321/CONTINUUM/discussions) 設計や仕様の提案
+- [リリースノート](docs/release-notes.md)
+- [リリースチェックリスト](docs/release-checklist.md)

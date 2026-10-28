@@ -18,12 +18,18 @@ from continuum import reconcilers
 from continuum.actions import ActionLedger
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
-from continuum.models import ActionStatus, Origin, Run
+from continuum.models import Action, ActionStatus, Origin, Run
 from continuum.reconcilers import (
+    _AUTHORITY_VERDICT_CONTRACT,
     _DEFAULT_TIMEOUT,
+    _VERDICT_CONTRACT,
     ReconcilerConfigError,
+    _parse_authority_verdict,
     _parse_verdict,
+    _verdict_hint,
     load_reconcilers,
+    probe_authority_verdict,
+    probe_verdict,
     settle_run,
 )
 from continuum.storage import SQLiteStorage
@@ -115,6 +121,64 @@ def test_an_empty_registry_file_is_still_a_valid_empty_registry(tmp_path: Path) 
     assert load_reconcilers(p) == {}
 
 
+def test_unknown_probe_type_is_refused(tmp_path: Path) -> None:
+    """A probe with an unrecognized type raises ReconcilerConfigError."""
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps({"probes": {"act": {"type": "unsupported_type"}}}))
+    with pytest.raises(ReconcilerConfigError, match="unknown type 'unsupported_type'"):
+        load_reconcilers(p)
+
+
+def test_builtin_probe_rejects_unexpected_keys(tmp_path: Path) -> None:
+    """A built-in probe rejects keys outside its allowed set."""
+    p = tmp_path / "r.json"
+    p.write_text(
+        json.dumps(
+            {
+                "probes": {
+                    "act": {
+                        "type": "otel_span",
+                        "tool": "my_tool",
+                        "disallowed_key": "val",
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ReconcilerConfigError, match="does not accept \\['disallowed_key'\\]"):
+        load_reconcilers(p)
+
+
+def test_artifact_check_probe_requires_path_or_path_key(tmp_path: Path) -> None:
+    """artifact_check probe requires either path or path_key."""
+    p = tmp_path / "r.json"
+    p.write_text(
+        json.dumps({"probes": {"act": {"type": "artifact_check", "expect_sha256": "abc"}}})
+    )
+    with pytest.raises(ReconcilerConfigError, match="needs 'path' or 'path_key'"):
+        load_reconcilers(p)
+
+
+def test_builtin_probes_valid_configurations_load_successfully(tmp_path: Path) -> None:
+    """Valid built-in probe configurations load correctly."""
+    p = tmp_path / "r.json"
+    p.write_text(
+        json.dumps(
+            {
+                "probes": {
+                    "act_path": {"type": "artifact_check", "path": "/tmp/out.txt"},
+                    "act_key": {"type": "artifact_check", "path_key": "output_file"},
+                    "act_otel": {"type": "otel_span", "tool": "query", "identity": "arg1"},
+                }
+            }
+        )
+    )
+    loaded = load_reconcilers(p)
+    assert loaded["act_path"] == {"type": "artifact_check", "path": "/tmp/out.txt"}
+    assert loaded["act_key"] == {"type": "artifact_check", "path_key": "output_file"}
+    assert loaded["act_otel"] == {"type": "otel_span", "tool": "query", "identity": "arg1"}
+
+
 # --- verdict parsing -------------------------------------------------------------- #
 
 
@@ -141,6 +205,121 @@ def test_verdict_parsing(line: str, expected: bool | str) -> None:
 
 def test_last_line_wins() -> None:
     assert _parse_verdict("noise\nmore noise\noccurred=false") is False
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("valid=true", True),
+        ("VALID=TRUE", True),
+        ("valid=false", False),
+        ("VALID=FALSE", False),
+        ("valid=unknown", "unknown"),
+        ("valid=other", "unknown"),
+        ('{"valid": true}', True),
+        ('{"valid": false}', False),
+        ('{"valid": null}', "unknown"),
+        ('{"valid": "unknown"}', "unknown"),
+        ('{"valid": "UNKNOWN"}', "unknown"),
+        ('{"valid": "other"}', "unknown"),
+        ('{"valid": 123}', "unknown"),
+        ("[1, 2, 3]", "unknown"),
+        ("not json", "unknown"),
+        ("", "unknown"),
+        ("   ", "unknown"),
+    ],
+)
+def test_authority_verdict_parsing(line: str, expected: bool | str) -> None:
+    assert (
+        _parse_authority_verdict(line) is expected
+        if expected != "unknown"
+        else _parse_authority_verdict(line) == "unknown"
+    )
+
+
+def test_authority_verdict_last_line_wins() -> None:
+    """Only the last non-empty line of output determines the authority verdict."""
+    output = "checking authority...\npreliminary info\nvalid=true"
+    assert _parse_authority_verdict(output) is True
+    output_json = 'checking authority...\npreliminary info\n{"valid": false}'
+    assert _parse_authority_verdict(output_json) is False
+
+
+@pytest.mark.parametrize("line", ["occurred:false", "occurred:true", "OCCURRED:FALSE"])
+def test_a_colon_separated_verdict_is_not_a_verdict(line: str) -> None:
+    """``occurred:false`` is the shape a shell ``echo`` suggests, not an answer.
+
+    The contract's separator is ``=``; accepting a colon would be generous in
+    the wrong direction, since a probe printing ``occurred:false`` in a config
+    dialect means something the caller should state explicitly. It reads as
+    unknown, and the diagnostic -- not the parse -- is what has to save the
+    operator's time.
+    """
+    assert _parse_verdict(line) == "unknown"
+
+
+def test_the_diagnostic_names_the_colon_not_the_probe() -> None:
+    """``occurred:false`` used to report generic unparseable output.
+
+    That sends an operator hunting in their probe's logic when the cause is one
+    character away. The message now names the separator and shows the line to
+    print instead.
+    """
+    hint = _verdict_hint(
+        "checking outbox...\noccurred:false", "occurred", "occurred=true or occurred=false"
+    )
+    assert hint is not None
+    assert ":" in hint
+    assert "occurred=false" in hint
+    assert "occurred:false" in hint
+
+
+def test_the_diagnostic_stays_silent_on_output_that_is_not_an_attempted_verdict() -> None:
+    """A colon in unrelated output, or the other parser's field, is not a miss."""
+    assert _verdict_hint("invoice I-42 not found", "occurred", _VERDICT_CONTRACT) is None
+    assert _verdict_hint("", "occurred", _VERDICT_CONTRACT) is None
+    # An authority verdict line is not an action verdict near-miss, and vice versa.
+    assert _verdict_hint("valid:false", "occurred", _VERDICT_CONTRACT) is None
+    assert _verdict_hint("occurred:false", "valid", _AUTHORITY_VERDICT_CONTRACT) is None
+
+
+def test_probe_verdict_names_the_colon_in_its_detail() -> None:
+    action = Action(
+        run_id="run_1",
+        action_type="send_invoice",
+        arguments={},
+        status=ActionStatus.STARTED,
+    )
+    verdict, detail = probe_verdict({"command": "echo occurred:false", "timeout": 5}, action)
+    assert verdict is None
+    assert "the verdict uses ':'" in detail
+    assert "occurred=false" in detail
+
+
+def test_probe_verdict_states_the_contract_on_any_other_miss() -> None:
+    action = Action(
+        run_id="run_1",
+        action_type="send_invoice",
+        arguments={},
+        status=ActionStatus.STARTED,
+    )
+    verdict, detail = probe_verdict({"command": "echo not a verdict", "timeout": 5}, action)
+    assert verdict is None
+    assert "could not determine the outcome" in detail
+    for form in ("occurred=true", "occurred=false", "occurred=unknown"):
+        assert form in detail
+
+
+def test_an_authority_probes_colon_verdict_names_the_colon_too() -> None:
+    """``probe_authority_verdict`` parses ``valid=`` with the same shape and had
+    the same opaque message; the diagnosis is not action-probe specific.
+    """
+    verdict, detail = probe_authority_verdict(
+        {"command": "echo valid:false", "timeout": 5}, {"authority_id": "approval-7"}
+    )
+    assert verdict is None
+    assert "the verdict uses ':'" in detail
+    assert "valid=false" in detail
 
 
 # --- settle loop -------------------------------------------------------------------- #

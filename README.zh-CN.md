@@ -94,7 +94,7 @@ uv pip install "continuum-agent[mcp] @ git+https://github.com/Cyrax321/CONTINUUM
 ```bash
 continuum --help                 # CLI 入口
 continuum-mcp --help             # MCP 服务器入口（需要 [mcp] 或 [dev]）
-pytest -q                        # 最小环境中约 2,864 个收集，约 2,825 个通过，约 34 个跳过（具体数量因环境而异）
+pytest -q                        # 最小环境中约 3950 个收集，约 3,636 个通过，约 41 个跳过（具体数量因环境而异）
 ruff check src/ tests/ examples/ && ruff format --check src/ tests/ examples/
 mypy src/continuum               # CI 强制的三扇门禁
 ```
@@ -119,7 +119,9 @@ from continuum import EventType, Run, SQLiteStorage, project
 
 store = SQLiteStorage("agent.db")
 store.create_run(Run(run_id="run_4821", goal="分析 10,000 份文档"))
-store.append_event("run_4821", EventType.RUN_STARTED, {"goal": "分析 10,000 份文档", "total": 10_000})
+store.append_event(
+    "run_4821", EventType.RUN_STARTED, {"goal": "分析 10,000 份文档", "total": 10_000}
+)
 
 for i, doc in enumerate(documents):
     analyze(doc)
@@ -127,7 +129,7 @@ for i, doc in enumerate(documents):
 
 # 崩溃后，新进程从停止的地方精确接续：
 state = project("run_4821", store.read_events("run_4821"))
-print(state.progress.completed)            # 已完成，不会重复
+print(state.progress.completed)  # 已完成，不会重复
 print(store.verify_events("run_4821").ok)  # True，崩溃后链仍然完整
 ```
 
@@ -191,7 +193,7 @@ python demo-run/generate_crash_visual.py
 | 框架适配器 | 通用 Python、OpenAI Agents SDK、LangGraph 和 LangChain 集成 |
 | 安全规划循环 | 双信号观测验证将高风险分支提升至 REQUIRES_REVIEW |
 | 周期性重验证 | 按计划重新检查环境，在一个周期内捕获运行中漂移 |
-| 防篡改日志 | 哈希链事件日志（51 种事件类型）带完整性验证 |
+| 防篡改日志 | 哈希链事件日志（55 种事件类型）带完整性验证 |
 | 强制门控 | 未声明的副作用调用在触发前被拒绝，拒绝信息会教授声明协议 |
 | 观测钩子 | 编码 CLI 写入的每个文件都会成为摘要验证的证据，位于模型控制之外 |
 | 会话简报 | 全新会话在开始时确定性地学习运行状态，包括上一会话的推理摘要 |
@@ -227,7 +229,7 @@ CONTINUUM 针对真实 LLM 智能体、真实协议边界和硬进程崩溃进�
 - **第三方客户端**：Gemini CLI 和 Kilo Code 通过 stdio JSON-RPC 对接真实 SQLite 存储，验证多智能体共存和鉴权隔离。
 - **协议合规**：使用 `@modelcontextprotocol/inspector --cli` 在进程死亡间端到端驱动，变更工具默认拒绝并位于 `CONTINUUM_MCP_MUTATING_CLIENTS` 后，外部声明降级为 `REQUIRES_REVIEW`（`safe: false`）。
 - **自愈**：硬杀的服务器在启动时通过单次重试清理孤立的 SQLite `-wal`/`-shm` 伴生文件来恢复。
-- **规模**：约 2,864 个测试被收集（约 2,825 通过，其余在缺少可选服务时跳过），覆盖 Python 3.11、3.12 和 3.13（单元、`hypothesis` 属性测试、并发、对抗）。CONTINUUM-Bench 运行五个崩溃场景加一个专门的参数漂移场景，对 CONTINUUM 测量到 0 重复工作和 0 重复副作用，而对朴素重放则为完全重复，另有一个 14 场景恢复正确性套件（`continuum.benchmark.phase6`）将持久执行调研中的崩溃点编码为可执行断言。
+- **规模**：约 2,809 个测试被收集（约 2,775 通过，其余在缺少可选服务时跳过），覆盖 Python 3.11、3.12 和 3.13（单元、`hypothesis` 属性测试、并发、对抗）。CONTINUUM-Bench 运行五个崩溃场景加一个专门的参数漂移场景，对 CONTINUUM 测量到 0 重复工作和 0 重复副作用，而对朴素重放则为完全重复，另有一个 14 场景恢复正确性套件（`continuum.benchmark.phase6`）将持久执行调研中的崩溃点编码为可执行断言。
 - **对抗审计**：完整 MCP 面已在真实协议上被审计，发现并修复了三个缺陷。方法和复现步骤见 [test.md](test.md)。
 
 <!-- BENCH:START -->
@@ -399,7 +401,7 @@ Schema v6。SQLite 为主，Postgres 经 CI 验证。单一日志，多重投影
 
 | 表 | 用途 |
 |:--|:--|
-| `events` | 哈希链仅追加日志（51 种事件类型） |
+| `events` | 哈希链仅追加日志（55 种事件类型） |
 | `runs` | Run 元数据，带 `parent_run_id` 用于多智能体 |
 | `versions` | 每个检查点的 SemanticState 快照 |
 | `checkpoints` | 带 `RECOVERY` 锚点的密封检查点记录 |
@@ -409,7 +411,7 @@ Schema v6。SQLite 为主，Postgres 经 CI 验证。单一日志，多重投影
 
 ### 模块映射，一库多面
 
-CONTINUUM 是一个库（`src/continuum`，131 个模块）加上大型测试套件（185 个测试文件，约 2,864 个测试）。所有模块追加并重放同一个哈希链事件日志：
+CONTINUUM 是一个库（`src/continuum`，132 个模块）加上大型测试套件（186 个测试文件，约 2,809 个测试）。所有模块追加并重放同一个哈希链事件日志：
 
 | 模块 | 职责 |
 |:--|:--|
@@ -431,7 +433,7 @@ CONTINUUM 是一个库（`src/continuum`，131 个模块）加上大型测试套
 | `mcp/` | 12 个 stdio 工具加上鉴权 `authz.py` token 鉴权、allowlist、确认 token |
 | `serve/` | Sidecar stdio JSON 线路 + HTTP `CONTINUUM_SERVE_TOKEN` |
 | `dashboard/` | Web 仪表板 `app.py` `hitl.py` 带 HITL 按钮确认、对账和完成，前缀信任建议，钉扎 |
-| `cli/` | 49 个 argparse 命令，退出码即裁决，`runs、start、inspect、resume、verify、health、tree、benchmark、attest、dashboard` |
+| `cli/` | 55 个 argparse 命令，退出码即裁决，`runs、start、inspect、resume、verify、health、tree、benchmark、attest、dashboard` |
 | `otel.py` | OpenTelemetry 跨度处理器桥 |
 | `benchmark/` | CONTINUUM-Bench  harness，5 个崩溃场景 + 参数漂移 + 14 场景恢复套件 |
 
@@ -511,9 +513,33 @@ continuum tree <parent_run_id>                   # 多智能体层级视图
 
 CONTINUUM 位于持久执行、幂等副作用追踪和针对 LLM 智能体的崩溃恢复的交叉点。最近的邻域是经机器检查的恢复合约（Khan 2026）、带约束门控准入的智能体事务处理（Mnemosyne 2026）、检查点回滚攻击分析（ACRFence 2026）和设计级 prompt 注入防御（CaMeL 2025）。完整的带注释列表、基础和引用审计见 [references/related-work.md](references/related-work.md)。
 
+## 文档地图
+
+`docs/` 下的每一页及其存在理由：
+
+- **参考与 API**：[docs/api/README.md](docs/api/README.md)（库、CLI、MCP、sidecar），
+  [docs/GLOSSARY.md](docs/GLOSSARY.md)（每个恢复术语，各自指向其实现），
+  [references/api.md](references/api.md)、[references/cli.md](references/cli.md)。
+- **任务指南**：[docs/guides/README.md](docs/guides/README.md)，
+  [docs/recipes/README.md](docs/recipes/README.md)、[docs/concepts/README.md](docs/concepts/README.md)。
+- **安全**：[docs/threat_model.md](docs/threat_model.md)（保护什么、检测什么、明确不保护什么），
+  [docs/signing_key_rotation.md](docs/signing_key_rotation.md)（轮换带密钥的封印，同时不破坏对旧的纯哈希契约的验证）。
+- **契约与规模**：[docs/contract_compatibility.md](docs/contract_compatibility.md)
+  （由另一构建验证的已封印承诺），
+  [docs/multi_agent_isolation.md](docs/multi_agent_isolation.md)（共享 `run_id` 的隔离），
+  [docs/audit-provenance-compaction-294.md](docs/audit-provenance-compaction-294.md)
+  （在压缩后依然存续的溯源）。
+- **编写与运维**：[docs/adapters_guide.md](docs/adapters_guide.md)（编写适配器），
+  [docs/cloud_api.md](docs/cloud_api.md)（可选的部署层），
+  [docs/TESTING_MCP.md](docs/TESTING_MCP.md)（对 MCP 表面的对抗性审计），
+  [docs/CONTRIBUTING_ONBOARDING.md](docs/CONTRIBUTING_ONBOARDING.md)（入门指引）。
+- **规划**：[docs/ARCHITECTURE_EVOLUTION.md](docs/ARCHITECTURE_EVOLUTION.md)（北极星），
+  [docs/CONTINUUM_MASTER_PLAN.md](docs/CONTINUUM_MASTER_PLAN.md)（已验证的状态与下一步工作），
+  [docs/research/README.md](docs/research/README.md)（这些计划所源出的笔记）。
+
 ## 状态与局限
 
-- **已测试**：在 2026-08-24 对本树的完整运行中为 1,360 通过 + 23 跳过，CI 在 Python 3.11、3.12 和 3.13 上强制执行套件，计数因平台和 Postgres 等可选服务而异（见 [STATUS.md](STATUS.md)）。MCP 面也已在真实协议上被对抗性审计，见 [test.md](test.md)。
+- **已测试**：在 2026-08-24 对本树的完整运行中为 3,636 通过 + 23 跳过，CI 在 Python 3.11、3.12 和 3.13 上强制执行套件，计数因平台和 Postgres 等可选服务而异（见 [STATUS.md](STATUS.md)）。MCP 面也已在真实协议上被对抗性审计，见 [test.md](test.md)。
 - **在 PyPI 上为 `continuum-agent` 0.1.2**（`pip install continuum-agent`，克隆仍可通过 `pip install .` 见 Quick Start）。
 - **MCP 调用者认证按部署可选。** 当设置 `CONTINUUM_MCP_TOKEN` 时，服务器会拒绝每个变更工具，除非调用者在 `initialize` 握手的 `_meta.authToken` 中出示该共享密钥，通过 `CONTINUUM_MCP_CLIENT_TOKENS`（`name:secret` 对）支持按调用者的密钥。未配置任何 token 时，鉴权仅按声明身份（历史默认值，为本地单用户使用保留）。
 - **通过 MCP 确认自我报告状态需要单独的密钥。** `continuum_confirm` 会拒绝每个调用者，直至操作员设置 `CONTINUUM_MCP_CONFIRM_TOKEN`，因为被允许记录进度的智能体不能同时被允许确认它。默认路径保持人类驱动：在主机上运行 `continuum confirm <run_id>`。
@@ -527,7 +553,7 @@ CONTINUUM 位于持久执行、幂等副作用追踪和针对 LLM 智能体的�
 
 在 2026 年初，我看到长时间运行的智能体在恢复而非推理上失败。检查点被视为继续的证明，而非待验证的证据。调研 Temporal、LangGraph、ACRFence 2603.20625 和 self conditioning 2509.09677 后，我发现缺口是一个可移植的验证基座，它会问：给定时间 T 的状态和当下的世界，继续是否仍然安全。
 
-在三周内，我从一个不变量出发构建了 CONTINUUM：每个事实都携带其来源。结果是一个带 `verify()` 的哈希链日志、带稳定键去重的账本、阻止未声明效应的门控与网关，以及密封合约的恢复引擎。五个接缝将同一日志暴露给 Claude Code、LangGraph、LangChain、OpenAI、HTTP 和 OpenTelemetry。经真实杀死和约 2,864 个测试验证，它在朴素重放打印 `50` 的地方打印 `0 重复`。
+在三周内，我从一个不变量出发构建了 CONTINUUM：每个事实都携带其来源。结果是一个带 `verify()` 的哈希链日志、带稳定键去重的账本、阻止未声明效应的门控与网关，以及密封合约的恢复引擎。五个接缝将同一日志暴露给 Claude Code、LangGraph、LangChain、OpenAI、HTTP 和 OpenTelemetry。经真实杀死和约 2,809 个测试验证，它在朴素重放打印 `50` 的地方打印 `0 重复`。
 
 CONTINUUM 由 **Anandhu P Shaji**（[@Cyrax321](https://github.com/Cyrax321) · [LinkedIn](https://www.linkedin.com/in/anandhupshaji/)）创建并由原始创建者维护。基于 [Apache-2.0](LICENSE) 开源。社区贡献欢迎通过 [CONTRIBUTING.md](CONTRIBUTING.md)，并在 [AUTHORS.md](AUTHORS.md) 和 [graphs/contributors](https://github.com/Cyrax321/CONTINUUM/graphs/contributors) 中致谢。
 
@@ -535,7 +561,7 @@ CONTINUUM 由 **Anandhu P Shaji**（[@Cyrax321](https://github.com/Cyrax321) · 
 
 本项目基于 Apache 2.0 开源，并有意构建为可扩展：面向验证恢复语义的研究者、面向将账本或 MCP 服务器移植到其他框架或语言的工程师，以及面向将规划路线图变为现实的任何人。一个好的起点是 issue 跟踪器上的 `good first issue` 标签，或 STATUS.md 中列出的开放正确性缺陷。
 
-在提交大型 PR 前请先开 issue。完整贡献指南见 [CONTRIBUTING.md](CONTRIBUTING.md)，包括 [Code of Conduct](CODE_OF_CONDUCT.md)。
+在提交大型 PR 前请先开 issue。完整贡献指南见 [CONTRIBUTING.md](CONTRIBUTING.md)，包括 [Code of Conduct](CODE_OF_CONDUCT.md) 与 [安全策略](SECURITY.md)。
 
 ### 贡献者
 
@@ -575,3 +601,10 @@ Apache 2.0，见 [LICENSE](LICENSE)。
 - [references/e2e.md](references/e2e.md) - 端到端自主测试 walkthrough
 - [references/testing.md](references/testing.md) - 测试套件布局和约定
 - [references/related-work.md](references/related-work.md) - 带注释的相关工作和引用审计
+
+## 快速链接
+
+- [Issues](https://github.com/Cyrax321/CONTINUUM/issues) 提交错误与功能需求
+- [Discussions](https://github.com/Cyrax321/CONTINUUM/discussions) 探讨设计与提案
+- [发布说明](docs/release-notes.md)
+- [发布检查清单](docs/release-checklist.md)

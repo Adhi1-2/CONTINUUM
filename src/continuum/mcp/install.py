@@ -41,7 +41,6 @@ every state it is asked to fix.
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import shutil
@@ -50,13 +49,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from continuum.mcp import configfmt
+
 __all__ = [
     "HOST_PROFILES",
     "INSTALL_COMMAND",
     "SERVER_NAME",
+    "host_format",
+    "host_shape",
     "install_server",
     "remove_server",
     "resolve_command",
+    "server_spec",
     "verify_sdk",
 ]
 
@@ -74,20 +78,275 @@ INSTALL_COMMAND = 'pip install "continuum-agent[mcp]"'
 #: How long the SDK probe may run before the install gives up on it.
 PROBE_TIMEOUT_SECONDS = 30.0
 
+
+def _vscode_user_settings(platform: str = sys.platform) -> str:
+    """VS Code's user ``settings.json``, on the platform that will read it.
+
+    VS Code keeps that file in a different directory on every platform, and the
+    three are documented verbatim at
+    https://code.visualstudio.com/docs/configure/settings:
+
+    - Windows: ``%APPDATA%\\Code\\User\\settings.json``
+    - macOS: ``$HOME/Library/Application Support/Code/User/settings.json``
+    - Linux: ``$HOME/.config/Code/User/settings.json``
+
+    The profile used to spell only the macOS path, so on Windows and Linux
+    ``mcp install --host vscode`` wrote the registration into a file no VS Code
+    reads, created that macOS-style tree under the user's profile to do it, and
+    reported ``status: installed`` (issue #1604).
+
+    ``platform`` is a parameter rather than read off ``sys.platform`` in the
+    body so the per-platform expectations are testable from one machine; the
+    profile below binds it at import with the default. POSIX resolves to a
+    ``~``-relative string every consumer of the profile expands the same way,
+    so no caller needs to know this entry is computed. Windows does the same
+    whenever ``APPDATA`` points at the roaming directory under the profile
+    home, which is the standard layout, and only goes absolute when ``APPDATA``
+    was redirected somewhere else: ``~``-relative keeps the entry under the
+    caller's ``home`` override (``agents/diagnose.py`` applies its ``home``
+    argument only to paths that start with ``~``, so an absolute binding would
+    make the doctor read the developer's real ``%APPDATA%`` instead of the
+    sandbox a scan passes). A session without ``APPDATA`` (a service account, a
+    hardened shell) falls back to the same directory under the profile home
+    rather than to a guess. An environment that cannot resolve a profile home at
+    all falls back to the ``~``-relative form: the binding below runs at import,
+    and Python 3.13 raises out of ``Path.home()`` there (a subprocess whose
+    environment carries no ``USERPROFILE``), which must not crash the import;
+    each consumer's ``expanduser`` resolves the entry the way it resolves the
+    POSIX answers.
+
+    ``XDG_CONFIG_HOME`` is deliberately not honored on Linux. VS Code's own
+    documentation names ``$HOME/.config/Code`` with no XDG qualifier, and
+    upstream microsoft/vscode#38476 records that the Linux builds hardcode
+    that directory. Honoring a variable VS Code ignores would write the
+    registration somewhere VS Code does not look, which is the bug this fixes.
+    """
+    if platform == "win32":
+        try:
+            default = Path.home() / "AppData" / "Roaming"
+        except RuntimeError:
+            default = None
+        appdata = os.environ.get("APPDATA")
+        resolved = Path(appdata) if appdata else default
+        if resolved is None or resolved == default:
+            return "~/AppData/Roaming/Code/User/settings.json"
+        return str(resolved / "Code" / "User" / "settings.json")
+    if platform == "darwin":
+        return "~/Library/Application Support/Code/User/settings.json"
+    return "~/.config/Code/User/settings.json"
+
+
 #: Per-host wiring profiles, structured the way ``CLIENT_PROFILES`` is
 #: (``src/continuum/clienthooks.py``): everything that differs between hosts
 #: is data, not code. ``project_settings`` is the committed, per-project file
 #: (``--scope project``); ``local_settings`` is the per-user file that holds
 #: local-scope registrations under ``projects/<absolute project path>``
 #: (``--scope local``, the default). ``mutating_clients`` is the client name
-#: the registration allows to call mutating tools. Adding cursor or windsurf
-#: later is one dict entry, not a redesign.
+#: the registration allows to call mutating tools.
+#:
+#: The rest is how the host *spells* a registration, and it falls into two
+#: independent groups. ``format`` is the only one that can need a third-party
+#: parser. ``container``, ``servers_key``, ``nested_by_project``, ``argv_style``
+#: and ``env_key`` say where the entry sits in the document and what its keys
+#: are called, and they are plain structure that :mod:`continuum.mcp.configfmt`
+#: handles with no dependency at all.
+#:
+#: Adding a host that is JSON and dict-keyed and spells the command as
+#: ``command`` plus ``args`` really is one row. Adding one that is TOML or
+#: YAML, list-shaped, or argv-array-shaped is also one row, but it costs a
+#: config parser at install time (see ``configfmt``), and no amount of data
+#: removes that cost. That caveat used to be hidden behind a docstring
+#: claiming otherwise; it is stated here instead.
+#:
+#: ``local_projects_key`` predates the shape keys and is not read by anything.
+#: It is kept so its meaning, which is none, does not change under a caller
+#: that reads it. Per-project nesting is ``nested_by_project``.
 HOST_PROFILES: dict[str, dict[str, str]] = {
     "claude-code": {
         "project_settings": ".mcp.json",
         "local_settings": "~/.claude.json",
+        "user_settings": "~/.claude.json",
         "local_projects_key": "projects",
         "mutating_clients": "claude-code",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "mcpServers",
+        "nested_by_project": "projects",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "type",
+        "type_value": "stdio",
+    },
+    "gemini": {
+        "project_settings": ".mcp.json",
+        "local_settings": "~/.gemini/settings.json",
+        "user_settings": "~/.gemini/settings.json",
+        "local_projects_key": "mcpServers",
+        "mutating_clients": "gemini-cli",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "mcpServers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "type",
+        "type_value": "stdio",
+    },
+    "cursor": {
+        "project_settings": ".cursor/mcp.json",
+        "local_settings": "~/.cursor/mcp.json",
+        "user_settings": "~/.cursor/mcp.json",
+        "local_projects_key": "mcpServers",
+        "mutating_clients": "cursor",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "mcpServers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "type",
+        "type_value": "stdio",
+    },
+    "vscode": {
+        "project_settings": ".vscode/mcp.json",
+        # VS Code has no per-project user settings file at all, unlike Claude
+        # Code's ``~/.claude.json`` with its ``projects`` key, so the local and
+        # user scopes are the same file: the one VS Code reads on this platform
+        # (``_vscode_user_settings``). Pointing a "local" scope anywhere else
+        # would make the default scope write where no VS Code looks, which is
+        # the failure mode issue #1604 reported.
+        "local_settings": _vscode_user_settings(),
+        "user_settings": _vscode_user_settings(),
+        "local_projects_key": "mcpServers",
+        "mutating_clients": "vscode",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "mcpServers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "type",
+        "type_value": "stdio",
+    },
+    # --- verified against vendor documentation, sources cited per host below ---
+    #
+    # Codex CLI: TOML, so writing one needs a config parser at install time.
+    # Shape and path from the configuration reference:
+    # https://developers.openai.com/codex/config-reference
+    # ("User-level configuration lives in ~/.codex/config.toml . You can also
+    # add project-scoped overrides in .codex/config.toml files."), and the
+    # mcp_servers.<id>.command / .args / .env entries on the same page.
+    #
+    # MUTATING_CLIENTS IS UNVERIFIED. The reference documents no clientInfo
+    # name and the handshake site could not be read, so "codex-cli" is this
+    # project's best guess and not a citation. If it is wrong the server
+    # still connects and serves only the three read-only tools. That is the
+    # failure `continuum mcp doctor` reports, which is why the guess is
+    # recorded here rather than buried.
+    "codex": {
+        "project_settings": ".codex/config.toml",
+        "local_settings": "~/.codex/config.toml",
+        "user_settings": "~/.codex/config.toml",
+        "local_projects_key": "",
+        "mutating_clients": "codex-cli",
+        "format": "toml",
+        "container": "dict",
+        "servers_key": "mcp_servers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "",
+        "type_value": "",
+    },
+    # opencode: one argv array under "command", and "environment" rather than
+    # "env". Shape and paths from https://opencode.ai/docs/mcp-servers/ ("You
+    # can define MCP servers in your OpenCode Config under mcp", the local
+    # example showing "command": ["bun", "x", "my-mcp-command"] and
+    # "environment"), and the schema at
+    # https://github.com/sst/opencode/blob/dev/packages/core/src/config/mcp.ts
+    # (ConfigV2.MCP.Local: type "local", command: String.pipe(Schema.Array),
+    # environment). The user's file is
+    # ~/.config/opencode/opencode.json, the project's is opencode.json in the
+    # workspace root.
+    #
+    # MUTATING_CLIENTS IS VERIFIED. https://github.com/sst/opencode/blob/dev/
+    # packages/opencode/src/mcp/index.ts constructs
+    # `new Client({ name: "opencode", version: InstallationVersion })`, which
+    # is the clientInfo.name the server reads.
+    "opencode": {
+        "project_settings": "opencode.json",
+        "local_settings": "~/.config/opencode/opencode.json",
+        "user_settings": "~/.config/opencode/opencode.json",
+        "local_projects_key": "",
+        "mutating_clients": "opencode",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "mcp",
+        "nested_by_project": "",
+        "argv_style": "array",
+        "env_key": "environment",
+        "type_key": "type",
+        "type_value": "local",
+    },
+    # Continue: a list, not a dict, and each record carries its own name.
+    # Shape and paths from https://github.com/continuedev/continue/blob/main/
+    # docs/customize/deep-dives/mcp.mdx, which shows `mcpServers:` followed by
+    # `- name: SQLite MCP / command: npx / args:` in config.yaml, and
+    # documents the `name`, `type`, `command`, `args` and `env` properties
+    # (with type "stdio" for a local server). The user's file is
+    # ~/.continue/config.yaml and the project's is .continue/config.yaml.
+    #
+    # MUTATING_CLIENTS IS UNVERIFIED. Continue is a VS Code extension whose
+    # MCP client name is not documented; "continue" is this project's best
+    # guess and not a citation. See the codex note above for what a wrong
+    # value costs.
+    "continue": {
+        "project_settings": ".continue/config.yaml",
+        "local_settings": "~/.continue/config.yaml",
+        "user_settings": "~/.continue/config.yaml",
+        "local_projects_key": "",
+        "mutating_clients": "continue",
+        "format": "yaml",
+        "container": "list",
+        "servers_key": "mcpServers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "type",
+        "type_value": "stdio",
+        "name_field": "name",
+    },
+    # Zed calls them context servers, not MCP servers, and puts them in its
+    # own settings file rather than in anything MCP-shaped. Shape from
+    # https://zed.dev/docs/ai/mcp, which shows the settings file as
+    # `{"context_servers": {"local-mcp-server": {"command": "...",
+    # "args": [...], "env": {}}}}`; the key is at the top level because
+    # SettingsContent flattens ProjectSettingsContent
+    # (https://github.com/zed-industries/zed/blob/main/crates/settings_content
+    # /src/settings_content.rs) and ProjectSettingsContent declares
+    # `context_servers: HashMap<...>` (crates/settings_content/src/project.rs).
+    # The user's file is ~/.config/zed/settings.json and the project's is
+    # .zed/settings.json.
+    #
+    # MUTATING_CLIENTS IS VERIFIED, and not in the way it looks:
+    # https://github.com/zed-industries/zed/blob/main/crates/context_server/
+    # src/context_server.rs sends `name: "Zed".to_string()`, capital Z. This is
+    # precisely the mismatch that silently costs a host its mutating tools,
+    # and why it is worth citing rather than inferring from the product name.
+    "zed": {
+        "project_settings": ".zed/settings.json",
+        "local_settings": "~/.config/zed/settings.json",
+        "user_settings": "~/.config/zed/settings.json",
+        "local_projects_key": "",
+        "mutating_clients": "Zed",
+        "format": "json",
+        "container": "dict",
+        "servers_key": "context_servers",
+        "nested_by_project": "",
+        "argv_style": "split",
+        "env_key": "env",
+        "type_key": "",
+        "type_value": "",
     },
 }
 
@@ -157,6 +416,122 @@ def verify_sdk(form: str, *, timeout: float = PROBE_TIMEOUT_SECONDS) -> tuple[bo
     return False, lines[-1] if lines else "(no output)"
 
 
+def host_format(host: str) -> str:
+    """The config format ``host``'s settings file is written in.
+
+    One of :data:`configfmt.FORMATS`. JSON covers every host that shipped
+    before this module did; TOML and YAML are the two formats that cannot be
+    reached from the standard library alone, and both refuse loudly rather
+    than guessing when their parser is absent.
+    """
+    return HOST_PROFILES[host]["format"]
+
+
+def host_shape(host: str) -> configfmt.Shape:
+    """The structure ``host``'s settings file files its servers in.
+
+    Built from the profile's flat string keys rather than stored as a nested
+    object, so a profile stays a flat ``dict[str, dict[str, str]]`` and
+    nothing a caller reads off it changes type.
+    """
+    profile = HOST_PROFILES[host]
+    return configfmt.Shape(
+        servers_key=profile["servers_key"],
+        container=profile["container"],
+        nesting_key=profile["nested_by_project"],
+        name_field=profile.get("name_field", "name"),
+        argv_style=profile["argv_style"],
+        env_key=profile["env_key"],
+        type_key=profile.get("type_key", ""),
+        type_value=profile.get("type_value", ""),
+    )
+
+
+def scope_available(host: str, scope: str) -> bool:
+    """Whether ``scope`` can mean what its name promises on ``host``.
+
+    Only ``claude-code`` carries a per-project section inside its per-user
+    settings file, and that section is what makes ``--scope local`` real there:
+    the entry lands under ``projects/<path>`` instead of the top-level
+    container. Every other host's ``local_settings`` and ``user_settings`` are
+    one and the same file with no nesting key, so a local write has nowhere to
+    nest and lands in the user-wide container, which the host then applies to
+    every project on the machine -- the opposite of what the command claims
+    (#1761). ``project`` and ``user`` are always available: they name a file,
+    not a section inside one.
+    """
+    if scope != "local":
+        return True
+    return bool(HOST_PROFILES[host]["nested_by_project"])
+
+
+def server_spec(command: list[str], db: Path, host: str) -> configfmt.ServerSpec:
+    """The registration to write, stated format-free.
+
+    ``CONTINUUM_MCP_MUTATING_CLIENTS`` names the client the server will read
+    out of the ``initialize`` handshake. Without it the server connects and
+    exposes only the three read-only tools, which is a working registration
+    that looks broken the first time the agent tries to record anything.
+    """
+    return configfmt.ServerSpec(
+        name=SERVER_NAME,
+        argv=(*command, "--db", str(db)),
+        env={"CONTINUUM_MCP_MUTATING_CLIENTS": HOST_PROFILES[host]["mutating_clients"]},
+    )
+
+
+def _server_entry(command: list[str], db: Path, *, host: str) -> dict[str, Any]:
+    """The registration to bake, spelled the way ``host`` spells one.
+
+    Absolute command, absolute db, and the host's own env key. The spelling
+    is the host's, not ours: the same three facts are a ``command``/``args``
+    pair for most hosts and one argv array for opencode.
+    """
+    return host_shape(host).entry(server_spec(command, db, host))
+
+
+def _is_managed_argv(argv: list[str]) -> bool:
+    """Whether ``argv`` is one of the two shapes install bakes.
+
+    Two shapes are recognised, and both must carry the absolute ``--db``
+    this module bakes: a resolved console script (absolute path whose stem is
+    ``continuum-mcp``) and the interpreter fallback (argv beginning
+    ``-u -m continuum.mcp``). The absolute db is what separates ours from the
+    committed ``.mcp.json`` entry (path expression, cwd-relative db) and from
+    a hand-registered absolute path (``docs/api/mcp.md`` remedy 2 bakes a
+    relative db).
+    """
+    if not argv:
+        return False
+    if not _bakes_absolute_db(argv):
+        return False
+    launcher = Path(argv[0])
+    if launcher.is_absolute() and launcher.stem == SERVER_NAME:
+        return True
+    return argv[1 : 1 + len(MODULE_ARGS)] == list(MODULE_ARGS)
+
+
+def _bakes_absolute_db(argv: list[str]) -> bool:
+    """True when ``argv`` carries ``--db`` with an absolute path."""
+    for index, arg in enumerate(argv):
+        if arg == "--db" and index + 1 < len(argv):
+            return Path(argv[index + 1]).is_absolute()
+    return False
+
+
+def _is_managed_server(entry: Any, host: str = "claude-code") -> bool:
+    """True when ``entry`` is one this module wrote, read in ``host``'s shape.
+
+    Narrow on purpose, the same discipline as
+    ``clienthooks._is_managed_hook``: ``mcp remove`` must never delete a
+    registration this command did not write. The entry is first normalised to
+    argv by the host's shape, so an entry spelled in some other host's shape
+    is not even a candidate.
+    """
+    argv = host_shape(host).argv_of(entry)
+    return argv is not None and _is_managed_argv(argv)
+
+
 def install_server(
     settings_path: Path,
     *,
@@ -170,34 +545,23 @@ def install_server(
 
     ``"installed"`` when the entry was added, ``"updated"`` when an entry this
     module wrote pointed somewhere else (a moved virtualenv, say) and was
-    repointed, ``"present"`` when nothing needed to change. A file that exists
-    but is not a JSON object raises rather than being overwritten, and an
-    entry under :data:`SERVER_NAME` that this module did not write raises
-    too: a hand-registered server is a statement of intent, and replacing it
-    to save a name collision would delete configuration the operator wrote.
+    repointed, ``"present"`` when nothing needed to change. A file that
+    exists but is not a document this module can read raises, as does an
+    entry under :data:`SERVER_NAME` that this module did not write: a
+    hand-registered server is a statement of intent, and replacing it to save
+    a name collision would delete configuration the operator wrote.
     """
-    data = _load_object(settings_path)
-    servers = _mcp_servers(data, scope=scope, project_root=project_root)
-    entry = _server_entry(command, db, host=host)
-
-    existing = servers.get(SERVER_NAME)
-    if existing is None:
-        servers[SERVER_NAME] = entry
-        status = "installed"
-    elif _is_managed_server(existing):
-        if existing == entry:
-            status = "present"
-        else:
-            servers[SERVER_NAME] = entry
-            status = "updated"
-    else:
+    fmt = host_format(host)
+    shape = host_shape(host)
+    data = configfmt.read_document(fmt, settings_path)
+    status, previous = shape.put(data, scope, project_root, server_spec(command, db, host))
+    if status != "installed" and previous is not None and not _is_managed_server(previous, host):
         raise ValueError(
             f"{settings_path} already registers {SERVER_NAME!r} with an entry "
             "continuum mcp install did not write; remove it by hand first, or "
             "register under a different --scope"
         )
-
-    _save(settings_path, data)
+    configfmt.write_document(fmt, settings_path, data)
     return status
 
 
@@ -206,6 +570,7 @@ def remove_server(
     *,
     scope: str,
     project_root: Path,
+    host: str | None = None,
 ) -> bool:
     """Remove the registration this command wrote. True when anything went.
 
@@ -214,199 +579,58 @@ def remove_server(
     hand-registered server survive untouched, as does every other key in the
     file. Empty containers the entry occupied are pruned so a remove leaves
     the file as if the install had never happened.
+
+    ``host`` is optional because the command that calls this resolves the
+    settings path from a profile but does not pass the host along. It is
+    recovered from the path itself, which is exact for every invocation that
+    uses the host's own file. A ``--settings`` override pointing somewhere no
+    profile names falls back to the file's extension for the format and to
+    the canonical shape for the container, and therefore to a no-op rather
+    than to a guess about which structure to delete from.
     """
     if not settings_path.exists():
         return False
-    data = _load_object(settings_path)
-    if scope == "project":
-        removed = _remove_project_entry(data)
-    elif scope == "local":
-        removed = _remove_local_entry(data, project_root)
-    else:
-        raise ValueError(f"unknown scope {scope!r} (expected 'local' or 'project')")
-    if not removed:
+    resolved = host or _infer_host(settings_path, scope)
+    fmt = host_format(resolved)
+    shape = host_shape(resolved)
+    data = configfmt.read_document(fmt, settings_path)
+    entry = shape.find(data, scope, project_root, SERVER_NAME)
+    if entry is None or not _is_managed_server(entry, resolved):
         return False
-    _save(settings_path, data)
+    if not shape.drop(data, scope, project_root, SERVER_NAME):
+        return False
+    configfmt.write_document(fmt, settings_path, data)
     return True
 
 
-def _remove_project_entry(data: dict[str, Any]) -> bool:
-    """Take our entry out of a project-scope file's ``mcpServers``."""
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
-        return False
-    if not _drop_managed(servers):
-        return False
-    if not servers:
-        del data["mcpServers"]
-    return True
+#: The profile key that decides which file a scope writes to.
+_SCOPE_SETTINGS = {
+    "project": "project_settings",
+    "local": "local_settings",
+    "user": "user_settings",
+}
 
 
-def _remove_local_entry(data: dict[str, Any], project_root: Path) -> bool:
-    """Take our entry out of this project's local-scope registration."""
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return False
-    project_entry = projects.get(str(project_root))
-    if not isinstance(project_entry, dict):
-        return False
-    servers = project_entry.get("mcpServers")
-    if not isinstance(servers, dict):
-        return False
-    if not _drop_managed(servers):
-        return False
-    if not servers:
-        del project_entry["mcpServers"]
-        if not project_entry:
-            del projects[str(project_root)]
-        if not projects:
-            del data["projects"]
-    return True
+def _infer_host(settings_path: Path, scope: str) -> str:
+    """Which host's shape a settings path should be read in.
 
-
-def _drop_managed(servers: dict[str, Any]) -> bool:
-    """Delete our entry from one ``mcpServers`` dict. True when it went."""
-    existing = servers.get(SERVER_NAME)
-    if existing is None or not _is_managed_server(existing):
-        return False
-    del servers[SERVER_NAME]
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# the entry and its recognition
-# --------------------------------------------------------------------------- #
-
-
-def _server_entry(command: list[str], db: Path, *, host: str) -> dict[str, Any]:
-    """The registration to bake: absolute command, absolute db, env.
-
-    The env names the host's own client in the mutating-tools allowlist:
-    without it the server connects but exposes only the read-only tools
-    (``docs/api/mcp.md``), which is a working registration that looks broken
-    the first time the agent tries to record anything.
+    The path is compared against every profile's file for the requested
+    scope. A relative profile path is resolved against the working directory
+    the way the command that built this path resolved it, so ``--scope
+    project`` lands on the same file either way.
     """
-    argv = [*command, "--db", str(db)]
-    return {
-        "type": "stdio",
-        "command": argv[0],
-        "args": argv[1:],
-        "env": {"CONTINUUM_MCP_MUTATING_CLIENTS": HOST_PROFILES[host]["mutating_clients"]},
-    }
-
-
-def _is_managed_server(entry: Any) -> bool:
-    """True when an ``mcpServers`` entry is one this module wrote.
-
-    Narrow on purpose, the same discipline as ``clienthooks._is_managed_hook``:
-    ``mcp remove`` must never delete a registration this command did not
-    write. Two shapes are recognised, matching :func:`_server_entry` exactly:
-    a resolved console script (absolute path whose stem is ``continuum-mcp``)
-    and the interpreter fallback (args beginning ``-u -m continuum.mcp``).
-    Both must also carry the absolute ``--db`` this module bakes, which is
-    what separates our entry from the committed ``.mcp.json`` one (path
-    expression, cwd-relative db) and from a hand-registered absolute path
-    (``docs/api/mcp.md`` remedy 2 bakes a relative db).
-    """
-    if not isinstance(entry, dict):
-        return False
-    command, args = entry.get("command"), entry.get("args")
-    if not isinstance(command, str) or not isinstance(args, list):
-        return False
-    if not all(isinstance(arg, str) for arg in args):
-        return False
-    if not _bakes_absolute_db(args):
-        return False
-    path = Path(command)
-    if not path.is_absolute():
-        return False
-    if path.stem == SERVER_NAME:
-        return True
-    return args[: len(MODULE_ARGS)] == list(MODULE_ARGS)
-
-
-def _bakes_absolute_db(args: list[str]) -> bool:
-    """True when ``args`` carries ``--db`` with an absolute path."""
-    for index, arg in enumerate(args):
-        if arg == "--db" and index + 1 < len(args):
-            return Path(args[index + 1]).is_absolute()
-    return False
-
-
-# --------------------------------------------------------------------------- #
-# settings-file plumbing
-# --------------------------------------------------------------------------- #
-
-
-def _mcp_servers(
-    data: dict[str, Any],
-    *,
-    scope: str,
-    project_root: Path,
-) -> dict[str, Any]:
-    """The ``mcpServers`` dict a registration is written into, for one scope.
-
-    Project scope is the file's top level. Local scope nests under
-    ``projects/<absolute project path>``, which is how the host's own
-    ``--scope local`` writes (``docs/api/mcp.md``): local beats project, so a
-    registration there wins over the committed ``.mcp.json`` without touching
-    it. Missing containers are created; a container that exists but holds
-    something else raises rather than being replaced, because whatever is in
-    there was written on purpose.
-    """
-    if scope == "project":
-        servers = data.get("mcpServers")
-        if servers is None:
-            servers = data["mcpServers"] = {}
-        if not isinstance(servers, dict):
-            raise ValueError("the settings file's 'mcpServers' is not an object")
-        return servers
-
-    if scope != "local":
-        raise ValueError(f"unknown scope {scope!r} (expected 'local' or 'project')")
-
-    projects = data.get("projects")
-    if projects is None:
-        projects = data["projects"] = {}
-    if not isinstance(projects, dict):
-        raise ValueError("the settings file's 'projects' is not an object")
-    key = str(project_root)
-    project_entry = projects.get(key)
-    if project_entry is None:
-        project_entry = projects[key] = {}
-    if not isinstance(project_entry, dict):
-        raise ValueError(f"the settings file's projects[{key!r}] is not an object")
-    servers = project_entry.get("mcpServers")
-    if servers is None:
-        servers = project_entry["mcpServers"] = {}
-    if not isinstance(servers, dict):
-        raise ValueError(f"projects[{key!r}].mcpServers is not an object")
-    return servers
-
-
-def _load_object(path: Path) -> dict[str, Any]:
-    """Read a settings file as a JSON object, or ``{}`` when it is absent.
-
-    A file that exists but does not parse raises rather than being replaced:
-    a hand-edited file is a statement of intent, and silently recreating it
-    would destroy work to save a typo (the same contract as
-    ``clienthooks._install_hook``).
-    """
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{path} is not valid JSON ({exc}); refusing to edit it") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} does not contain a JSON object")
-    return data
-
-
-def _save(path: Path, data: dict[str, Any]) -> None:
-    """Write the settings back, creating parent directories as needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    target = settings_path.expanduser()
+    wanted = _SCOPE_SETTINGS.get(scope)
+    for name, profile in HOST_PROFILES.items():
+        for key in _SCOPE_SETTINGS.values():
+            if key == wanted:
+                candidate = Path(profile[key]).expanduser()
+                if candidate == target or candidate.resolve() == target.resolve():
+                    return name
+    # A --settings override points at a file no profile names. The extension
+    # still says how to parse it; what it cannot say is which container holds
+    # the servers, and a wrong answer there would delete the wrong thing.
+    return "claude-code"
 
 
 def display_command(command: list[str]) -> str:

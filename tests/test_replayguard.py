@@ -120,6 +120,35 @@ def test_protected_call_raises_replayblocked_for_an_uncertain_action(db: str) ->
     assert excinfo.value.decision.key is not None
 
 
+def test_deny_reclaim_decision_carries_its_key(db: str) -> None:
+    # Same contract as BLOCK_UNCERTAIN (issue #735): every decision names the
+    # ledger key it is about. DENY_RECLAIM used to be built without the key,
+    # so protected_call hit its `decision.key is not None` checkpoint and
+    # raised a bare AssertionError instead of the documented ReplayBlocked
+    # (issue #1836).
+    seed(db, "send_invoice", "i:4", ActionStatus.FAILED)
+    assert verdict(db, "send_invoice", "i:4").key is not None
+
+
+def test_protected_call_raises_replayblocked_for_a_closed_action(db: str) -> None:
+    # A closed attempt (failed, compensated) must refuse with ReplayBlocked so
+    # the caller can claim again before retrying. The missing key turned the
+    # refusal into an AssertionError callers could not distinguish from a bug
+    # (issue #1836).
+    seed(db, "send_invoice", "i:4", ActionStatus.FAILED)
+    with pytest.raises(ReplayBlocked) as excinfo:
+        protected_call(
+            SQLiteStorage(db),
+            "run_1",
+            action_type="send_invoice",
+            key="i:4",
+            fn=lambda: "SHOULD_NOT_RUN",
+        )
+    assert excinfo.value.decision.kind is GuardKind.DENY_RECLAIM
+    assert excinfo.value.decision.key is not None
+    assert excinfo.value.kind is GuardKind.DENY_RECLAIM
+
+
 def make_run(db: str) -> None:
     with SQLiteStorage(db) as store:
         store.create_run(Run(run_id="run_1", goal="g"))
@@ -274,7 +303,9 @@ def test_a_non_canonical_result_completes_instead_of_refiring(db: str) -> None:
     )
     assert kind2 is GuardKind.SKIP_DUPLICATE
     assert len(fired) == 1, "the replay must answer from the record, not re-fire the effect"
-    assert result2 == repr(result1), "the journal degrades to a description of the real result"
+    assert result2 == {"amount": "Decimal('19.99')", "currency": "USD"}, (
+        "the journal degrades to a replayable description of the real result"
+    )
 
 
 def test_a_non_canonical_result_degrades_only_the_journal(db: str) -> None:
@@ -301,7 +332,9 @@ def test_a_non_canonical_result_degrades_only_the_journal(db: str) -> None:
         fn=lambda: {"SHOULD_NOT_RUN": True},
     )
     assert kind2 is GuardKind.SKIP_DUPLICATE
-    assert result2 == repr(result)
+    assert result2 == {"ids": "{1, 2, 3}"}, (
+        "the journal degrades to a replayable description of the real result"
+    )
 
 
 def test_exception_marks_uncertain_failure_and_reraises(db: str) -> None:

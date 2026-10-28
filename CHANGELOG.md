@@ -6,195 +6,339 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Test counts: ~3950 collected on a minimal env.
+
 ### Added
 
-- **A run can configure the environment providers it trusts at resume (#762).**
-  Providers for files, git, values and static inputs existed, but a resume only
-  applied the ones a caller remembered to pass to `assess`, so an integration
-  could wire a reliable world-observer and still resume through a path that
-  validated only what was supplied by hand, with nothing in the output saying
-  so. A run now records provider descriptors and their bounded resource scopes
-  in the event log (`ENVIRONMENT_PROVIDERS_CONFIGURED`, append-only, newest
-  record authoritative); at resume `RecoveryEngine.assess` resolves them when no
-  environment was supplied, captures, and feeds the result to the validator that
-  already existed. New `continuum providers <add|remove|list|check>` manages the
-  configuration, and `check` resolves exactly as resume would so a failing
-  observer is visible before it gates a recovery.
+- **Wire specification and automated wire conformance suite.**
+  Published OpenAPI 3.1 specification for the CONTINUUM sidecar wire protocol
+  covering action interception and idempotency leases, completion, progress tracking,
+  checkpoints, semantic resume, and human confirmation. The sidecar now serves the
+  OpenAPI 3.1 document dynamically via `GET /openapi.json`, exposes health checks on
+  `GET /healthz`, returns the canonical `Continuum-Version: 1.0` header on all responses,
+  and structures wire errors with standardized error codes. Added the `continuum conformance`
+  CLI tool (`continuum conformance --url <endpoint>`) to validate any server implementation
+  against the full wire specification.
 
-  The trust boundary is the design. A provider name is a lookup key matching
-  `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`, never a path or import; only the four
-  built-ins and names handed to a `ProviderRegistry` resolve, and an unknown
-  name is reported unavailable rather than autoloaded. Parameters must be
-  JSON-native, so a callable cannot mean one thing in memory and another after
-  a restart, and a parameter whose name looks like a secret is refused so it
-  never reaches the hashed log. `CallableProvider` is not configurable at all:
-  it registers by name and the configuration references the name.
+- **Sidecar trust and authentication hardening.**
+  Separated review confirmation from normal agent credentials. An agent holding a
+  normal client token cannot call `confirm` (`NotAuthorized`, HTTP 403), preventing
+  self-certification bypasses of human-in-the-loop review. The sidecar now accepts
+  dedicated confirm credentials via `CONTINUUM_SERVE_CONFIRM_TOKEN` and supports
+  per-client tokens via `CONTINUUM_SERVE_CLIENT_TOKENS`. The HTTP wire transport
+  accepts credentials via standard `Authorization: Bearer <token>` headers without
+  embedding tokens into JSON request bodies, and token verification uses constant-time
+  comparisons (`hmac.compare_digest`) against timing side channels. The HTTP listener
+  bind address is configurable via `--bind` and `CONTINUUM_SERVE_BIND`, with tested
+  reverse proxy configurations for Nginx and Caddy documented in `docs/guides/sidecar_tls_proxy.md`.
 
-  Fail-closed everywhere. A disabled, unavailable, malformed, conflicting or
-  failing provider emits `UNKNOWN_VERSION` for every resource it declared
-  instead of leaving it out, and `UNKNOWN` is what the validator already
-  downgrades on. Two specs claiming one resource key fail closed for both
-  rather than letting one win by order. A provider reporting beyond its scope
-  has those keys marked unknown too. Unconfigured runs behave exactly as
-  before, and a caller-supplied environment still wins. Captured resources
-  carry the provider that produced them, so a validation entry reads
-  `verified unchanged (provider: git)` and the recovery contract inherits that
-  evidence. See `docs/guides/environment-providers.md`.
+- **Atomic claim in storage eliminates concurrent duplicate actions.**
+  `ActionLedger.claim` now resolves and records within a single atomic storage
+  transaction (`atomic_claim`). On SQLite, a single `BEGIN IMMEDIATE` transaction
+  wraps both claim resolution and event append, preventing race conditions where
+  multiple writers observe an unclaimed key and both append. On PostgreSQL, an
+  explicit transaction with `pg_advisory_xact_lock` on the action key enforces
+  mutual exclusion. Concurrency race tests verify zero duplicate claims across 64
+  threads, 16 processes, and crash fault injection (`kill -9`).
+
+- **Good first issues and Hacktoberfest guidance in CONTRIBUTING.md (#1652).**
+  Added an on-ramp section pointing to tracking issue #1661, ground rules for
+  first pull requests, a Table of Contents, and a reference table for issue
+  labels (including hacktoberfest, help wanted, and good first issue).
+
+- **Recovery-attempt budgets are scoped to the dependency that owns them (#744).**
+  `RecoveryLedger` records an optional dependency scope on each attempt, so a
+  repeatedly failing integration spends its own allowance instead of the run's:
+  exhausting dependency A leaves dependency B's repair path open, which is what
+  `docs/research/human_gate_minimization.md` asked for. `record_attempt`,
+  `attempts`, `requires_human` and the new `budget` all take a scope; callers
+  who never pass one get the previous run-wide behaviour unchanged, including
+  the entries already on disk, whose sealed content omits the key when it is
+  unset and therefore still verifies. The escalation marker is anchored and
+  scoped, so it survives compaction and stops at its own dependency.
+  Ownership is fail-closed by construction. `resolve_scope` accepts every
+  signal the system already carries, an action's `dep_scope`, a dependency
+  finding's component id, the resource set a scoped assessment was confined
+  to, and charges the run-wide bucket whenever they are absent, malformed, or
+  disagree. A scoped limit is additionally capped at the run-wide ceiling, so
+  a per-dependency allowance can never buy more attempts than the run was ever
+  allowed. `RepairStep` carries the scope the plan derived, and the contract's
+  evidence names the budget scope with its remaining or exhausted allowance;
+  the line carries counts and a dependency name only, never arguments, files
+  or failure detail. `RecoveryEngine` takes an optional ledger and reads the
+  budget read-only; without one every decision is unchanged.
+
+- **The escalation policy that budgets human attention (#1409).** Every action
+  the ledger cannot settle on its own becomes `REQUIRES_REVIEW` and interrupts
+  a human at once, and on a weeks-long run that floods the reviewer into
+  approving without reading, which is a gate with no gate in it. This ships
+  the schema, the loader and the deterministic scorer for the
+  attention-budgeted human gate: an `hourly_prompt_cap`, a
+  `batch_window_seconds` buffering window, a `blast_radius_threshold` above
+  which an item skips batching and interrupts immediately, and `risk_weights`
+  per action type or resource class. `load_escalation_policy` in
+  `src/continuum/recovery/escalation.py` reads `.continuum/escalation.json`,
+  falling back to a fail-safe default when the file is absent and raising
+  `EscalationPolicyError` when it exists but cannot be honoured, so a broken
+  policy never silently substitutes a risk posture the operator never chose.
+  `evaluate_action_risk` scores an action as the highest applicable weight,
+  because when two classifications disagree the more dangerous one should
+  govern. Nothing consumes the policy yet: the deferred review queue (#1410)
+  and the reviewer fatigue telemetry (#1411) are its wired consumers, so the
+  scorer is shipped and tested on its own rather than arriving with a heuristic
+  that moves while the queue is built.
 ### Fixed
 
-- **The Level 4 MCP inspector walkthrough now names the config the repository
-  ships (#1395).** `references/testing.md` pointed
-  `@modelcontextprotocol/inspector --cli` at `mcp-config.json`, which has never
-  existed anywhere in the tree (not tracked, never committed, absent on disk),
-  so the copy-pasted command failed at the exact step meant to exercise the
-  protocol boundary. It now points at the tracked `.mcp.json`, whose
-  `continuum-mcp` entry is the server the `--server continuum-mcp` flag names. A
-  guard in `tests/test_docs_mcp_inspector.py` folds the fenced command's
-  backslash continuations and asserts, for every inspector command in
-  `references/` and `docs/`, that its `--config` file is present in the tree and
-  its `--server` name is an entry in that file, so a walkthrough cannot drift
-  back out of sync with the shipped config.
+- **Benchmark report timestamps are timezone-aware UTC (#1823).** The Phase 6,
+  fault-injection, and horizon benchmark runners now use the shared `utcnow()`
+  helper, keeping report timestamps comparable across benchmark suites.
 
-- **File-derived progress no longer bloats the log on a compacted run.**
-  `record_file_progress` gates its mirror on a projection of the log, but folded
-  the live tail (`read_events`) alone. Once a run has been compacted the
-  goal-bearing prefix, `RUN_STARTED` included, lives in `events_archive`, so the
-  fold raised `ProjectionError` and the except branch fell through to "changed",
-  appending a redundant `TASK_UPDATED` and a duplicate-evidence tail on every call
-  over an unchanged file — the documented no-op contract was silently void. The
-  fold now reads the full history (`read_all_events`); a run with no goal yet
-  still raises against the merged history, so the "not yet projectable" behaviour
-  is unchanged. The reproject inside `GenericAgentAdapter.capture_state`'s auto
-  branch had the same live-tail read and rejected the checkpoint outright with
-  `TASK_UPDATED before the run was started` — the mirror's own appended event
-  could not fold against the archived start. It now reads the archive too.
+- **`continuum doctor` no longer calls a portable path expression a broken
+  path (#1619).** A committed registration may bake
+  `${CLAUDE_PROJECT_DIR:-.}/.venv/bin/continuum-mcp`, the form for POSIX
+  environments, and `os.path.expandvars` does not speak the shell's
+  `${VAR:-default}`, so the expression survived the doctor's expansion
+  untouched, was not absolute, and fell through to `shutil.which`, which could
+  not find it either. Every clean clone therefore reported `stale` and exited
+  `REQUIRES_REPAIR`, and the remedy printed for it, re-running
+  `continuum mcp install`, would have replaced the committed expression with
+  one machine's absolute path, which is the exact thing the committed file
+  exists to avoid. Resolution is now three-valued in
+  `continuum.agents.diagnose`: a command that still contains a `$` after
+  expansion is `unresolved`, a state the row carries next to `wired`,
+  `stale` and `read-only-degraded`, and one that does not reach the exit code
+  or carry a remedy. What the doctor *can* expand it now verifies, so a
+  `${VAR}` form is checked against the path the host would spawn, and still
+  reported `stale` when that path is gone. Hook commands get the same
+  treatment, and the new state is exposed in the `--json` payload.
+
+- **`verify_events` now accounts for archived events and keeps a verified
+  archive prefix trusted (#1814).** On a compacted run the audit re-digested
+  and chain-linked every archived row, but `checked` was incremented only in
+  the live loop (8 instead of 13 on the issue's repro), so `continuum verify`
+  and every report consumer understated the audit and contradicted
+  `trusted_through`. `last_good` was also seeded at 0 rather than from the
+  archive edge, so one tampered live row discarded a fully verified archived
+  prefix and a recovery engine would rebuild from nothing instead of from the
+  prefix that still holds. `_audit_archive` now returns how many archived
+  rows it audited, `verify_events` folds that count into `checked`, and when
+  the archive verifies in full `last_good` is seeded from the archive edge
+  before the live walk, so a later live violation stops trust exactly where
+  it should: at the last verified sequence. Both engines (SQLite and
+  Postgres) carry the fix and a regression test each.
+
+- **The nightly benchmark publish no longer pushes to `main` (#1641).** The
+  job committed the refreshed tables and ran `git push`, and `main` is
+  branch-protected, so the push was declined by the branch ruleset and the
+  workflow failed every night: the published tables stopped tracking the
+  benchmark on 2026-10-10. The refresh now commits to a branch the job owns
+  and opens a pull request from it, and a night that finds nothing to change
+  exits cleanly instead of pushing an empty commit. The `pull-requests: write`
+  grant the push path never needed is scoped to the publishing job alone, the
+  branch always builds on `main` rather than on whatever ref a manual dispatch
+  happened to select, the `Generated:` timestamp the run rewrites every night
+  no longer counts as a table change, and a night with nothing to publish
+  closes the refresh request an earlier night left open instead of leaving it
+  stale.
+
+- **The daemon CLI no longer crashes when dispatched without storage (#1603).**
+  `continuum daemon` was dispatched through the no-storage tuple, but called
+  `storage.get_active_run()` unconditionally and raised an `AttributeError`
+  before binding the gateway. It now handles `storage=None`, probing an active
+  run from an existing database file when present and warning gracefully on
+  unreadable databases. On non-fork platforms like Windows, `--detach` spawns
+  a background process with detached process flags, verifies port availability
+  and PID file writability beforehand, records the daemon's own PID safely,
+  reports early child startup failures, and unlinks the PID file only when it
+  matches the process's own PID on shutdown.
+
+- **An observed client name is recorded as the one name the host sent (#1805).**
+  `record_observed_client` split the `clientInfo.name` a single connection
+  declared on the separators an allowlist uses (`[\s,]+`), so a host whose name
+  contains spaces or commas was recorded as several names it never declared.
+  One connection from VS Code's MCP client, which declares `"Visual Studio
+  Code"`, wrote three entries: `Visual`, `Studio` and `Code`. The doctor's
+  `client-name` finding then reported `hosts have connected as 'Code',
+  'Studio', 'Visual'` against a registration that authorizes some other name,
+  sending an operator hunting for clients that do not exist, and each fragment
+  consumed its own slot in the 32-entry record and its own counter. Splitting
+  belongs to the allowlist path in `authz`, where one declared value
+  legitimately names several authorized callers; the record path now validates
+  the name exactly the way `declared_client_name` does and stores it verbatim.
+  `split_declared_names` had no other caller and is gone. A database that
+  already saw a multi-word host keeps the fragments the splitting code wrote,
+  so the observation file's schema version is bumped to 2: a reader treats the
+  old file as unknown rather than parsing it, and the next observation
+  replaces it, so an upgrade stops reporting the mismatch instead of carrying
+  the fragments into the doctor's finding.
+
+- **A Kubernetes namespace can run more than one `run_job`, ever (#1807).**
+  `KubernetesAdapter.run_job` called `kubectl run` with the hardcoded pod
+  name `continuum-job` and no `--rm`, so the completed pod stayed in the
+  namespace and the API server refused the next call with
+  `pods "continuum-job" already exists`: the first job succeeded, every job
+  after it in the namespace failed, and two concurrent runs raced for the one
+  name. The name is now derived from the run id plus the action's image and
+  command, so distinct jobs get distinct names while a replay of the same
+  job lands on its own name again, and the pod is created with `--rm`, the
+  cleanup `docker run --rm` already gave the container adapter. Only hex
+  digest characters reach the name, so a run id that kubernetes would reject
+  as a DNS-1123 label cannot be passed through. The argv assertion in
+  `tests/test_kubernetes_adapter.py` moved with the fix and gained tests
+  for the second-call, replay, and invalid-name cases.
+
+- **A digest-less `TOOL_COMPLETED` no longer makes rewind delete a
+  pre-checkpoint file or freeze a post-checkpoint one (#1806).**
+  `rewind_to_checkpoint` keyed its whole "which files survive" decision on
+  whether a `TOOL_COMPLETED` observation carries a `sha256`, so an observation
+  that carries none was treated exactly like "no observation at all". A path
+  whose pre-checkpoint observation has no digest took the "created after the
+  checkpoint" branch and was unlinked even though the checkpoint-era log
+  records a write to it, with zero conflicts and `ok=True`. On the other side,
+  a post-checkpoint observation without a digest left nothing to compare
+  against, so the pre-delete check `file_digest(path) != expected_after` was
+  always true and the file was reported as "digest changed before delete"
+  forever; `--force` did not delete it either, because the `continue` skipped
+  the unlink, so a forced rewind left post-checkpoint files in the workspace
+  while reporting that it ran. Digest-less observations are honest evidence and
+  reachable in an ordinary run: `observe_event_payload` records the path
+  without `bytes`/`sha256` when the file cannot be read at hook time (the
+  PostToolUse hook races the writer, the file can be held exclusively or
+  unreadable, and a multi-step tool can move it between the write and the
+  read), and the gateway's `TOOL_COMPLETED` never carries a digest at all. The
+  pre-checkpoint side now distinguishes "an observation exists but records no
+  digest" from "no observation": the first means the file was already there and
+  cannot be restored, so it is left in place and reported as unrecoverable,
+  never deleted. The post-checkpoint side no longer compares a digest it does
+  not have: there is nothing to verify, so the file is deleted and listed in
+  `deleted_files`. The same guard lifts an unkillable "digest changed before
+  restore" conflict that blocked restoring a file whose post-checkpoint
+  observation had no digest.
+
+- **Replay similarity no longer matches non-completed prior actions (#1837).**
+  `classify_call`'s exact-key path already restricted replay to actions whose
+  status is `completed`, but the similarity scan compared against every prior
+  action of the same type regardless of status. A post-restore call with
+  arguments similar to a previously failed, started, unknown, or compensated
+  action exceeded the replay threshold and was classified as a replay hit of
+  that action, blocking re-execution of an operation that never succeeded. The
+  scan now skips any action whose status is not `completed`, so such calls are
+  classified `fresh` (or matched against a completed action when one exists)
+  and the operation executes again.
+
+- **The replay guard's closed-attempt refusal is raised as `ReplayBlocked`
+  instead of a bare `AssertionError` (#1836).** `evaluate()` built its
+  `DENY_RECLAIM` decision without `key=`, unlike every other branch of the
+  decision table, so `decision.key` was `None` and `protected_call()` tripped
+  `assert decision.key is not None` before it could reach the documented
+  `raise ReplayBlocked(decision)`. A retry of an action whose previous attempt
+  reached a closed status (`failed`, `compensated`) therefore surfaced as an
+  internal assertion error callers could not catch, and under `python -O` the
+  stripped assertion silently made `key_to_use` `None`. `DENY_RECLAIM` now
+  carries its key, so the refusal reaches callers as `ReplayBlocked` with the
+  decision and key, and the gate's closed-attempt message reports the real
+  status instead of the `action is None` fallback. Regression tests mirror the
+  `BLOCK_UNCERTAIN` coverage from #735.
 
 
-  merges.** Several branches each synced the documented collected total on its
-  own base, so once merged the tree collected more tests than every doc stated
-  and the docs-count guard failed; README, the translated READMEs, CHANGELOG,
-  `docs/CONTRIBUTING_ONBOARDING.md`, `references/testing.md` and
-  `references/install.md` now all read the live total. `README.md` and
-  `docs/api/mcp.md` still counted twelve MCP tools after #1260 added a
-  thirteenth (`continuum_compensate_action`), so the tool-count guard read 12
-  against the server's 13. The MCP doc guard
-  also tripped because `curate_briefing` reads `contract.triggering_risks`
-  while the wiring test's contract stand-in predated that field, and the
-  pre-#1262 trajectory-render label test still asserted the old inline
-  `"unverified (derived)"` string against the shared `derived_label`. Two mypy
-  errors from the recovery-anchor wiring (`anchor_seq` narrowing and a `payload`
-  redefinition in `cmd_actions`) are fixed. No behavior changes.
+- **`continuum status` now honours the global `--json` flag in its main view (#1785).**
+  Running `continuum --json status <run>` without `--provenance` previously ignored
+  `--json` and emitted plain text, while `--provenance` honoured it. The main view
+  now threads `as_json=args.json` into its emitter and outputs a structured JSON
+  payload containing `run_id`, `goal` (`description` and `version`), `version`,
+  `progress` (`completed`, `pending`, `failed`, `total`), and `decisions`
+  (`valid`, `total`). On an unprojectable run, the payload includes the
+  `projection_failed_at` block and exits with code `ExitCode.CORRUPTED`.
 
-- **PostgresStorage action-index fold skips malformed JSON payloads (#1386).**
-  `PostgresStorage._canonical_index_rows` decoded raw payload strings without
-  guarding against decode errors, so an event with a malformed JSON payload
-  raised an unhandled `json.JSONDecodeError` during `action_index_drift()` and
-  `rebuild_action_index()`. `SQLiteStorage` already wrapped the parse in
-  `try/except json.JSONDecodeError: continue` to skip corrupt rows and complete
-  the fold. The Postgres fold now guards payload decoding with matching
-  skip-not-crash semantics, allowing `continuum verify --index` to complete
-  consistently across backends on partially corrupted stores.
+- **A developer's own venv and scratch database are no longer committed as the
+  project's Continue registration (#1618).** PR #1612 added
+  `.continue/config.yaml` to the repository root, fully baked: a `command`
+  inside one contributor's home directory and a `--db` under
+  `/private/tmp/fix-1612/`. That path exists on one machine, so every other
+  clone was wired to a server that cannot start, the `CONNECTION_CLOSED` shape
+  `docs/api/mcp.md` documents, and `continuum doctor` ended at
+  `REQUIRES_REPAIR` on a clean checkout because the baked command does not
+  resolve. The file is gone, and the per-project files `continuum mcp install
+  --scope project` writes, `.continue/config.yaml`, `.cursor/mcp.json`,
+  `.codex/config.toml`, `.zed/settings.json` and `opencode.json`, are now
+  gitignored so the same thing cannot recur. `.mcp.json` is the exception and
+  stays tracked: it carries a path expression the host expands rather than a
+  command resolved on one machine, which is why `install.py` resolves paths on
+  the target machine in the first place. A test pins this per host, so a
+  committed project registration fails CI instead of failing a clone.
 
-- **GenericAgentAdapter records dependency declarations as deterministic (#1391).**
-  `GenericAgentAdapter._declare_dependencies` previously hardcoded
-  `source=Origin.EXTERNAL_AGENT`, which contradicted its documented contract as
-  a trusted in-process facade writing `Origin.DETERMINISTIC` state. This dropped
-  the advisory prefix trust score on runs with pinned environments. The adapter
-  now stamps `DEPENDENCY_DECLARED` events with `source=Origin.DETERMINISTIC` to
-  match its checkpoint and action ledger writes.
+- **The documented test count is re-synced, so `main` builds again.** The
+  collected total had drifted to 3,680 against a documented 3,636, past the
+  30-test tolerance `test_documented_count_matches_suite` allows, so the
+  guard failed every test job on `main` and would fail on any branch adding
+  three or more tests for a reason that has nothing to do with the branch.
+  Every doc that states the total now states 3,680: `README.md`, the five
+  translated READMEs, `docs/CONTRIBUTING_ONBOARDING.md`, `docs/index.html`,
+  `references/install.md`, `references/testing.md`. Four phrasings that
+  contradicted the new figure on the same line are corrected with it, and one
+  of them is why the drift was invisible: `README.md` stated a collected
+  total in the form `3,636 collected` with no tilde, which no pattern in the
+  guard matches, so that line drifted with the suite while every guarded line
+  held.
 
-- **`ensure_run` now checks archived history so compaction does not inject a duplicate `RUN_STARTED` (#1436).**
-  `ContinuumMCP.ensure_run` and `SidecarServer._ensure_run` checked `read_events(run_id, upto=1)`
-  to decide whether a run needed its genesis event backfilled. On a compacted run, events up to
-  the anchor sequence reside in `events_archive`, so the live query returned an empty list,
-  causing both servers to append a second `RUN_STARTED` event into the live tail. The duplicate
-  event wiped initial goal constraints, reset progress counters, and corrupted projected state.
-  Both entry points now inspect archived events first, recognizing that a compacted run was
-  already started properly.
+- **The read-only MCP tools say "no such run" for an unknown run id.**
+  `continuum_validate`, `continuum_resume` and `continuum_list_actions` were
+  not wrapped in `_refusal_reaches_the_caller`, so under mcp 2.1.0 a mistyped
+  id reached the caller as the bare `Error executing tool <name>`. They now
+  carry a `refusals` decorator that applies the same conversion, and
+  `continuum_validate` and `continuum_resume` look up the run row first so an
+  unknown id is refused as `RunNotFound` (as `continuum_list_actions` already
+  did) rather than as `run 'x' has no checkpoint and no events`.
 
-- **Compaction no longer mints an environment-blind anchor checkpoint (#1049).**
-  `compact_run` took its forced anchor checkpoint without an `environment`
-  argument, so the anchor's `StateCheckpoint.environment` was always `None`.
-  That anchor becomes the run's newest checkpoint, and `RecoveryEngine.assess`
-  hands `None` to the validator, which marks every pinned dependency `UNKNOWN`
-  for want of a snapshot to compare against. A run that resumed cleanly one
-  moment before compaction downgraded to `REQUEST_HUMAN` one moment after,
-  with nothing about the world having changed. Both engines now thread an
-  optional `environment` through `compact_run`: `continuum compact` captures
-  one from `--env` the way `continuum validate` does, and when the caller
-  supplies none, the anchor carries forward the environment the run's newest
-  checkpoint already recorded, because compaction observes the world rather
-  than changing it. A run with no recorded checkpoint still anchors with
-  `None` rather than inventing a snapshot.
+- **Client names are now folded, so the mutating-tool allowlist and the
+  per-client token map agree (#1598).** Both halves of the handshake key off
+  the same `clientInfo.name` string, and neither normalised it, so the two
+  could disagree: a host naming itself `Cursor` against a grant registered as
+  `cursor` passed authorisation and then failed authentication, and the
+  message blamed the name as unregistered rather than naming the mismatch.
+  Every name comparison in `src/continuum/mcp/authz.py` now goes through one
+  fold (whitespace-stripped, `casefold`), so one spelling of a client name is
+  one identity across both halves. Secrets are still compared exactly, and
+  the refusal paths still fail closed. The match is documented as
+  case-insensitive in `docs/api/security.md`.
 
-- **Path canonicalization in idempotency hashing is now platform-independent (#1437).**
-  `_canonicalize_paths` previously used `os.path.normpath`, which converted separators
-  to backslashes on Windows while leaving forward slashes on POSIX. Because `stable_hash`
-  hashes canonical JSON strings, equivalent path arguments hashed differently on Windows
-  versus Linux, causing shared ledgers or cross-platform replays to generate mismatched
-  idempotency keys and fail deduplication. Normalization now standardizes Windows path
-  separators to forward slashes using `posixpath.normpath` across all operating systems,
-  while preserving backslashes in POSIX filenames and regex-like strings. Note that
-  existing ledger entries recorded on Windows with backslash paths will compute new
-  idempotency keys under the normalized representation.
+- **A probe that prints `occurred:false` is now told the separator is the
+  problem.** A command probe's verdict contract was documented only in the
+  module docstring, so the place an operator met it was the error, and the
+  error said `probe could not determine the outcome from output 'occurred:false'`
+  -- which sends someone hunting in their probe's logic when the cause is one
+  character away. `occurred:false` is the natural shape for a shell `echo` and
+  for most config formats, and it reads as unknown rather than as a verdict,
+  because the separator is `=`. The message now names the colon and shows the
+  line to print instead, and every other unparseable output carries the accepted
+  forms with it. The output contract is documented next to the registry schema
+  in `docs/api/cli.md` (the three verdicts, the JSON alternatives, the
+  last-non-empty-line rule, and the colon trap), and the authority probe's
+  `valid=` parser, which had the identical opaque message, gets the same
+  diagnosis.
 
-- **Agent adapters now check archived history so compaction does not inject a duplicate `RUN_STARTED` (#1453).**
-  `LangChainAgentAdapter.start_run`, `LangGraphAgentAdapter.start_run`, and `OpenAIAgentAdapter._ensure_run_exists`
-  checked `read_events(run_id, upto=1)` to decide whether a run needed its genesis event recorded. On a compacted run,
-  events up to the anchor sequence reside in `events_archive`, so the live query returned an empty list, causing
-  the adapters to append a second `RUN_STARTED` event into the live tail. The duplicate event wiped initial goal
-  constraints, reset progress counters, and corrupted projected state. All three adapters now inspect archived
-  events first, recognizing that a compacted run was already started properly.
+- **The gateway can finally reach a plain-HTTP upstream.** The transport was
+  hardcoded: every route opened an `HTTPSConnection` and the recorded evidence
+  stamped `https://` on the path, so an upstream that does not terminate TLS
+  itself -- a local service on `localhost`, an internal address behind a
+  TLS-terminating load balancer -- was unreachable at all. The handshake to its
+  cleartext port failed as `WRONG_VERSION_NUMBER` before a byte was forwarded,
+  the claim settled `UNKNOWN` (uncertain), and no `TOOL_COMPLETED` evidence was
+  recorded, which is the worst answer the gateway can give: the effect looked
+  unaccountable when the truth was that the proxy never tried.
 
-- **ActionLedger.compensate() now enforces a completed status precondition (#1387).**
-  The method accepted any existing record and transitioned it to `COMPENSATED`
-  while clearing `side_effect_uncertain`, mirroring the gap #366 and #733 fixed
-  for `complete()` and `fail()`. Because `claim()` deliberately treats a
-  compensated action as re-fireable, compensating an interrupted or uncertain
-  (`UNKNOWN`) action laundered the recovery blocker away and allowed duplicate
-  execution of an external effect that may have already run. `compensate()` now
-  verifies the action is in `(ActionStatus.COMPLETED, ActionStatus.COMPENSATED)`,
-  raising `LedgerError` for any in-flight or un-reconciled record.
-
-- **`record-plan` now succeeds on compacted runs (#1438).** `cmd_record_plan`
-  queried `read_events` for its preflight projection check and post-write
-  emission, which on a compacted run reads only the post-anchor live tail.
-  Because `RUN_STARTED` lives in `events_archive`, projecting the candidate
-  against that truncated history raised `ProjectionError` and refused valid
-  plans with exit code 1. The command now queries `read_all_events` so the
-  preflight fold and state emission see the full merged event history.
-
-- **The MCP candidate fold now reads the full history, so `continuum_record_progress`
-  and `continuum_record_plan` keep working on a compacted run (#1133).**
-  `_project_candidate` folded only the live tail; once compaction moved
-  `RUN_STARTED` into `events_archive`, the goal no longer projected and both
-  write tools refused every payload as "unprojectable" -- exactly the
-  long-running runs they exist for. It now folds `read_all_events`, so the goal
-  still projects and the head sequence it validates against is unchanged. The
-  original fix (PR #1219) was dropped in a merge-of-main and never landed.
-
-- **`DependencyGraph.impacted_by` now cascades taint along finding-to-finding
-  citation edges to a fixpoint (#1475).** Findings may cite other findings
-  (blessed by `SemanticState.dangling_evidence`), and `StateValidator._propagate`
-  iterated to a fixpoint so stale findings cascade down the derivation graph.
-  `impacted_by` previously only checked citations against the initial evidence
-  set in a single pass, missing findings and decisions that depended on tainted
-  findings. `DependencyGraph.impacted_by` now repeats until no new findings are
-  tainted, restoring parity with the validator and preventing stale downstream
-  findings and decisions from surviving localized repair plans.
-- **The edit-precondition gate now raises the exception subclass matching the
-  edit type it refused (#1114).** The gate picked `ForkPreconditionError` for
-  forks but the plain `EditPreconditionError` for every other edit type, so
-  `MergePreconditionError` and `RestorePreconditionError` -- both exported
-  through `recovery/__init__.py` -- were never raised anywhere and a caller
-  could not distinguish a merge refusal from a restore refusal by exception
-  type. `check_preconditions` now maps `edit_type` to its subclass, and the
-  two-sided `check_merge_preconditions` path raises `MergePreconditionError`
-  as well. The three subclasses are defined once in `gate.py` and re-exported
-  by `fork.py`, `merge.py` and `restore.py` as before, so existing imports and
-  `except EditPreconditionError` handlers are unaffected; only `type(exc)`
-  becomes observable.
-
+  A route's upstream scheme is now data. `http://` on the host, or a `scheme`
+  field naming it, selects the plain transport, and the recorded path reports
+  the scheme the request actually travelled. A route without either still means
+  `https`, so an existing `gateway.json` keeps the transport it was built for.
+  The two spellings must agree and only `http`/`https` are accepted, both
+  rejected at load time where the operator still has the file open. The scheme
+  is stored off the host, which stays a bare authority, and the scheme's default
+  port folds to absent so a client that spells it still reaches the route. The
+  suite now drives a live plain-HTTP upstream through the real stack -- its
+  module docstring had claimed one for a year while every upstream was either
+  unreachable `example.com` or a canned connection that replaced the very class
+  that chose the transport.
 - **A padded argument token can no longer reset the authorization-bound retry
   budget (#1052).** The bucket was derived from every argument token, and the
   arguments are caller-controlled noise plus the real resource, so keeping the
@@ -212,16 +356,60 @@ All notable changes to this project are documented here. The format follows
   since declaring such fields `volatile` at every call site is not a fix: a
   caller that wants around the cap simply forgets to declare them.
 
+- **The doctor stops contradicting the server over client-name case (#1621).**
+  `doctor._observation_finding` compared the baked client name against the
+  names hosts actually sent with a raw `in`, while every comparison in
+  `authz` goes through the fold. The `zed` profile makes the discrepancy
+  visible immediately: `HOST_PROFILES["zed"]["mutating_clients"]` is `"Zed"`,
+  capital Z, transcribed from zed's own source, and `docs/api/mcp.md` tells
+  readers the comparison folds case. The server authorized the caller; the
+  doctor said it had been refused and that install reported success.
+
+  The comparison now folds both sides through the same normalisation, so the
+  doctor agrees with the server. The normaliser is also exported as
+  `authz.fold_client_name`, so there is one place to read the rule instead of
+  re-deriving it. The `_fold` alias is kept so existing readers still resolve.
+
+
+- **The doctor no longer reports a portable registration as stale (#1619).**
+  `.mcp.json` in this repository bakes the form `docs/api/mcp.md` tells people
+  to commit, `${CLAUDE_PROJECT_DIR:-.}/.venv/bin/continuum-mcp`.
+  `os.path.expandvars` does not understand the shell's `${VAR:-default}`
+  syntax, so the text reached `_resolves` unchanged, was not absolute, and fell
+  through to a PATH lookup for a name no PATH will ever contain. The row came
+  back `stale` on every machine, which is the state whose remedy is to re-bake
+  the path, and re-baking replaces a portable committed expression with an
+  absolute one tied to whichever machine ran it. A clean clone therefore
+  exited `REQUIRES_REPAIR` (10) and printed advice that would have made the
+  registration worse.
+
+  A command carrying a shell expression is now reported as `unverified`, a
+  third state carried on `IdeReport.unverified`. It is not stale, so it does
+  not drive the repair exit code; the summary and the detail row say plainly
+  that the host expands it at spawn and the doctor cannot check it. Detection
+  is a literal `$` in the command, which also covers `$VAR` and `$HOME`: those
+  expand to a real path when the variable is set and to a literal `$NAME` when
+  it is not, so the unset case would otherwise have reported a path containing
+  a `$` as broken. A genuinely deleted virtualenv is still `stale`, still
+  exits `REQUIRES_REPAIR`, and still prints the re-bake remedy. The hook
+  surface is untouched: it bakes absolute paths and has no expression form.
+
 ### Changed
 
-- **A compaction anchor keeps the environment it was validated against (#762).**
-  `compact_run` writes a forced anchor checkpoint, which becomes the newest one
-  and the resume comparison point. It was written with no environment, so a
-  compacted run had no snapshot to diff a resumed capture against and every
-  resource read as unknown. The anchor now inherits the previous checkpoint's
-  environment. Both the SQLite and Postgres paths changed, since they carry
-  identical anchor logic.
-
+- **The authority-resurrection check now goes through its own exported helper
+  instead of being inlined twice (#1154).** `is_authority_consumed` was in
+  `__all__` and documented but called nowhere; `decide` and the gateway's
+  `match_route` each tested membership inline, and each also carried a
+  `hasattr` ladder whose dict fallback could not run, because
+  `collect_consumed_authorities` stores the `Event` itself as the map value and
+  an `Event` always has `.sequence` and `.payload`. Both call sites now route
+  through the helper and read those two attributes directly, with the
+  map-holds-Events contract documented at its one definition. Behaviour is
+  unchanged: the dead branches happened to compute the same values the live
+  ones did, so no message, verdict, or sequence number moves. What goes away is
+  that a security-sensitive block no longer reads as though it handles a
+  dict-valued map it can never receive, so the next change to
+  `collect_consumed_authorities` cannot silently select a different branch.
 - **The TUI `tree` view fetches the run once instead of twice (#1157).**
   `family_lines` in `src/continuum/tui/model.py` called
   `storage.get_run(run_id)` twice and discarded the first result: the first
@@ -307,182 +495,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **The pin-marker surface no longer contradicts itself (#1099).** The docs
-  name `pin_markers_for_state` as the emitter of the `[pin:<id>:<hash>]`
-  markers, but the code that actually builds the ACTIVE CONSTRAINTS section
-  (`checkpoint/context.py:_pins_section`) reached across modules for the
-  private twin `_pin_marker` instead, and the public helper had no caller
-  outside its own module. `_pins_section` now builds its markers through
-  `pin_markers_for_state`, so the section and the accounting that reads it
-  cannot spell a pin two different ways, and the two doc sentences are true as
-  written. The four pin helpers (`account_pins_in_context`,
-  `pin_markers_for_state`, `check_pin_accounting`, `constraint_pins_payload`)
-  are added to `state/semantic.py`'s `__all__`, where three test modules and
-  `checkpoint/context.py` already import them by name.
-  `tests/test_module_all_exports.py` now covers that module, so the `__all__`
-  half cannot silently regress. Rendered output is unchanged.
-
-- **`benchmarks/` is now included in CI and pre-commit ruff gates (#1064).**
-  `benchmarks/` is imported by the test suite but sat outside the lint scope
-  in both CI and pre-commit configuration. The five ruff lint and format
-  findings in `benchmarks/fault_injection/runner.py` (SIM115, I001, SIM102,
-  SIM105, and formatting drift) are resolved, and CI `ruff check` and
-  `ruff format --check` as well as `.pre-commit-config.yaml` now cover
-  `benchmarks/` alongside the existing `src/`, `tests/`, `examples/`,
-  `_bugaudit/`, `scripts/` and `demo-run/` scopes. Contributor verification
-  guides across the documentation are synchronized to match.
-
-- **`PostgresStorage.rebuild_action_index` returns corrected row count (#1267).**
-  `rebuild_action_index` on Postgres ended in an unconditional `return 0`,
-  so `continuum verify --index --repair-index` always reported 0 rows corrected
-  even after rewriting drifted rows. It now queries the stored index before
-  rebuilding, compares against the canonical fold, and returns the count of
-  missing, stale, and spurious rows corrected, matching `SQLiteStorage` and the
-  base `Storage` contract.
-
-- **CITATION.cff states the released version, and the bump sites are documented
-  (#1120).** The citation file pinned `0.1.0` while the package was `0.1.2`, so
-  anyone citing the project recorded a version two releases stale, and
-  `CONTRIBUTING.md` still said the version lived in two places guarded by
-  checking that "will be added" -- the guard has run in CI since #838 and reads
-  four sites. The file now says `0.1.2`, the paragraph names all five sites a
-  bump touches (pyproject, `__init__.py`, both README pins, CITATION.cff, the
-  release tag), and `tests/test_version_drift.py` checks the citation file
-  alongside the README pins so the drift cannot recur.
-
-- **The Postgres backend now stores and returns a fork's `parent_run_id`
-  (#1079).** Both `create_run` and `create_run_started` inserted only the six
-  columns the schema had before lineage existed, and `_row_to_run` never read
-  the column back, so `runs.parent_run_id` was declared with a foreign key to
-  the parent and then left permanently null. Every fork silently lost its
-  lineage on the Postgres engine, and because `children_of`
-  (`recovery/family.py`) filters `list_runs` on that column, the family
-  resume block was vacuous there: a Postgres deployment would never refuse a
-  parent RESUME over an unsafe child, and would report the same empty family
-  the CLI tree and TUI render from. SQLite wrote and read the column in all
-  three places, so the two engines disagreed on a safety property with no
-  error anywhere. Both inserts now carry `run.parent_run_id` and the row maps
-  it into the `Run`, matching SQLite; the contract suite gained a case that
-  forks on the engine and asserts `children_of` resolves the child.
-- **The translated docs no longer tell users to pass `--json` after the subcommand, where argparse rejects it (#1144).**
-  `--json` is a global flag on the top-level parser, so `continuum resume RUN --json` exits 2 with "unrecognized arguments": the trailing position is not a valid invocation anywhere. Five translated READMEs still claimed every command accepts it there, and `docs/guides/memory_governance.md` built two shell pipelines on the failing form, so the whole tenant-enumeration section it belongs to produced nothing: the command never ran and `python -m json.tool` read an empty pipe. The guides now state the placement and the failure, matching `docs/api/cli.md`, which already documented the rule correctly. The translated READMEs also picked up the webhook caveat the English README gained when read-only-ness was qualified, so they describe the same CLI the canonical docs do rather than a stale version of it.
-- **`replay --upto` works on a compacted run instead of failing for every value
-  of `N` and blaming the operator for it (#1172).** `cmd_replay` read only the
-  live event tail, where `RUN_STARTED` no longer lives once a run is compacted,
-  so its guard rejected every `--upto` request and advised "increase `--upto`"
-  -- the one fix that cannot help, because the event had moved into the archive
-  rather than being excluded by the window. `--upto 999` failing on a run whose
-  head was 13 is what proved the message was wrong about the cause. The command
-  now windows the full history, archived prefix included, the way `cmd_events`
-  already does; `--upto` remains the bisection tool it is documented as, on the
-  long-lived runs compaction exists to serve. `_verify_against_stored` had the
-  same blind spot one function down: it re-derived the stored version's prefix
-  from `read_events(upto=source_sequence)`, which reads an empty log on a
-  compacted run because the prefix starts at sequence 1 and compaction moves
-  exactly that range. Left alone it would have reported every healthy
-  checkpoint as corrupt once the primary read was corrected, so both sites now
-  window `read_all_events`. `STATE_CHECKPOINTED` and `EVENT_LOG_ANCHORED` are
-  both non-projecting, so folding the archived prefix from genesis reaches the
-  same state the anchored path already produced. The guard is unchanged and
-  still fires when a window genuinely excludes `RUN_STARTED`.
-- **The gateway now enforces a route's `prefix` instead of only parsing it
-  (#1051).** `match_route` narrowed candidates by host and method and never
-  compared the request path against the route, so every path on a registered
-  host was the route's scope: a live claim for `/v1/invoices` spent itself on
-  `/v1/refunds` or `/internal/admin/purge`, the gateway forwarded the request,
-  settled the claim as completed, and wrote `TOOL_COMPLETED` evidence whose
-  `path` recorded the off-prefix URL: the run's log said the invoice was sent
-  while the upstream saw something else entirely. The prefix is the only
-  per-path scope a route has and nothing else narrowed what a claim could
-  reach, so there was no workaround. `match_route` now takes the request path
-  and requires it to fall within the prefix on a whole-segment boundary
-  (`/v1/invoices` admits `/v1/invoices/49`, not `/v1/invoices-archived` or
-  `/v1/refunds`); the path is normalised first (query stripped, percent-decoded,
-  `..` collapsed) because the upstream rewrites `/v1/invoices/../refunds` and
-  decodes `/v1/invoices/%2e%2e/refunds` to the same thing before it dispatches,
-  and the refusal has to be about the path actually served. A
-  request on a registered host but under none of its prefixes is refused with
-  `403` naming the prefixes, before the key is rendered and before anything is
-  forwarded or settled. A route written without a `prefix` keeps the whole
-  host, which is what the default `/` has always meant. `match_route`'s new
-  `path` argument is required rather than defaulted: a caller cannot ask for a
-  routing verdict without saying what it is routing, and a silent default
-  would reintroduce the hole as an omission rather than a design. The path is
-  normalised exactly once, because `urllib.parse.unquote` is not idempotent:
-  `/v1%252finvoices/49` decodes to `/v1%2finvoices/49` on the first pass and to
-  `/v1/invoices/49` on the second, and the gateway was normalising in
-  `match_route` and again in `_path_under_prefix`, so a doubly-encoded
-  separator made the boundary see the invoice path, spend the claim, and write
-  evidence that the invoice was sent while the upstream, which decodes once,
-  served one literal segment that never reached the invoice endpoint. The
-  verdict is now taken on the raw request line, which is what the upstream
-  decodes.
-- **`resume --pinning` compares against the archived pinning, so a compacted
-  run stops reporting every key as newly pinned (#1126).** The drift display
-  folded the live event tail alone, and compaction moves the pinning-carrying
-  `ACTION_RECORDED` into `events_archive` while the anchor marker that replaces
-  it carries no pinning at all. The fold therefore read `{}` as the run's
-  recorded identity and `pinning_drift({}, current)` called every key newly
-  pinned -- including on a run whose recorded pinning was byte-identical to the
-  one passed at resume. The wrong directions were exactly the ones an operator
-  would act on: a genuinely *changed* hash
-  rendered as "newly pinned" instead of "changed", hiding the previous value,
-  and a key that had been unpinned never rendered at all, because the
-  `unpinned (was ...)` line needs the old value the empty record could not
-  supply. The display is informational and never gated recovery (issue #241),
-  but it was wrong in the direction of hiding drift, which is the opposite of
-  what a drift report is for. `latest_pinning` now folds `read_all_events`, the
-  same history the assess (#1050) and watch (#1072) folds already read.
-- **`continuum mcp doctor` names the directory the console script is installed
-  into, not the one the venv python symlinks to.** `_scripts_dir()` took
-  `Path(sys.executable).resolve().parent`, but a venv's `python` is a symlink
-  to the base interpreter and resolving it walks past the venv to that
-  interpreter's `bin` -- a directory that holds neither the script nor the one
-  an operator should add to PATH. Windows has the same shape one level over:
-  scripts install into `Scripts` beside the executable, not beside it. It now
-  reads `sysconfig.get_path("scripts")`, which reports the directory the
-  install actually uses on both platforms. The bug was invisible to the suite
-  because the test module recomputed the same expression for its own
-  expectations, so both sides agreed on the wrong directory; that constant now
-  comes from the function under test, and
-  `tests/test_mcp_doctor.py::test_scripts_dir_follows_the_venv_not_the_symlink`
-  installs a real symlinked python and asserts the old logic's answer for it
-  is wrong.
-- **The content-addressed snapshot store now rejects a key that is not a digest
-  before it is joined into a path, so a traversal string cannot turn `rewind`
-  into a file-read primitive (#1268).** `snapshot_path` built its storage
-  location by pure concatenation, so a `sha256` containing `../` escaped
-  `.continuum/file-snapshots` and landed anywhere the process could reach;
-  `restore_file` then copied whatever that path pointed at over a workspace
-  file, and `snapshot_path(key).exists()` was an existence oracle for the same
-  range. The write side of this store was hardened in #1110 (issue #1077), which
-  closed filing content under a digest it does not have without touching the
-  read side -- the worse direction, reached through `continuum rewind`, the
-  command whose purpose is to restore trusted content. A key is now only a name
-  here when it is a 64-char lowercase hex digest: `snapshot_path` raises
-  `ValueError`, `snapshot_file` and `restore_file` fail closed to their existing
-  `None`/`False` contracts so a caller that does not catch still cannot reach
-  `copyfile`, and `rewind` reports the poisoned key as unrecoverable rather than
-  following it. Stated honestly, no shipped CLI or MCP path lets an agent plant
-  such a string today -- every `TOOL_COMPLETED` writer computes its own digest
-  -- so this is a defect in the sink, not a complete exploit chain; it is worth
-  closing because the content-addressed contract the store relies on was
-  enforced nowhere on the side that copies bytes into the workspace.
-- **The Postgres action index no longer reads as permanently dirty on an
-  ordinary store (#1321).** `action_index_drift` compares the projection
-  against a canonical fold of the log, and the two sides numbered each row on
-  different scales: `_maintain_action_index` takes `nextval` on a sequence
-  that advances once per action event, while the fold numbered a row by its
-  position in the merged row stream, which counts `RUN_STARTED`,
-  `TOOL_CALLED`, `EVIDENCE_ADDED` and every other non-action row too. A
-  normal run has those between its actions, so the two disagreed by one per
-  intervening row and `continuum verify --index` reported a corrupted
-  projection on a store nothing had tampered with, with `--repair-index` no
-  help because a rebuild rewrote the rows with the fold's numbers and the
-  next appended action put them straight back out of step. The fold now
-  counts action events only, 1-based, which is exactly the number the
-  sequence assigned. SQLite was immune -- both sides there use the writing
-  event's `rowid` -- and a regression test now pins that agreement.
+- **Postgres compaction no longer archives and deletes its own anchor marker
+  (#1078).** `SQLiteStorage.compact_run` refused an explicit `through_sequence`
+  at or above the anchor marker's sequence (#705), but `PostgresStorage.
+  compact_run` computed `through` straight from the argument and ran the
+  archive and delete over it, so a direct caller of the storage API could
+  remove the marker and every live row after it. The next append then minted a
+  fresh genesis with `prev_hash = None` and the live chain forked away from the
+  archive, defeating the single-transaction marker-plus-move that both engines
+  implement. The SQLite and Postgres engines now resolve the bound through one
+  shared helper, `continuum.storage.compaction.
+  resolve_compaction_bound`, so the anchor guard and the other safety checks
+  cannot drift apart between backends again. The CLI still calls
+  `compact_run` with no bound, so only a direct API caller could reach this;
+  that remains a real hole for a library whose storage is a public interface.
+  Behaviour on SQLite is unchanged, and the Postgres suite gains the anchor
+  rejection test the SQLite suite already had.
 - **Webhook dedup now survives a compaction inside the re-notify window
   (#1186).** `_within_dedup_window` scanned only the live event tail for the
   `NOTIFICATION_SENT` / `NOTIFICATION_FAILED` rows the dedup state lives in,
@@ -511,7 +539,6 @@ All notable changes to this project are documented here. The format follows
   all its prose is rephrased, so that one pattern reads all six READMEs.
   `references/testing.md`, `references/install.md`, and the translated READMEs
   now carry the same figures as `README.md`.
->>>>>>> origin/main
 
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
@@ -574,26 +601,6 @@ All notable changes to this project are documented here. The format follows
   recovery verdicts and safety semantics are unchanged.
 
 ### Fixed
-
-- **`continuum mcp install` and `continuum mcp remove` register the server
-  cross-platform (#834), and the registration's lifecycle is now defined
-  (#841).** The committed `.mcp.json` cannot express "`.venv/bin/x` on POSIX,
-  `.venv\Scripts\x.exe` on Windows", and a bare command name is resolved by
-  the host's `CreateProcess` against *its* PATH, never the child's, so
-  resolution has to happen on the machine that will spawn the server.
-  `mcp install` does that: it probes the `mcp` SDK in a fresh subprocess
-  first (a missing extra is refused with the install command and nothing is
-  written), then bakes the resolved console script, or the
-  `python -u -m continuum.mcp` fallback that carries zero PATH assumptions,
-  plus an absolute `--db`, into the local- or project-scope registration.
-  The result connects regardless of the host's PATH and spawn cwd. `mcp
-  remove` deletes only the entries install recognises; a foreign or
-  hand-edited entry under the same name is left alone. The lifecycle #841
-  left undefined is documented as a table in `docs/api/mcp.md`: a re-run
-  after an upgrade repoints a moved venv in place and never duplicates, and
-  `pip uninstall` leaves the registration behind so `mcp remove` is the
-  documented pairing. `tests/test_mcp_install.py` pins idempotency, the
-  repoint, the foreign-entry guarantee and both scopes.
 
 - **MCP and sidecar ledger writes now carry `EXTERNAL_AGENT` (#653).**
   `ContinuumMCP.ledger` and `SidecarServer._ledger` construct their
@@ -1153,6 +1160,45 @@ All notable changes to this project are documented here. The format follows
   callable), and the existing answers for genuinely malformed JSON are
   unchanged.
 
+### Tests
+
+- **`resolve_compaction_bound` is covered (#1653).**
+  `src/continuum/storage/compaction.py` was at 17%: the whole function body
+  was unexercised, including all four `ValueError` branches, in the module
+  both storage engines now share to decide what is safe to archive. That
+  matters because the comparison against `anchor_sequence` is the guard that
+  stops an explicit `through_sequence` from archiving the run's own anchor
+  marker, which is the regression fix for #705 and #1078.
+  `tests/test_storage_compaction_bound.py` drives a real `SQLiteStorage` in
+  `tmp_path` (the resolver calls the private `storage._anchor_environment`, so
+  a mock would skip the anchor logic under test) and covers the happy path,
+  the three re-anchor triggers, and each refusal. Coverage of the module is
+  97%, and removing the comparison fails three tests. Initial tests contributed
+  by @fraware in #1671.
+- **The liveness cadence contract is covered (#1656).**
+  `src/continuum/recovery/health.py` was at 76%. `silence_seconds` had not a
+  single line of coverage, both `load_cadence_contract` refusals were
+  unexercised, and `CadenceContract._scopes_positive` had never been seen to
+  raise, so a change that stopped rejecting a blank scope key or a zero-second
+  scope would not have been caught. `tests/test_recovery_health_cadence.py`
+  covers all three exits of `silence_seconds`, both refusals, every validator
+  branch, `threshold_for` including the fallback for an absent scope,
+  `to_dict`, and `advisory_text`, which had no test at all. The module is now
+  at 90%. No test reads the operator's real `.continuum/liveness.json`; every
+  load points at a file in `tmp_path`, which is what keeps the suite from
+  depending on the machine it runs on. Additional cadence contracts and liveness
+  evaluation tests contributed by @heyyReggiee in #1670.
+- **The splash animation frame math is pinned (#1655).**
+  `src/continuum/tui/animate.py` shipped with no test at all. Its only
+  appearance in a coverage report was
+  `tests/test_module_all_exports.py` importing it, which touches module-level
+  lines and no function body. `tests/test_tui_animate.py` covers all six public
+  functions and the exported constants, and asserts the `SETTLED` contract that
+  makes them safe: a negative frame resolves to the complete, unemphasised
+  result for every one of them. The module is still orphaned, and is left that
+  way on purpose; wiring it up is a design question with its own issue.
+  Coverage of the module is 100%.
+
 ## [0.1.2] - 2026-08-31
 
 ### Fixed
@@ -1345,7 +1391,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,864 collected, ~2,825 passed, ~34 skipped on a minimal env).
+  (3,672 collected, ~3,672 passed, ~0 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses

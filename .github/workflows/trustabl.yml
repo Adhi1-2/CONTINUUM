@@ -1,0 +1,39 @@
+name: Trustabl Agent Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Minimal top-level permissions; write grants are scoped to the scan job only.
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: trustabl-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    # Findings stay advisory, but a scanner that never ran must not look
+    # green: step-level continue-on-error plus an explicit execution gate.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: scanner
+        uses: trustabl/trustabl-action@d97575c864814bf4965fa2c72c044224d372723a # v0.4.3
+        continue-on-error: true
+        with:
+          version: v0.1.6
+      - name: Report scanner execution failure
+        if: ${{ always() && steps.scanner.outcome != 'success' && steps.scanner.outputs.exit-code != '1' }}
+        run: |
+          echo "Trustabl did not complete a scan" >&2
+          exit 1

@@ -1,8 +1,11 @@
 """The enforcing HTTP gateway (seam 4).
 
 A local proxy that refuses unclaimed outbound requests to registered
-upstreams and settles claims from real upstream responses. Tested against a
-live upstream server on an ephemeral port, through the actual HTTP stack.
+upstreams and settles claims from real upstream responses. A plain-HTTP
+upstream is driven through the actual HTTP stack against a live server on an
+ephemeral port; the failure modes a real upstream cannot be made to produce on
+demand (a truncated reply, an oversized one, a DNS-unreachable host) use a
+canned connection instead.
 """
 
 from __future__ import annotations
@@ -11,8 +14,11 @@ import http.client
 import json
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -83,6 +89,30 @@ def post(addr: str, path: str, body: dict[str, object], host: str = "api.example
     return resp.status, data
 
 
+# The scheme tests replace ``http.client``'s connection classes to see which one
+# the gateway dials out with, and ``post`` dials in through the same class --
+# so a patched ``HTTPConnection`` would fake the request that drives the
+# gateway and hand it a canned 200 that never reached the proxy. Captured at
+# import time, before any patch, this is the real socket the test talks to.
+_REAL_HTTP_CONNECTION = http.client.HTTPConnection
+
+
+def _post_to_gateway(
+    addr: str, path: str, body: dict[str, object], host: str = "api.example.com"
+) -> tuple[int, dict[str, object]]:
+    conn = _REAL_HTTP_CONNECTION(addr, timeout=10)
+    conn.request(
+        "POST",
+        path,
+        body=json.dumps(body),
+        headers={"Host": host, "Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    data = json.loads(resp.read() or b"{}")
+    conn.close()
+    return resp.status, data
+
+
 def recv_until_close(sock: socket.socket) -> bytes:
     chunks = []
     while chunk := sock.recv(4096):
@@ -118,6 +148,99 @@ def test_config_loading_and_validation(tmp_path: Path) -> None:
     incomplete.write_text(json.dumps({"upstreams": [{"host": "x"}]}))
     with pytest.raises(GatewayConfigError, match="required field"):
         load_gateway_config(incomplete)
+
+
+def _one_upstream(tmp_path: Path, **overrides: object) -> Path:
+    entry: dict[str, object] = {
+        "host": "api.example.com",
+        "methods": ["POST"],
+        "prefix": "/v1/invoices",
+        "action_type": "send_invoice",
+        "key_template": "invoice:{id}",
+    }
+    entry.update(overrides)
+    p = tmp_path / "gateway.json"
+    p.write_text(json.dumps({"upstreams": [entry]}))
+    return p
+
+
+@pytest.mark.parametrize("origin,expected", [("http://a.com", "http"), ("https://a.com", "https")])
+def test_a_scheme_prefix_on_the_host_is_carried_to_the_route(
+    tmp_path: Path, origin: str, expected: str
+) -> None:
+    """``http://a.com`` names a plain-HTTP upstream and leaves the host bare.
+
+    The host is stored without its prefix: every consumer downstream splits or
+    compares it as a bare authority, and a scheme left on it would make
+    ``_normalize_host`` read ``http`` as the name.
+    """
+    routes = load_gateway_config(_one_upstream(tmp_path, host=origin))
+    assert routes[0].scheme == expected
+    assert routes[0].host == "a.com"
+
+
+def test_a_scheme_spelled_two_agreeing_ways_is_accepted(tmp_path: Path) -> None:
+    routes = load_gateway_config(_one_upstream(tmp_path, host="http://a.com", scheme="http"))
+    assert routes[0].scheme == "http"
+    assert routes[0].host == "a.com"
+
+
+def test_a_scheme_that_disagrees_with_its_own_host_is_rejected(tmp_path: Path) -> None:
+    """One entry naming two upstreams cannot tell the operator which would run."""
+    with pytest.raises(GatewayConfigError, match="while its 'scheme' field says 'http'"):
+        load_gateway_config(_one_upstream(tmp_path, host="https://a.com", scheme="http"))
+
+
+@pytest.mark.parametrize("scheme", ["ftp", "ws", "HTTPD"])
+def test_an_unknown_scheme_is_rejected(tmp_path: Path, scheme: str) -> None:
+    with pytest.raises(GatewayConfigError, match="is not one of"):
+        load_gateway_config(_one_upstream(tmp_path, scheme=scheme))
+
+
+def test_an_unknown_scheme_prefix_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(GatewayConfigError, match="uses scheme 'ftp'"):
+        load_gateway_config(_one_upstream(tmp_path, host="ftp://a.com"))
+
+
+def test_a_scheme_with_no_host_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(GatewayConfigError, match="names a scheme but no host"):
+        load_gateway_config(_one_upstream(tmp_path, host="http://"))
+
+
+def test_an_https_and_an_http_route_for_one_host_collide(tmp_path: Path) -> None:
+    """A ``Host`` header carries no scheme, so one host cannot name two upstreams.
+
+    The request cannot tell the registry which it meant, so the collision is
+    rejected at load time, where the operator still has the file open, rather
+    than resolved by registry order at request time. The two routes below agree
+    on host, port, prefix and method and differ only in scheme -- the one axis a
+    request cannot carry.
+    """
+    p = tmp_path / "gateway.json"
+    p.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "http://a.com",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    },
+                    {
+                        "host": "https://a.com",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{other}",
+                    },
+                ]
+            }
+        )
+    )
+    with pytest.raises(GatewayConfigError, match="repeats"):
+        load_gateway_config(p)
 
 
 def test_unclaimed_request_is_denied_with_claim_instructions(db: str, gateway: str) -> None:
@@ -167,7 +290,9 @@ def test_a_truncated_upstream_reply_settles_the_claim_uncertain(
     class _TruncatedResponse:
         status = 200
 
-        def read(self) -> bytes:
+        # The gateway reads in bounded chunks, so read() takes the chunk size.
+        def read(self, amt: int | None = None) -> bytes:
+            """Simulate reading a chunk that raises IncompleteRead."""
             raise http.client.IncompleteRead(b"partial", 512)
 
     class _TruncatedConn:
@@ -311,6 +436,22 @@ def test_an_empty_body_is_still_an_empty_mapping(db: str, gateway: str) -> None:
     status, body = _post_raw(gateway, "/v1/invoices", "")
     assert status == 403
     assert "key template" in body["reason"]
+
+
+def test_non_mapping_body_missing_template_field_is_refused(db: str, gateway: str) -> None:
+    """A non-object JSON body cannot satisfy a template with placeholders."""
+    claim(db, "invoice:seed")
+    status, body = _post_raw(gateway, "/v1/invoices", "[1, 2, 3]")
+    assert status == 403
+    assert "key template 'invoice:{id}' needs body field(s) ['id']" in body["reason"]
+
+
+def test_render_key_with_non_mapping_body() -> None:
+    """render_key resolves static templates and refuses missing fields on non-mappings."""
+    assert render_key("bulk-static", [1, 2, 3]) == "bulk-static"
+    assert render_key("bulk-static", None) == "bulk-static"
+    with pytest.raises(GatewayConfigError, match="needs body field"):
+        render_key("invoice:{id}", [1, 2, 3])
 
 
 # --- CLI ---------------------------------------------------------------------- #
@@ -1382,6 +1523,1098 @@ def test_cmd_gateway_runs_with_tenant_flag(tmp_path: Path) -> None:
             assert mock_server.call_args.kwargs["bound_tenant"] == "tenant_cli_override"
 
 
+def test_cmd_daemon_runs_with_storage_none(tmp_path: Path) -> None:
+    """cmd_daemon handles storage=None when invoked from CLI dispatch (#1603)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(tmp_path / "absent.db"),
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert mock_server.call_args.args[1] is None
+
+
+def test_cmd_daemon_resolves_active_run_when_storage_none(tmp_path: Path) -> None:
+    """cmd_daemon resolves active run from existing db when storage is None (#1603)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    db_path = str(tmp_path / "existing.db")
+    with SQLiteStorage(db_path) as store:
+        store.create_run(Run(run_id="active_daemon_run", goal="g"))
+        store.append_event("active_daemon_run", EventType.RUN_STARTED, {"goal": "g"})
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=db_path,
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert mock_server.call_args.args[1] == "active_daemon_run"
+
+
+def test_cmd_daemon_detach_without_os_fork(tmp_path: Path) -> None:
+    """cmd_daemon detach spawns background process when os.fork is unavailable (#1603)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import build_parser, cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            assert mock_popen.called
+            assert pid_file.read_text(encoding="utf-8") == "99999"
+            out_val = out.getvalue()
+            assert "CONTINUUM daemon started (pid 99999)" in out_val
+            assert str(pid_file) in out_val
+
+            # Validate child command against CLI parser
+            child_argv = mock_popen.call_args.args[0]
+            daemon_idx = child_argv.index("daemon")
+            parsed = build_parser().parse_args(child_argv[daemon_idx:])
+            assert parsed.port == 8765
+            assert parsed.pid_file == str(pid_file)
+            assert parsed.run_id == "run_123"
+            assert parsed.detach is False
+            assert parsed.write_pid is True
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_main_daemon_invocation_end_to_end(tmp_path: Path) -> None:
+    """main(['daemon', ...]) runs without AttributeError when storage is None (#1603)."""
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import main
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = main(["daemon", "--config", str(cfg), "--port", "8765"], out=out, err=err)
+        assert code == 0
+
+
+def test_cmd_daemon_foreground_does_not_delete_foreign_or_stale_pid_file(tmp_path: Path) -> None:
+    """Foreground daemon never deletes an existing PID file it did not write (#1640)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    stale_pid = tmp_path / "stale.pid"
+    stale_pid.write_text("12345", encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=False,
+        pid_file=str(stale_pid),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+
+    assert stale_pid.exists()
+    assert stale_pid.read_text(encoding="utf-8") == "12345"
+
+
+def test_cmd_daemon_child_unlinks_own_pid_file_on_exit(tmp_path: Path) -> None:
+    """A daemon cleanly unlinks a PID file when the PID matches its own (#1640)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "own.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=False,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+
+    assert not pid_file.exists()
+
+
+def test_cmd_daemon_write_pid_writes_and_cleans_up(tmp_path: Path) -> None:
+    """--write-pid writes current process PID and unlinks on shutdown (#1640)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "child.pid"
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=False,
+        pid_file=str(pid_file),
+        write_pid=True,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+
+        def fake_serve() -> None:
+            assert pid_file.exists()
+            assert pid_file.read_text(encoding="utf-8") == str(os.getpid())
+
+        mock_server.return_value.serve_forever.side_effect = fake_serve
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+
+    assert not pid_file.exists()
+
+
+def test_cmd_daemon_corrupt_database_probe_warns(tmp_path: Path) -> None:
+    """cmd_daemon warns when probing an unreadable or corrupt db without crashing (#1640)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"garbage not a valid sqlite database header")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=str(corrupt_db),
+        port=8765,
+        detach=False,
+        pid_file=None,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with patch("continuum.gateway.GatewayServer") as mock_server, patch("signal.signal"):
+        mock_server.return_value.serve_forever.return_value = None
+        mock_server.return_value.port = 8765
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert mock_server.call_args.args[1] is None
+        assert "warning: failed to probe active run" in err.getvalue()
+
+
+def test_cmd_daemon_detach_windows_creationflags(tmp_path: Path) -> None:
+    """Windows detach passes DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP flags (#1640)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 88888
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with (
+            patch("sys.platform", "win32"),
+            patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+        ):
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            call_flags = mock_popen.call_args.kwargs.get("creationflags", 0)
+            expected_flags = 0x00000008 | 0x00000200
+            assert call_flags == expected_flags
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_occupied_port_fails(tmp_path: Path) -> None:
+    """cmd_daemon --detach fails when requested port cannot be bound (#1640)."""
+    import argparse
+    import io
+    import os
+    import socket
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        port = int(occupied.getsockname()[1])
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            tenant=None,
+            run_id="run_123",
+            db=str(tmp_path / "test.db"),
+            port=port,
+            detach=True,
+            pid_file=str(pid_file),
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+
+        orig_fork = getattr(os, "fork", None)
+        if hasattr(os, "fork"):
+            delattr(os, "fork")
+        try:
+            with patch("subprocess.Popen") as mock_popen:
+                code = cmd_daemon(args, None, out, err)
+                assert code != 0
+                assert "error: cannot bind to" in err.getvalue()
+                assert not mock_popen.called
+                assert not pid_file.exists()
+        finally:
+            if orig_fork is not None:
+                setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_readonly_pid_file_fails(tmp_path: Path) -> None:
+    """cmd_daemon --detach fails cleanly when pid_file cannot be written (#1640)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "not_a_dir" / "nested" / "daemon.pid"
+    (tmp_path / "not_a_dir").write_text("file_not_dir", encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen") as mock_popen:
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: cannot write pid file" in err.getvalue()
+            assert not mock_popen.called
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_early_exit_fails(tmp_path: Path) -> None:
+    """cmd_daemon --detach fails and unlinks pid_file when child exits immediately (#1640)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.wait.return_value = 1
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", return_value=mock_proc):
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: daemon exited during startup (code 1)" in err.getvalue()
+            assert not pid_file.exists()
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_port_zero_fails_on_non_fork(tmp_path: Path) -> None:
+    """cmd_daemon --detach with --port 0 fails on non-fork platforms (#1669)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=0,
+        detach=True,
+        pid_file=str(tmp_path / "daemon.pid"),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen") as mock_popen:
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: --detach requires an explicit --port" in err.getvalue()
+            assert not mock_popen.called
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_child_writes_pid_reporting(tmp_path: Path) -> None:
+    """Non-fork detach adopts the child's recorded PID without overwriting it (#1669)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = None
+
+    def fake_popen(*_args: Any, **_kwargs: Any) -> MagicMock:
+        pid_file.write_text("77777", encoding="utf-8")
+        return mock_proc
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            assert pid_file.read_text(encoding="utf-8") == "77777"
+            assert "CONTINUUM daemon started (pid 77777)" in out.getvalue()
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_early_exit_preserves_foreign_pid(tmp_path: Path) -> None:
+    """Early exit of a non-fork child preserves a foreign PID file (#1669)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_text("12345", encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.wait.return_value = 1
+    mock_proc.poll.return_value = 1
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", return_value=mock_proc):
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: daemon exited during startup (code 1)" in err.getvalue()
+            assert pid_file.exists()
+            assert pid_file.read_text(encoding="utf-8") == "12345"
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_log_file_oserror_falls_back_to_devnull(tmp_path: Path) -> None:
+    """Non-fork detach falls back to DEVNULL if opening the log file fails (#1669)."""
+    import argparse
+    import builtins
+    import io
+    import os
+    import subprocess
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = None
+
+    orig_open = builtins.open
+
+    def mock_open(file, *args: Any, **kwargs: Any) -> Any:
+        if str(file).endswith(".log"):
+            raise OSError("disk read-only")
+        return orig_open(file, *args, **kwargs)
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with (
+            patch("builtins.open", side_effect=mock_open),
+            patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
+        ):
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            assert mock_popen.call_args.kwargs["stdout"] is subprocess.DEVNULL
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_detach_spawn_oserror_fails_cleanly(tmp_path: Path) -> None:
+    """Non-fork detach prints error when process spawning raises OSError (#1669)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", side_effect=OSError("spawn failed")):
+            code = cmd_daemon(args, None, out, err)
+            assert code != 0
+            assert "error: failed to spawn daemon process: spawn failed" in err.getvalue()
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_unlink_pid_file_invalid_utf8_does_not_crash(tmp_path: Path) -> None:
+    """Invalid UTF-8 in a pid_file does not raise during shutdown (#1669)."""
+    import argparse
+    import io
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_bytes(b"\xff\xfe\x00\x01\x80")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=False,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_server = MagicMock()
+    mock_server.port = 8765
+
+    with (
+        patch("signal.signal"),
+        patch("continuum.gateway.GatewayServer", return_value=mock_server),
+        patch.object(mock_server, "serve_forever", side_effect=KeyboardInterrupt),
+    ):
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert pid_file.exists()
+        assert pid_file.read_bytes() == b"\xff\xfe\x00\x01\x80"
+
+
+def test_cmd_daemon_detach_ignores_stale_pid_file(tmp_path: Path) -> None:
+    """Detached daemon startup ignores a stale PID file from an earlier run (#1669)."""
+    import argparse
+    import io
+    import os
+    import subprocess
+    from unittest.mock import MagicMock, patch
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_text("12345", encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=str(tmp_path / "test.db"),
+        port=8765,
+        detach=True,
+        pid_file=str(pid_file),
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = None
+    mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd=["mock"], timeout=0.02)
+
+    orig_fork = getattr(os, "fork", None)
+    if hasattr(os, "fork"):
+        delattr(os, "fork")
+    try:
+        with patch("subprocess.Popen", return_value=mock_proc):
+            code = cmd_daemon(args, None, out, err)
+            assert code == 0
+            assert "CONTINUUM daemon started (pid 99999)" in out.getvalue()
+            assert "pid 12345" not in out.getvalue()
+            assert pid_file.read_text(encoding="utf-8") == "99999"
+    finally:
+        if orig_fork is not None:
+            setattr(os, "fork", orig_fork)  # noqa: B010
+
+
+def test_cmd_daemon_normalizes_sqlite_url_for_active_run_probe(tmp_path: Path) -> None:
+    """Active run probe normalizes sqlite:// URLs to filesystem paths (#1603)."""
+    import argparse
+    import io
+    from unittest.mock import patch
+
+    from continuum.cli.main import cmd_daemon
+    from continuum.models import Run
+
+    db_path = tmp_path / "sqlite_url.db"
+    store = SQLiteStorage(str(db_path))
+    store.create_run(Run(run_id="run_active_123", goal="probe test"))
+    store.close()
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id=None,
+        db=f"sqlite:///{db_path.as_posix()}",
+        port=0,
+        detach=False,
+        pid_file=None,
+        write_pid=False,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    captured_run_id = None
+
+    class FakeGatewayServer:
+        def __init__(self, storage_fn, run_id, routes, port=0, bound_tenant=None):
+            nonlocal captured_run_id
+            captured_run_id = run_id
+            self.port = 8765
+
+        def serve_forever(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    with patch("continuum.gateway.GatewayServer", FakeGatewayServer):
+        code = cmd_daemon(args, None, out, err)
+        assert code == 0
+        assert captured_run_id == "run_active_123"
+
+
+def test_cmd_daemon_unlinks_pid_file_on_gateway_construction_failure(tmp_path: Path) -> None:
+    """Child unlinks pid file if GatewayServer constructor raises an error (#1603)."""
+    import argparse
+    import io
+    import os
+    from unittest.mock import patch
+
+    import pytest
+
+    from continuum.cli.main import cmd_daemon
+
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "action_type": "send",
+                        "key_template": "key:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    args = argparse.Namespace(
+        config=str(cfg),
+        tenant=None,
+        run_id="run_123",
+        db=None,
+        port=8765,
+        detach=False,
+        pid_file=str(pid_file),
+        write_pid=False,
+    )
+    out = io.StringIO()
+    err = io.StringIO()
+
+    with (
+        patch("continuum.gateway.GatewayServer", side_effect=RuntimeError("bind failure")),
+        pytest.raises(RuntimeError, match="bind failure"),
+    ):
+        cmd_daemon(args, None, out, err)
+
+    assert not pid_file.exists()
+
+
 def test_match_route_falls_back_to_run_metadata_tenant(tmp_path: Path) -> None:
     """match_route extracts bound tenant from storage run metadata when bound_tenant is None (#1415)."""
     route = Route(
@@ -2042,3 +3275,349 @@ def test_a_reply_within_the_cap_is_forwarded_verbatim(
 
         action = fold_action_events(store.read_events("run_1"))[key]
     assert action.status is ActionStatus.COMPLETED
+
+
+# --- A plain-HTTP upstream, reached through the real stack -----------------
+#
+# The canned connections above replace ``http.client``'s connection classes,
+# which is the one seam that knows which transport the gateway opened. A route
+# whose upstream is plain HTTP is only really exercised against a server a
+# socket can talk to, so these spin one up and drive the whole path: the
+# request leaves the proxy, the upstream answers, and the claim settles from
+# the reply.
+
+
+@pytest.fixture
+def http_upstream() -> Generator[tuple[str, list[bytes]], None, None]:
+    """A live plain-HTTP upstream on an ephemeral port.
+
+    Yields ``(origin, received)``: the ``http://host:port`` the registry names
+    and the list of bodies it was handed, so a test can prove the request
+    really arrived rather than only that the gateway believes it forwarded one.
+    """
+    received: list[bytes] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: object) -> None:
+            """The access log is noise here; the event log is the record."""
+            pass
+
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.append(body)
+            payload = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", received
+    server.shutdown()
+
+
+@contextmanager
+def _gateway_for(
+    db_path: str, run_id: str, routes: list[Route], tmp_path: Path
+) -> Generator[str, None, None]:
+    """A live gateway on an ephemeral port serving ``routes`` for ``run_id``."""
+    server = GatewayServer(lambda: SQLiteStorage(db_path), run_id, routes, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"127.0.0.1:{server.port}"
+    server.shutdown()
+
+
+def test_a_plain_http_upstream_is_reached_and_settles_the_claim(
+    db: str, tmp_path: Path, http_upstream: tuple[str, list[bytes]]
+) -> None:
+    """An http:// upstream is forwarded to over plain HTTP and settled (#7-fix).
+
+    The transport was hardcoded to https, so a plain-HTTP upstream -- a local
+    service, an internal address behind a TLS terminator -- was unreachable at
+    all: the handshake to its cleartext port failed as WRONG_VERSION_NUMBER
+    before a byte was forwarded, the claim settled UNKNOWN, and no evidence was
+    recorded. The canned connections hide that, because they replace the very
+    class that would have failed.
+    """
+    origin, received = http_upstream
+    routes = load_gateway_config(_registry(tmp_path, origin))
+    assert routes[0].scheme == "http"
+    assert routes[0].host == origin[len("http://") :]
+
+    key = claim(db, "invoice:I-60")
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        status, body = post(addr, "/v1/invoices", {"id": "I-60"}, host=routes[0].host)
+    assert status == 200
+    assert body == {"ok": True}
+    assert received == [b'{"id": "I-60"}']
+
+    with SQLiteStorage(db) as store:
+        from continuum.actions.ledger import fold_action_events
+
+        action = fold_action_events(store.read_events("run_1"))[key]
+        evidence = [e for e in store.read_events("run_1") if e.type is EventType.TOOL_COMPLETED]
+    assert action.status is ActionStatus.COMPLETED
+    assert action.side_effect_uncertain is False
+    # The recorded path names the scheme the request actually travelled, so
+    # the evidence does not claim TLS a plain-HTTP upstream never used.
+    assert [e.payload["path"] for e in evidence] == [f"{origin}/v1/invoices"]
+
+
+def test_non_object_json_body_forwarded_to_upstream(
+    db: str, tmp_path: Path, http_upstream: tuple[str, list[bytes]]
+) -> None:
+    """A request whose top level is not a dict forwards its raw bytes (#1774).
+
+    Bulk endpoints taking JSON arrays or routes with static templates need
+    no body fields to render their idempotency keys. The raw wire bytes must
+    reach the upstream rather than being dropped to an empty body.
+    """
+    origin, received = http_upstream
+    registry_path = tmp_path / "gateway_bulk.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": origin,
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices/batch",
+                        "action_type": "bulk_invoices",
+                        "key_template": "bulk-invoices-static",
+                    }
+                ]
+            }
+        )
+    )
+    routes = load_gateway_config(registry_path)
+
+    with SQLiteStorage(db) as store:
+        outcome = ActionLedger(store, "run_1").claim(
+            "bulk_invoices", {}, key="bulk-invoices-static"
+        )
+        key = outcome.key
+    payload = b'[{"id": "O-1"}, {"id": "O-2"}]'
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        status, body = _post_raw(addr, "/v1/invoices/batch", payload, host=routes[0].host)
+
+    assert status == 200
+    assert body == {"ok": True}
+    assert received == [payload]
+
+    with SQLiteStorage(db) as store:
+        from continuum.actions.ledger import fold_action_events
+
+        action = fold_action_events(store.read_events("run_1"))[key]
+    assert action.status is ActionStatus.COMPLETED
+
+
+def test_empty_json_object_forwarded_to_upstream(
+    db: str, tmp_path: Path, http_upstream: tuple[str, list[bytes]]
+) -> None:
+    """An empty JSON object '{}' is forwarded to the upstream as '{}' (#1774)."""
+    origin, received = http_upstream
+    registry_path = tmp_path / "gateway_empty_obj.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": origin,
+                        "methods": ["POST"],
+                        "prefix": "/v1/ping",
+                        "action_type": "ping",
+                        "key_template": "ping-static",
+                    }
+                ]
+            }
+        )
+    )
+    routes = load_gateway_config(registry_path)
+
+    with SQLiteStorage(db) as store:
+        ActionLedger(store, "run_1").claim("ping", {}, key="ping-static")
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        status, body = _post_raw(addr, "/v1/ping", b"{}", host=routes[0].host)
+
+    assert status == 200
+    assert body == {"ok": True}
+    assert received == [b"{}"]
+
+
+def test_a_route_without_a_scheme_still_means_https(
+    db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry written before schemes existed keeps its https meaning.
+
+    Schemes are additive: the default has to stay https or every existing
+    ``gateway.json`` silently changes which transport it dials.
+    """
+    routes = load_gateway_config(Path(config_file(tmp_path)))
+    assert routes[0].scheme == "https"
+
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingConn("https", opened))
+    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingConn("http", opened))
+
+    claim(db, "invoice:I-61")
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        _post_to_gateway(addr, "/v1/invoices", {"id": "I-61"})
+    # The request the test sends also travels a patched HTTPConnection to the
+    # gateway itself, so the netloc is what distinguishes the two hops.
+    assert ("https", "api.example.com") in opened
+    assert ("http", "api.example.com") not in opened
+
+
+def test_an_http_route_opens_a_plain_connection(
+    db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route's scheme selects the connection class, not the hardcoded one."""
+    routes = load_gateway_config(_registry(tmp_path, "http://api.example.com"))
+    assert routes[0].host == "api.example.com"
+
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingConn("https", opened))
+    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingConn("http", opened))
+
+    claim(db, "invoice:I-62")
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        status, _ = _post_to_gateway(addr, "/v1/invoices", {"id": "I-62"})
+    assert status == 200
+    assert ("http", "api.example.com") in opened
+    assert ("https", "api.example.com") not in opened
+
+
+def test_an_explicit_scheme_key_selects_plain_http(
+    db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``scheme`` field reaches the same upstream without a URL prefix."""
+    p = tmp_path / "gateway.json"
+    p.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": "api.example.com",
+                        "scheme": "http",
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    routes = load_gateway_config(p)
+    assert routes[0].scheme == "http"
+
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr(http.client, "HTTPSConnection", _RecordingConn("https", opened))
+    monkeypatch.setattr(http.client, "HTTPConnection", _RecordingConn("http", opened))
+
+    claim(db, "invoice:I-63")
+    with _gateway_for(db, "run_1", routes, tmp_path) as addr:
+        _post_to_gateway(addr, "/v1/invoices", {"id": "I-63"})
+    assert ("http", "api.example.com") in opened
+
+
+def _registry(tmp_path: Path, origin: str) -> Path:
+    """Write a one-upstream registry whose host is ``origin``."""
+    p = tmp_path / "gateway.json"
+    p.write_text(
+        json.dumps(
+            {
+                "upstreams": [
+                    {
+                        "host": origin,
+                        "methods": ["POST"],
+                        "prefix": "/v1/invoices",
+                        "action_type": "send_invoice",
+                        "key_template": "invoice:{id}",
+                    }
+                ]
+            }
+        )
+    )
+    return p
+
+
+class _RecordingConn:
+    """Records which connection class the gateway opened and to whom.
+
+    The canned connection the rest of the suite uses replaces one class and
+    cannot say which one was chosen, which is exactly the question a scheme
+    raises. Recording the netloc as well matters because the request the test
+    itself sends reaches the gateway over a patched ``HTTPConnection`` too --
+    so the client's own connection to ``127.0.0.1:<port>`` is recorded
+    alongside the gateway's to the upstream, and only the netloc tells them
+    apart.
+    """
+
+    def __init__(self, name: str, opened: list[tuple[str, str]]) -> None:
+        self._name = name
+        self._opened = opened
+
+    def __call__(self, netloc: str, *args: object, **kwargs: object) -> _RecordingConn._Conn:
+        self._opened.append((self._name, netloc))
+        return self._Conn()
+
+    class _Conn:
+        def request(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(200, b"{}", declared=2)
+
+        def close(self) -> None:
+            pass
+
+
+def test_an_http_route_matches_a_client_spelling_its_default_port(
+    tmp_path: Path,
+) -> None:
+    """``Host: a.com:80`` reaches an ``http://a.com`` route (#1342's other half).
+
+    The route side folds its own scheme's default port; the request side cannot
+    know which scheme its route will turn out to have, so it folds either --
+    or a client that writes the default port explicitly is refused as
+    unregistered for spelling a port the scheme does not consider one.
+    """
+    from continuum.gateway import _normalize_request_host
+
+    assert _normalize_request_host("a.com:80") == ("a.com", None)
+    assert _normalize_request_host("a.com:443") == ("a.com", None)
+    assert _normalize_request_host("a.com:8080") == ("a.com", "8080")
+
+    route = Route(
+        host="a.com",
+        methods=("POST",),
+        prefix="/",
+        action_type="send_invoice",
+        key_template="invoice:{id}",
+        scheme="http",
+    )
+    store = SQLiteStorage(":memory:")
+    store.create_run(Run(run_id="run_1", goal="g"))
+    store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+    ActionLedger(store, "run_1").claim("send_invoice", {"id": "I-64"}, key="invoice:I-64")
+    from continuum.actions.ledger import fold_action_events
+
+    actions = fold_action_events(store.read_events("run_1"))
+    for host in ("a.com", "a.com:80"):
+        decision = match_route(
+            [route],
+            host=host,
+            method="POST",
+            path="/",
+            body={"id": "I-64"},
+            actions_by_key=actions,
+            run_id="run_1",
+        )
+        assert decision.allow, host

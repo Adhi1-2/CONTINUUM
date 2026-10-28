@@ -94,13 +94,13 @@ def _args_text(args: dict[str, Any]) -> str:
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    pairs = [(x, y) for x, y in zip(a, b, strict=False)]
-    dot = float(sum(x * y for x, y in pairs))
-    norm_a = float(sum(x * x for x, _ in pairs)) ** 0.5
-    norm_b = float(sum(y * y for _, y in pairs)) ** 0.5
+    dot = float(sum(x * y for x, y in zip(a, b, strict=False)))
+    norm_a = float(sum(x * x for x in a)) ** 0.5
+    norm_b = float(sum(y * y for y in b)) ** 0.5
     if norm_a == 0 or norm_b == 0:
         return 0.0
-    return float(dot / (norm_a * norm_b))
+    val = float(dot / (norm_a * norm_b))
+    return float(max(0.0, min(1.0, val)))
 
 
 def similarity(
@@ -138,6 +138,11 @@ def classify_call(
 
     Only actions of the SAME type are compared; cross-type matching is never
     performed regardless of similarity score.
+
+    Only COMPLETED actions are eligible for replay or fork matching. A prior
+    action that failed, never finished, or was compensated cannot supply a
+    cached result, so a similar subsequent call is classified ``"fresh"`` and
+    the operation executes again.
     """
     from continuum.actions.idempotency import idempotency_key
 
@@ -152,6 +157,8 @@ def classify_call(
     best_action: dict[str, Any] | None = None
     for key, action in prior_actions.items():
         if action.get("action_type") != action_type:
+            continue
+        if action.get("status") != "completed":
             continue
         prior_args_raw = action.get("arguments") or {}
         if not isinstance(prior_args_raw, dict):

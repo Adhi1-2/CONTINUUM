@@ -15,7 +15,7 @@ jobs:
     name: Markdown lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: |
@@ -23,4 +23,11 @@ jobs:
             README.md
             SECURITY.md
             CODE_OF_CONDUCT.md
+            README.es.md
+            README.ja.md
+            README.ko.md
+            README.pt-BR.md
+            README.zh-CN.md
+            CHANGELOG.md
+            AUTHORS.md
           config: .markdownlint-cli2.jsonc
