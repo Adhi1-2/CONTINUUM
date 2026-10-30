@@ -69,6 +69,10 @@ def _mark_corruption_refusal(state: SemanticState, refusal: CorruptedRecord) -> 
     recovery engine's existing INVALID handling turns the refusal into a
     REQUEST_HUMAN verdict naming the sequence (issue #1907).
     """
+    if state.status is StateStatus.INVALID and state.unprojectable_at_sequence is not None:
+        # An earlier unprojectable event already bounds the fold; it is the
+        # break the repair must start from.
+        return state
 
     reason = str(refusal) or "unreadable event record"
     if "\n" in reason:

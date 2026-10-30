@@ -47,7 +47,7 @@ _PATTERNS = {
 EXPECTED: dict[tuple[str, int], tuple[str, str]] = {
     ("src/continuum/checkpoint/policy.py", 54): ("CheckpointTrigger", "decl"),
     ("src/continuum/checkpoint/policy.py", 64): ("RECOVERY", "assign"),
-    ("src/continuum/checkpoint/manager.py", 221): ("checkpoint", "decl"),
+    ("src/continuum/checkpoint/manager.py", 225): ("checkpoint", "decl"),
     ("src/continuum/recovery/cleanup.py", 24): ("cleanup_ephemeral_artifacts", "decl"),
     ("src/continuum/concurrency/lease.py", 53): ("LeaseCoordinator", "decl"),
     ("src/continuum/recovery/ledger.py", 214): ("anchor", "assign"),

@@ -99,8 +99,8 @@ Test counts: ~3950 collected on a minimal env.
   `CorruptedRecord` now locates the refusing row (`run_id` and `sequence`),
   `CheckpointManager.restore` folds the clean prefix that precedes it and
   marks the state `INVALID` at the refused sequence, and `assess` degrades
-  its auxiliary readers — the all-events scan, the action ledger, the file
-  observations, and the informed-retry account — instead of letting the read
+  its auxiliary readers (the all-events scan, the action ledger, the file
+  observations, and the informed-retry account) instead of letting the read
   error escape. A checkpoint whose own `STATE_CHECKPOINTED` annotation row is
   the unreadable one falls back, under `"degrade"`, to the cursor a missing
   annotation already takes, instead of escaping before the pending read. An

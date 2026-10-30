@@ -384,3 +384,90 @@ def test_assess_tolerates_a_refusal_that_cannot_be_re_read(
     monkeypatch.setattr(engine.storage, "read_all_events", refuse)
     decision = engine.assess("damaged")
     assert decision.mode is RecoveryMode.REQUEST_HUMAN
+
+
+# --- earlier unprojectable break location preserved over later corruption --- #
+
+
+def test_restore_preserves_earlier_unprojectable_break_before_corrupted_row(
+    tmp_path: Path,
+) -> None:
+    """When an event in the clean prefix cannot be projected, the fold stops
+    there: a later corrupted row must not overwrite that earlier break sequence
+    or event type with the corruption refusal (issue #1907)."""
+    db = tmp_path / "early_break.db"
+    storage = SQLiteStorage(db)
+    storage.create_run(Run(run_id="r", goal="g"))
+    storage.append_event("r", EventType.RUN_STARTED, {"goal": "g", "total": 3})
+    # Seq 2 is unprojectable: completed exceeds total
+    storage.append_event("r", EventType.TASK_UPDATED, {"completed": 999, "total": 3})
+    storage.append_event("r", EventType.WORK_COMPLETED, {"doc": 1})
+    storage.close()
+    _corrupt_event(db, "r", sequence=4)
+
+    storage = SQLiteStorage(db)
+    try:
+        restored = CheckpointManager(storage).restore("r", on_unprojectable="degrade")
+    finally:
+        storage.close()
+
+    state = restored.state
+    assert state.status is StateStatus.INVALID
+    # Earliest break at seq 2 is preserved, not clobbered by corrupted row at seq 4
+    assert state.unprojectable_at_sequence == 2
+    assert state.unprojectable_event_type == "TASK_UPDATED"
+    assert "exceeds total" in (state.unprojectable_reason or "")
+    assert state.source_sequence == 1
+
+
+def test_restore_preserves_earlier_unprojectable_break_in_checkpoint_replay(
+    tmp_path: Path,
+) -> None:
+    """The incremental replay path also keeps the earlier unprojectable break
+    from pending replay when a subsequent pending row is unparseable."""
+    db = tmp_path / "early_break_chk.db"
+    storage = SQLiteStorage(db)
+    storage.create_run(Run(run_id="r", goal="g"))
+    storage.append_event("r", EventType.RUN_STARTED, {"goal": "g", "total": 3})
+    storage.append_event("r", EventType.WORK_COMPLETED, {"doc": 0})
+    env = capture("r", StaticProvider(dataset="v1"))
+    CheckpointManager(storage).checkpoint("r", environment=env)
+    # Checkpoint annotation is at seq 3.
+    # Seq 4 is unprojectable during replay:
+    storage.append_event("r", EventType.TASK_UPDATED, {"completed": 999, "total": 3})
+    storage.append_event("r", EventType.WORK_COMPLETED, {"doc": 2})
+    storage.close()
+    _corrupt_event(db, "r", sequence=6)
+
+    storage = SQLiteStorage(db)
+    try:
+        restored = CheckpointManager(storage).restore("r", on_unprojectable="degrade")
+    finally:
+        storage.close()
+
+    state = restored.state
+    assert state.status is StateStatus.INVALID
+    assert state.unprojectable_at_sequence == 4
+    assert state.unprojectable_event_type == "TASK_UPDATED"
+
+
+def test_assess_targets_earlier_unprojectable_break_when_later_row_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Assess diagnosis and repair planning target the earliest break where
+    folding stopped, rather than pointing the operator to the later corruption."""
+    db = tmp_path / "early_break_assess.db"
+    storage = SQLiteStorage(db)
+    storage.create_run(Run(run_id="r", goal="g"))
+    storage.append_event("r", EventType.RUN_STARTED, {"goal": "g", "total": 3})
+    storage.append_event("r", EventType.TASK_UPDATED, {"completed": 999, "total": 3})
+    storage.append_event("r", EventType.WORK_COMPLETED, {"doc": 1})
+    storage.close()
+    _corrupt_event(db, "r", sequence=4)
+
+    decision = _engine(db).assess("r")
+    assert decision.mode is RecoveryMode.REQUEST_HUMAN
+    assert decision.restored.state.status is StateStatus.INVALID
+    assert decision.restored.state.unprojectable_at_sequence == 2
+    assert any(step.target == "sequence_2" for step in decision.plan.steps)
+    assert any(step.kind.value == "repair_log" for step in decision.plan.steps)
