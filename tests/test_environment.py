@@ -338,3 +338,97 @@ def test_unknown_and_changed_are_reported_separately() -> None:
     assert len(diff.changed) == 1
     assert len(diff.unknown) == 1
     assert len(diff.breaking) == 2
+
+
+# --- GitProvider ------------------------------------------------------------ #
+
+
+def _init_git_repo(path: Path) -> str:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    (path / "f.txt").write_text("hello")
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True
+    )
+    return head.stdout.strip()
+
+
+def test_git_provider_captures_the_head_commit(tmp_path: Path) -> None:
+    """A successful capture reports the commit behind HEAD, versioned by its
+    16-character prefix, with the full hash carried in metadata."""
+    import continuum.environment.snapshot as environment_snapshot
+
+    commit = _init_git_repo(tmp_path)
+    resource = environment_snapshot.GitProvider(tmp_path).capture()[f"git:{tmp_path}"]
+    assert resource.kind == "git"
+    assert resource.name == f"git:{tmp_path}"
+    assert resource.version == commit[:16]
+    assert len(resource.version) == 16
+    assert resource.metadata["commit"] == commit
+
+
+def test_git_provider_reports_unknown_outside_a_git_repo(tmp_path: Path) -> None:
+    """A directory that is not a git repository is a finding, not a crash:
+    capture never raises, it degrades the resource to UNKNOWN_VERSION with the
+    git failure reported in metadata."""
+    import continuum.environment.snapshot as environment_snapshot
+
+    resource = environment_snapshot.GitProvider(tmp_path).capture()[f"git:{tmp_path}"]
+    assert resource.kind == "git"
+    assert resource.version == UNKNOWN_VERSION
+    assert "not a git repository" in resource.metadata["error"]
+
+
+def _git_run_raising(failure: object) -> object:
+    def run(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    return run
+
+
+def test_git_provider_degrades_when_git_cannot_be_executed(tmp_path, monkeypatch) -> None:
+    """A git executable that cannot run at all (missing binary, timeout, any
+    subprocess failure) must return UNKNOWN_VERSION carrying the exception in
+    metadata and never propagate: capture is not allowed to raise."""
+    import subprocess
+
+    import continuum.environment.snapshot as environment_snapshot
+
+    failures = [
+        subprocess.TimeoutExpired(cmd="git rev-parse HEAD", timeout=5),
+        OSError("git executable not found"),
+    ]
+    for failure in failures:
+        monkeypatch.setattr(environment_snapshot.subprocess, "run", _git_run_raising(failure))
+        resource = environment_snapshot.GitProvider(tmp_path).capture()[f"git:{tmp_path}"]
+        assert resource.kind == "git"
+        assert resource.version == UNKNOWN_VERSION
+        assert (
+            type(failure).__name__ in resource.metadata["error"]
+            or str(failure) in (resource.metadata["error"])
+        )
+
+
+def test_git_provider_reports_unknown_when_git_reports_a_nonzero_exit(
+    tmp_path, monkeypatch
+) -> None:
+    """A non-zero git exit is the broken-repository arm: the stderr reason (or
+    the fallback when git printed nothing) lands in metadata as an error, and
+    the version still degrades to UNKNOWN_VERSION."""
+    import continuum.environment.snapshot as environment_snapshot
+
+    class Prepared:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: corrupted git index\n"
+
+    monkeypatch.setattr(environment_snapshot.subprocess, "run", lambda *a, **kw: Prepared())
+    resource = environment_snapshot.GitProvider(tmp_path).capture()[f"git:{tmp_path}"]
+    assert resource.kind == "git"
+    assert resource.version == UNKNOWN_VERSION
+    assert "corrupted git index" in resource.metadata["error"]

@@ -279,6 +279,18 @@ Test counts: ~4400 collected on a minimal env.
   `CONTINUUM_LEDGER_DIR`, `.continuum/ledger`, `.continuum`, and
   `storage.storage_dir`, and degrades gracefully when no dependency budgets
   are configured.
+
+- **Unit coverage for GitProvider capture arms and file snapshot copy failures (#1990).**
+  `tests/test_environment.py` drives `GitProvider.capture()` on a commit-bearing
+  repository, asserting the 16-character commit prefix with the full hash in
+  metadata, and covers the degradation arms: a directory that is not a git
+  repository, a non-zero git exit carrying the stderr reason in metadata, and
+  `subprocess.run` raising `TimeoutExpired` or `OSError`, each returning
+  `UNKNOWN_VERSION` with the exception reported and never re-raised.
+  `tests/test_file_snapshot_edges.py` covers the `snapshot_file()` refusal when
+  `file_digest()` cannot read the source, plus the `mkdir` and copy-stage
+  `OSError` fallbacks, all of which return None. Tests only, no runtime change.
+
 ### Fixed
 
 - **The daemon's active-run probe and detached startup deadline work on

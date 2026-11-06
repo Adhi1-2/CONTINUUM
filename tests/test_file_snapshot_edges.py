@@ -203,3 +203,58 @@ def test_restore_file_returns_false_when_the_write_fails(tmp_path: Path, monkeyp
 
     assert file_snapshot.restore_file(dst, digest) is False
     assert not dst.exists()
+
+
+def test_snapshot_file_returns_none_when_the_digest_pass_cannot_read(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """snapshot_file() without a caller-supplied digest keys by content. If
+    file_digest() cannot read the source, there is nothing to key by, so the
+    snapshot is refused with None rather than written against a guessed
+    digest (issue #1990)."""
+    snapshot_dir = tmp_path / "snapshots"
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", snapshot_dir)
+    source = tmp_path / "f.txt"
+    source.write_bytes(b"content")
+    monkeypatch.setattr(file_snapshot, "file_digest", lambda path: None)
+
+    assert file_snapshot.snapshot_file(source) is None
+    assert not snapshot_dir.exists()
+
+
+def test_snapshot_file_returns_none_when_the_store_directory_cannot_be_created(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Creating the snapshot store can fail for real: a read-only filesystem,
+    a path that runs through a file, a permissions error. The OSError must be
+    caught and come back as None, not as an exception out of snapshot_file()
+    (issue #1990)."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a plain file here")
+    snapshot_dir = tmp_path / "blocker" / "snapshots"
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", snapshot_dir)
+    source = tmp_path / "f.txt"
+    source.write_bytes(b"content")
+    digest = hashlib.sha256(b"content").hexdigest()
+
+    assert file_snapshot.snapshot_file(source) is None
+    assert not (snapshot_dir / digest).exists()
+
+
+def test_snapshot_file_returns_none_when_the_copy_stage_fails(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A copy into the store that raises OSError (the .tmp stage path is
+    blocked by a directory here, standing in for any unwritable store) must be
+    caught and reported as None, with nothing filed under the content address
+    (issue #1990)."""
+    snapshot_dir = tmp_path / "snapshots"
+    monkeypatch.setattr(file_snapshot, "_SNAPSHOT_DIR", snapshot_dir)
+    source = tmp_path / "f.txt"
+    source.write_bytes(b"content")
+    digest = hashlib.sha256(b"content").hexdigest()
+    snapshot_dir.mkdir()
+    (snapshot_dir / f"{digest}.tmp").mkdir()  # blocks the tmp.write() call
+
+    assert file_snapshot.snapshot_file(source) is None
+    assert not (snapshot_dir / digest).exists()
