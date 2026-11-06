@@ -10,6 +10,15 @@ Test counts: ~4400 collected on a minimal env.
 
 ### Added
 
+- **Unit coverage for the LangChain adapter's checkpoint node, state extraction, and run-start guards (#1986).**
+  `tests/test_adapters_langchain.py` now drives `checkpoint_node` with no run
+  id, a fresh run, a strict backend that raises `RunNotFound`, and a log with
+  recorded events (asserting the log-backed fold over the dict fields),
+  `extract_semantic_state` with a custom converter and with the default field
+  parser, `start_run` against an archived anchor, and
+  `assess_langchain_recovery`, plus an import-time absent-SDK simulation via a
+  module reload. Tests only, no runtime change: the adapter went from 74% to
+  100% statement and branch coverage.
 - **Unit coverage for the ledger-anchored authorization id (#1951).**
   `tests/test_idempotency_ledger_resolution.py` drives
   `resolve_authorization_id(..., ledger=...)` with in-memory ledger stand-ins and
