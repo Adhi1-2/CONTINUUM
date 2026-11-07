@@ -10,6 +10,15 @@ Test counts: ~4400 collected on a minimal env.
 
 ### Added
 
+- **Unit coverage for the attestation guards and identity provider verification (#2011).**
+  `tests/test_attestation.py` now drives `sign_chain`'s non-Ed25519 private key
+  rejection, `verify_attestation`'s algorithm and public-key type guards, the
+  workload-identity parse fallback and its `require_workload_identity` gate,
+  `expected_workload_identity` matching both as a string and as an object, and
+  the `identity_provider` accept and reject arms with a recording stand-in.
+  The module reaches 100% statement and branch coverage. Tests only, no
+  runtime change.
+
 - **Unit coverage for the ledger-anchored authorization id (#1951).**
   `tests/test_idempotency_ledger_resolution.py` drives
   `resolve_authorization_id(..., ledger=...)` with in-memory ledger stand-ins and
