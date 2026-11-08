@@ -147,7 +147,6 @@ def read_document(fmt: str, path: Path) -> dict[str, Any]:
 
 def _parse(fmt: str, text: str, path: Path) -> dict[str, Any]:
     """Parse ``text`` in ``fmt``, refusing anything that is not a mapping."""
-    cause = _ROOT_CAUSE[fmt]
     try:
         if fmt == "json":
             data = json.loads(text)
@@ -172,6 +171,12 @@ def _parse(fmt: str, text: str, path: Path) -> dict[str, Any]:
     except ConfigError:
         raise
     except Exception as exc:  # tomllib.TOMLDecodeError, json.JSONDecodeError
+        # Resolved here rather than at the top of the function: a lookup of
+        # _ROOT_CAUSE[fmt] before the dispatch would turn an unknown format
+        # into a KeyError, and the refusal naming it would never be reached.
+        # Down here the format is one the dispatch accepted, so the label
+        # exists by construction.
+        cause = _ROOT_CAUSE[fmt]
         raise ConfigError(f"{path} is not valid {cause} ({exc}); refusing to edit it") from exc
     # An empty YAML file parses to None, and an editor writes exactly that.
     # Only the blank case is folded into an empty mapping: a document that
