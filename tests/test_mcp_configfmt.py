@@ -149,9 +149,13 @@ def test_a_yaml_document_that_is_a_list_is_never_rewritten(tmp_path: Path) -> No
     assert settings.read_text(encoding="utf-8") == "- one\n- two\n"
 
 
-@needs_toml
 def test_a_toml_file_that_will_not_parse_is_never_rewritten(tmp_path: Path) -> None:
-    """Unparseable TOML is reported, not recreated."""
+    """Unparseable TOML is reported, not recreated.
+
+    Not gated on ``tomli_w``: reading TOML needs only ``tomllib``, which is
+    standard library, so the refusal is testable on every machine. Only the
+    writer is optional -- see ``test_reading_toml_never_needs_a_writer``.
+    """
     settings = tmp_path / "config.toml"
     settings.write_text("[mcp_servers\n", encoding="utf-8")
 
@@ -161,7 +165,6 @@ def test_a_toml_file_that_will_not_parse_is_never_rewritten(tmp_path: Path) -> N
     assert settings.read_text(encoding="utf-8") == "[mcp_servers\n"
 
 
-@needs_toml
 def test_a_toml_array_value_is_read_as_a_table_not_refused(tmp_path: Path) -> None:
     """A key holding an array is a table, so it is read rather than refused.
 
@@ -195,6 +198,60 @@ def test_a_blank_yaml_file_reads_as_an_empty_mapping(tmp_path: Path) -> None:
     settings.write_text("\n\n", encoding="utf-8")
 
     assert configfmt.read_document("yaml", settings) == {}
+
+
+@needs_yaml
+def test_a_comment_only_yaml_file_is_refused_rather_than_folded(tmp_path: Path) -> None:
+    """A YAML file of nothing but comments parses to null, and is not a blank map.
+
+    Folding it into an empty mapping would delete the operator's notes, the
+    same loss the comment guard on the write path exists to prevent, so this
+    branch refuses too and leaves the file byte for byte as it was.
+    """
+    settings = tmp_path / "config.yaml"
+    marker = "# only a note the operator wrote\n"
+    settings.write_text(marker, encoding="utf-8")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.read_document("yaml", settings)
+
+    assert str(excinfo.value) == f"{settings} is empty; refusing to edit it"
+    assert settings.read_text(encoding="utf-8") == marker
+
+
+def test_a_json_null_root_is_refused_rather_than_folded(tmp_path: Path) -> None:
+    """``null`` is the JSON spelling of the same document, so it is refused too.
+
+    The empty branch exists for YAML, whose parser hands back ``None`` for a
+    file that holds nothing; a JSON ``null`` parses to that same value and
+    takes that same branch. Pinning it through JSON keeps the refusal honest
+    on a machine without PyYAML, where no YAML file can reach it.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text("null\n", encoding="utf-8")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.read_document("json", settings)
+
+    assert str(excinfo.value) == f"{settings} is empty; refusing to edit it"
+    assert settings.read_text(encoding="utf-8") == "null\n"
+
+
+def test_an_unknown_format_is_refused_by_name_on_read(tmp_path: Path) -> None:
+    """The read side names a bad format too, not just the render side.
+
+    A profile's format reaches ``read_document`` before it ever reaches
+    ``render_document``, so an unknown one has to be reported on the way in
+    rather than surfacing as a ``KeyError`` from the root-cause lookup.
+    """
+    settings = tmp_path / "settings.cfg"
+    settings.write_text("anything\n", encoding="utf-8")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.read_document("yml", settings)
+
+    assert str(excinfo.value) == "unknown config format 'yml' (expected one of json, toml, yaml)"
+    assert settings.read_text(encoding="utf-8") == "anything\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -270,9 +327,66 @@ def test_a_hash_inside_a_string_is_not_treated_as_a_comment(tmp_path: Path) -> N
     assert configfmt._has_comment_line("  # indented comment\n")
 
 
+def test_a_commented_toml_file_is_refused_with_no_writer_installed(tmp_path: Path) -> None:
+    """The comment guard is what protects the file; the writer is never reached.
+
+    Writing TOML needs an extra this machine may not have, and the guard runs
+    before any parser is touched. That ordering is the point: an operator with
+    an annotated Codex config is told their file is protected, not told to
+    install something first.
+    """
+    settings = tmp_path / "config.toml"
+    marker = "# a note the operator wrote\n"
+    settings.write_text(marker, encoding="utf-8")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.write_document("toml", settings, REGISTRATION)
+
+    assert str(excinfo.value) == (
+        f"{settings} contains comments, which a TOML writer cannot preserve. "
+        "Registering this server would discard them, so nothing was written. "
+        "Add the entry by hand, or strip the comments and re-run."
+    )
+    assert settings.read_text(encoding="utf-8") == marker
+
+
+@needs_yaml
+def test_an_uncommented_yaml_file_is_rewritten_in_place(tmp_path: Path) -> None:
+    """The guard refuses comments, not YAML: a clean file is still written.
+
+    The other leg of the same branch. A file that holds nothing this module
+    cannot reproduce is exactly the case a wholesale rewrite is safe for, so
+    "guard" must not become "never writes".
+    """
+    settings = tmp_path / "config.yaml"
+    settings.write_text("unrelated: value\n", encoding="utf-8")
+
+    configfmt.write_document("yaml", settings, REGISTRATION)
+
+    assert configfmt.read_document("yaml", settings) == REGISTRATION
+
+
 # --------------------------------------------------------------------------- #
 # refusal: an absent optional parser
 # --------------------------------------------------------------------------- #
+
+
+def _refuse_module(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make the lazy import of ``name`` report the package as not installed.
+
+    The format layer resolves its extras by name through
+    ``importlib.import_module`` precisely so the missing case is a refusal
+    rather than an import error at module scope, so that is the seam a test
+    of the refusal pulls on.
+    """
+    real_import_module = configfmt.importlib.import_module
+
+    def refusing(importee: str, *args: Any, **kwargs: Any) -> Any:
+        if importee == name:
+            raise ImportError(f"No module named {name!r}")
+        return real_import_module(importee, *args, **kwargs)
+
+    monkeypatch.setattr(configfmt.importlib, "import_module", refusing)
 
 
 def test_a_missing_yaml_parser_is_reported_with_the_command_that_fixes_it(
@@ -282,46 +396,52 @@ def test_a_missing_yaml_parser_is_reported_with_the_command_that_fixes_it(
 
     ``mcp install`` already refuses for a missing MCP SDK the same way, so the
     two failures read identically to an operator: here is what is missing,
-    here is the command.
+    here is the command. The message is pinned verbatim because it is what the
+    CLI prints.
     """
     settings = tmp_path / "config.yaml"
     settings.write_text("mcpServers: []\n", encoding="utf-8")
-    real_import_module = configfmt.importlib.import_module
-
-    def without_yaml(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "yaml":
-            raise ImportError("No module named 'yaml'")
-        return real_import_module(name, *args, **kwargs)
-
-    monkeypatch.setattr(configfmt.importlib, "import_module", without_yaml)
+    _refuse_module(monkeypatch, "yaml")
 
     with pytest.raises(configfmt.ConfigError) as excinfo:
         configfmt.read_document("yaml", settings)
 
-    message = str(excinfo.value)
-    assert "PyYAML" in message
-    assert 'pip install "continuum-agent[mcp]"' in message
+    assert str(excinfo.value) == (
+        "reading and writing YAML needs the 'PyYAML' package, which is not "
+        'installed. Install it with: pip install "continuum-agent[mcp]"'
+    )
+
+
+def test_a_missing_yaml_parser_stops_a_write_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same refusal on the way out: rendering needs the parser as well.
+
+    One message covers both directions, so an operator who reads it once knows
+    both operations are blocked, not merely the one they tried.
+    """
+    _refuse_module(monkeypatch, "yaml")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.render_document("yaml", REGISTRATION)
+
+    assert str(excinfo.value) == (
+        "reading and writing YAML needs the 'PyYAML' package, which is not "
+        'installed. Install it with: pip install "continuum-agent[mcp]"'
+    )
 
 
 def test_a_missing_toml_writer_is_reported_with_the_command_that_fixes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same contract for the TOML writer, which the standard library lacks."""
-    real_import_module = configfmt.importlib.import_module
-
-    def without_tomli_w(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "tomli_w":
-            raise ImportError("No module named 'tomli_w'")
-        return real_import_module(name, *args, **kwargs)
-
-    monkeypatch.setattr(configfmt.importlib, "import_module", without_tomli_w)
+    _refuse_module(monkeypatch, "tomli_w")
 
     with pytest.raises(configfmt.ConfigError) as excinfo:
         configfmt.render_document("toml", REGISTRATION)
 
-    message = str(excinfo.value)
-    assert "tomli-w" in message
-    assert 'pip install "continuum-agent[mcp]"' in message
+    assert str(excinfo.value) == (
+        "writing TOML needs the 'tomli-w' package, which is not installed. "
+        'Install it with: pip install "continuum-agent[mcp]"'
+    )
 
 
 def test_reading_toml_never_needs_a_writer() -> None:
@@ -335,6 +455,206 @@ def test_reading_toml_never_needs_a_writer() -> None:
 
     parsed = tomllib.loads('[mcp_servers.x]\ncommand = "c"\n')
     assert parsed == {"mcp_servers": {"x": {"command": "c"}}}
+
+
+# --------------------------------------------------------------------------- #
+# the contract with the optional parsers
+# --------------------------------------------------------------------------- #
+#
+# CI's test job installs neither ``tomli-w`` nor ``PyYAML`` (only the ``mcp``
+# extra pulls them in), and the guards above skip when a parser is missing.
+# That leaves the lines that *use* a parser exercised only on a machine that
+# happens to have one. The tests below install a stub in the lazy import's
+# place, so the YAML and TOML branches run everywhere -- and because the stub
+# records what it was handed, they also pin the contract this module keeps
+# with each library, which a round trip against the real parser cannot see.
+
+
+def _stand_in_for(monkeypatch: pytest.MonkeyPatch, name: str, module: Any) -> None:
+    """Install ``module`` where the lazy import of ``name`` looks."""
+    real_import_module = configfmt.importlib.import_module
+
+    def importing(importee: str, *args: Any, **kwargs: Any) -> Any:
+        if importee == name:
+            return module
+        return real_import_module(importee, *args, **kwargs)
+
+    monkeypatch.setattr(configfmt.importlib, "import_module", importing)
+
+
+class _StubYAML:
+    """PyYAML's surfaces as this module uses them, with every call recorded.
+
+    Two properties are worth a stub rather than a skip: reading goes through
+    ``safe_load`` -- never ``load``, which constructs arbitrary objects from
+    tags in a file this tool did not write -- and the dumper is handed a
+    specific set of options that each protect something a reader notices.
+    """
+
+    class YAMLError(Exception):
+        """``yaml.YAMLError`` as the refusal branch sees it."""
+
+    def __init__(
+        self,
+        *,
+        document: Any = None,
+        text: str = "rendered: stub\n",
+        load_error: Exception | None = None,
+    ) -> None:
+        self.document = document
+        self.text = text
+        self.load_error = load_error
+        self.loads: list[str] = []
+        self.dumps: list[tuple[Any, dict[str, Any]]] = []
+
+    def safe_load(self, text: str) -> Any:
+        self.loads.append(text)
+        if self.load_error is not None:
+            raise self.load_error
+        return self.document
+
+    def safe_dump(self, data: Any, **kwargs: Any) -> str:
+        self.dumps.append((data, kwargs))
+        return self.text
+
+
+class _StubTomlW:
+    """``tomli_w`` as this module uses it: one call, the whole document."""
+
+    def __init__(self, text: str = 'rendered = "stub"\n') -> None:
+        self.text = text
+        self.written: list[Any] = []
+
+    def dumps(self, data: Any) -> str:
+        self.written.append(data)
+        return self.text
+
+
+def test_yaml_is_read_through_safe_load_and_never_the_full_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config file is untrusted input, so the safe loader is the only one used.
+
+    ``load`` would build arbitrary Python objects from tags a hostile file can
+    carry, which makes the choice of loader a security property rather than a
+    formatting detail. The recorded call is the evidence: the text goes in,
+    and the document is the only thing that comes back.
+    """
+    yaml = _StubYAML(document={"mcpServers": {}})
+    _stand_in_for(monkeypatch, "yaml", yaml)
+    settings = tmp_path / "config.yaml"
+    settings.write_text("mcpServers: {}\n", encoding="utf-8")
+
+    assert configfmt.read_document("yaml", settings) == {"mcpServers": {}}
+    assert yaml.loads == ["mcpServers: {}\n"]
+
+
+def test_a_yaml_document_that_parses_to_nothing_folds_to_an_empty_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank YAML file is the one ``None`` that is an editor, not a mistake.
+
+    Pinned through the stub so the fold is exercised on a machine without
+    PyYAML as well, where no real file can reach it -- and with the
+    comment-only file pinned beside it, the boundary is visible from both
+    sides: blank folds, annotated refuses.
+    """
+    yaml = _StubYAML(document=None)
+    _stand_in_for(monkeypatch, "yaml", yaml)
+    settings = tmp_path / "config.yaml"
+    settings.write_text("\n\n", encoding="utf-8")
+
+    assert configfmt.read_document("yaml", settings) == {}
+
+
+def test_a_yaml_parse_failure_becomes_a_refusal_naming_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parser's own error is wrapped, not propagated.
+
+    An operator staring at a traceback from ``yaml`` learns nothing about
+    their file. The refusal names the file and the cause, and leaves the bytes
+    alone; the stub hands back a controlled error so the whole message can be
+    pinned rather than a fragment of a parser's wording.
+    """
+    yaml = _StubYAML(load_error=_StubYAML.YAMLError("boom"))
+    _stand_in_for(monkeypatch, "yaml", yaml)
+    settings = tmp_path / "config.yaml"
+    marker = "not: [yaml\n"
+    settings.write_text(marker, encoding="utf-8")
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.read_document("yaml", settings)
+
+    assert str(excinfo.value) == f"{settings} is not valid YAML (boom); refusing to edit it"
+    assert settings.read_text(encoding="utf-8") == marker
+
+
+def test_yaml_rendering_keeps_key_order_avoids_flow_style_and_never_wraps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The four options the dumper is handed are each a user-visible property.
+
+    Key order is the one part of a YAML file a reader navigates by, flow style
+    turns a readable block into a one-liner, escaping unicode turns names into
+    ``\\u`` sequences, and a wrap splits one readable line into several. All
+    four are pinned because all four are reasons the output would not read
+    like the file the operator wrote.
+    """
+    yaml = _StubYAML()
+    _stand_in_for(monkeypatch, "yaml", yaml)
+
+    assert configfmt.render_document("yaml", REGISTRATION) == yaml.text
+    assert yaml.dumps == [
+        (
+            REGISTRATION,
+            {
+                "sort_keys": False,
+                "default_flow_style": False,
+                "allow_unicode": True,
+                "width": 4096,
+            },
+        )
+    ]
+
+
+def test_toml_rendering_hands_the_whole_document_to_the_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer sees the document, and nothing else is done to it.
+
+    There is no standard-library TOML writer, so whatever ``tomli_w`` returns
+    is what reaches the file; this module adds no formatting of its own, and
+    the document is not reshaped on the way through.
+    """
+    writer = _StubTomlW()
+    _stand_in_for(monkeypatch, "tomli_w", writer)
+
+    assert configfmt.render_document("toml", REGISTRATION) == writer.text
+    assert writer.written == [REGISTRATION]
+
+
+def test_toml_rendering_checks_for_null_before_it_touches_the_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A null inside a list is refused by path, and the writer never runs.
+
+    TOML has no null, so a document holding one cannot be written back without
+    dropping a key or inventing a placeholder. The check has to come first: a
+    writer that had already been handed the document would have produced half a
+    file before the refusal landed.
+    """
+    writer = _StubTomlW()
+    _stand_in_for(monkeypatch, "tomli_w", writer)
+
+    with pytest.raises(configfmt.ConfigError) as excinfo:
+        configfmt.render_document("toml", {"mcp_servers": {"a": {"args": [None]}}})
+
+    assert str(excinfo.value) == (
+        "mcp_servers.a.args[0] is null, and TOML has no null to write it as; "
+        "removing the key first would change what the host reads"
+    )
+    assert writer.written == []
 
 
 # --------------------------------------------------------------------------- #
@@ -472,6 +792,67 @@ def test_an_empty_list_container_is_left_alone() -> None:
     LIST_SPLIT.drop(data, "local", Path("/proj"), SPEC.name)
 
     assert data == {"mcpServers": []}
+
+
+def test_find_reports_absence_where_the_nesting_path_is_missing() -> None:
+    """A per-project section that does not exist is ``None``, not a KeyError.
+
+    ``container_at`` walks the nesting path with ``create=False`` on a lookup,
+    so a host file with no per-project section at all is simply empty -- and
+    the lookup has to stay a lookup, never a creator.
+    """
+    assert DICT_SPLIT.find({}, "local", Path("/proj"), "continuum-mcp") is None
+
+
+def test_find_reports_absence_where_only_the_container_is_missing() -> None:
+    """A project section that exists but holds no servers reads as empty too.
+
+    The nesting key is present and is a mapping, which is the case a walk that
+    only checked the first level would get wrong: the missing piece is the
+    servers container one level further down.
+    """
+    data: dict[str, Any] = {"projects": {str(Path("/proj")): {"other": 1}}}
+
+    assert DICT_SPLIT.find(data, "local", Path("/proj"), "continuum-mcp") is None
+    assert data == {"projects": {str(Path("/proj")): {"other": 1}}}
+
+
+@pytest.mark.parametrize("shape", [DICT_SPLIT, LIST_SPLIT])
+def test_dropping_a_name_that_was_never_installed_changes_nothing(
+    shape: configfmt.Shape,
+) -> None:
+    """A remove of a name that is not there is ``False``, and the file stands.
+
+    ``drop`` treats an absent entry and a foreign one the same way, which is
+    what makes a remove safe to run against a file this tool never wrote: a
+    miss has to be a miss, not a reason to reshape the document.
+    """
+    data: dict[str, Any] = {}
+    shape.put(data, "project", Path("/proj"), SPEC)
+
+    assert shape.drop(data, "project", Path("/proj"), "somebody-else") is False
+
+    assert shape.find(data, "project", Path("/proj"), "somebody-else") is None
+    assert shape.argv_of(shape.find(data, "project", Path("/proj"), SPEC.name)) == list(SPEC.argv)
+
+
+def test_pruning_stops_at_a_container_another_project_still_uses() -> None:
+    """A remove in one project leaves another project's section standing.
+
+    Pruning walks upwards only while each container it meets is empty, so the
+    ``projects`` map survives for as long as anything is filed under it. That
+    is the difference between tidying up after a remove and deleting a
+    neighbour's registration by accident.
+    """
+    data: dict[str, Any] = {}
+    DICT_SPLIT.put(data, "local", Path("/proj"), SPEC)
+    DICT_SPLIT.put(data, "local", Path("/other"), SPEC)
+
+    assert DICT_SPLIT.drop(data, "local", Path("/proj"), SPEC.name) is True
+
+    assert data == {
+        "projects": {str(Path("/other")): {"mcpServers": {"continuum-mcp": DICT_SPLIT.entry(SPEC)}}}
+    }
 
 
 @pytest.mark.parametrize(
