@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,10 +22,17 @@ from continuum.checkpoint import CheckpointManager
 from continuum.cli import ExitCode, main
 from continuum.environment import StaticProvider, capture
 from continuum.events import EventType
-from continuum.models import Run
+from continuum.models import (
+    Component,
+    ComponentValidationEntry,
+    Run,
+    StateStatus,
+    StateValidationResult,
+)
 from continuum.recovery import RecoveryEngine
 from continuum.recovery.summary import (
     INFORMED_RETRY_CAP_BYTES,
+    _avoid_rules,
     _fit,
     build_informed_retry,
     render_informed_retry,
@@ -221,3 +229,143 @@ def test_clean_run_output_has_no_section(tmp_path: Path) -> None:
 def test_resume_prints_next_steps_exactly_once(history_db: str) -> None:
     _, out, _ = run("--db", history_db, "resume", "run_1")
     assert out.count("\n\nNext steps:\n") == 1
+
+
+# --- step naming, avoid-rule templates, eviction and rendering (#2054) ------------- #
+
+
+def _retry_from_recovery_start(plan: list[dict[str, object]]) -> dict[str, Any]:
+    """Build a block from one RECOVERY_STARTED carrying ``plan`` steps.
+
+    ``_step_name`` reads the last attempt's recorded plan, which is where the
+    block's ``last_attempt_steps`` come from -- the three naming shapes a
+    stored plan step can carry are exercised through this single seam.
+    """
+    storage = SQLiteStorage(":memory:")
+    seed(storage)
+    storage.append_event("run_1", EventType.RECOVERY_STARTED, {"plan": plan})
+    block = build_informed_retry(
+        storage,
+        "run_1",
+        validation_report=StateValidationResult(run_id="run_1", statuses=[]),
+    )
+    assert block is not None
+    return block
+
+
+def test_the_last_plan_step_can_carry_an_explicit_action_name() -> None:
+    block = _retry_from_recovery_start([{"action_name": "settle_invoice"}])
+
+    assert block["last_attempt_steps"] == ["settle_invoice"]
+
+
+def test_the_last_plan_step_falls_back_to_kind_colon_target() -> None:
+    block = _retry_from_recovery_start([{"kind": "tool", "target": "write_file"}])
+
+    assert block["last_attempt_steps"] == ["tool:write_file"]
+
+
+def test_the_last_plan_step_with_only_a_kind_names_it_barely() -> None:
+    block = _retry_from_recovery_start([{"kind": "step"}])
+
+    assert block["last_attempt_steps"] == ["step"]
+
+
+@pytest.mark.parametrize(
+    ("component", "component_id", "expected"),
+    [
+        (
+            Component.EVIDENCE,
+            "paper_1",
+            "evidence:paper_1: stale; re-derive from its source before citing it again",
+        ),
+        (
+            Component.FINDING,
+            "finding_1",
+            "finding:finding_1: stale; re-derive from its source before citing it again",
+        ),
+        (
+            Component.MODEL,
+            "gpt-9",
+            "model:gpt-9: model assumptions unverified; confirm which model resumes",
+        ),
+        (
+            Component.APPROVAL,
+            "approval_1",
+            "approval:approval_1: approval does not carry over; obtain a fresh one",
+        ),
+    ],
+)
+def test_avoid_rules_template_per_component(
+    component: Component, component_id: str, expected: str
+) -> None:
+    """Each template restates what the validator already concluded in the words
+    a resuming agent can act on -- never a cause it cannot see."""
+    entry = ComponentValidationEntry(
+        component=component, component_id=component_id, status=StateStatus.INVALID
+    )
+
+    assert _avoid_rules([entry], []) == [expected]
+
+
+def test_fit_strips_failure_detail_before_giving_up() -> None:
+    """Deeper into the eviction ladder than the size-cap test reaches: with
+    every list already as short as it can go, the loop strips ``detail`` from
+    the remaining failure -- and when even that does not fit, it hard-stops
+    keeping the block intact rather than emptying it."""
+    fat = {
+        "attempts": 1,
+        "last_attempt_mode": "m" * (INFORMED_RETRY_CAP_BYTES * 4),
+        "last_attempt_steps": ["only step"],
+        "settled_effects": [],
+        "current_failures": [
+            {"component": "goal", "id": "g", "detail": "d" * INFORMED_RETRY_CAP_BYTES}
+        ],
+        "avoid": [],
+    }
+
+    fitted = _fit(fat)
+
+    # First pass: the detail arm fires.
+    assert fitted["current_failures"][0]["detail"] == ""
+    # Second pass: nothing left to trim, so the loop breaks and keeps the
+    # untrimmed remainder rather than discarding the block's shape.
+    assert fitted["last_attempt_mode"] == fat["last_attempt_mode"]
+    assert fitted["current_failures"][0]["id"] == "g"
+
+
+def test_render_counts_every_recovery_outcome() -> None:
+    block: dict[str, Any] = {
+        "completed_recoveries": 3,
+        "blocked_recoveries": 1,
+        "compensations": 2,
+    }
+
+    lines = render_informed_retry(block)
+
+    assert "recoveries completed: 3" in lines
+    assert "recoveries blocked: 1" in lines
+    assert "compensations applied: 2" in lines
+
+
+def test_render_reports_attempts_without_a_last_plan_mode() -> None:
+    """A prior attempt with no recorded mode still counts, without printing an
+    empty mode line."""
+    lines = render_informed_retry({"attempts": 2})
+
+    assert "previous attempt(s): 2" in lines
+    assert not any("last plan mode" in line for line in lines)
+
+
+def test_render_names_failures_with_and_without_an_id_and_detail() -> None:
+    block: dict[str, Any] = {
+        "current_failures": [
+            {"component": "goal", "id": "gone_stale", "detail": "no longer matches the work"},
+            {"component": "pin", "detail": ""},
+        ]
+    }
+
+    lines = render_informed_retry(block)
+
+    assert "still failing: goal:gone_stale (no longer matches the work)" in lines
+    assert "still failing: pin" in lines
