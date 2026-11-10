@@ -29,7 +29,11 @@ from continuum.models import (
     ComponentValidationEntry,
     Decision,
     EnvironmentSnapshot,
+    EnvResource,
+    Finding,
     Goal,
+    PlanStep,
+    PlanStepStatus,
     RecoveryMode,
     RecoverySafety,
     Run,
@@ -906,3 +910,117 @@ def test_conformance_rejects_a_rule_whose_evaluate_is_not_callable() -> None:
 
     assert not report.passed
     assert any("no callable 'evaluate' method" in failure for failure in report.failures)
+
+
+# --- the revoked-approval rule on findings and plan steps (#2049) --------------- #
+
+
+def test_revoked_approvals_with_blank_subjects_are_skipped() -> None:
+    """A revocation that names nothing cannot authorize anything, so it is not
+    indexed -- and when no revocation names a subject at all, the rule answers
+    before it scans a single state component."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        decisions=[Decision(decision_id="decision_1", decision="adopt policy P-42")],
+        approvals=[
+            Approval(approval_id="approval_blank", subject="", status=ApprovalStatus.REVOKED),
+            Approval(approval_id="approval_space", subject="   ", status=ApprovalStatus.REVOKED),
+        ],
+    )
+
+    assert RevokedApprovalRule().evaluate(state) == []
+
+
+def test_a_revoked_approval_invalidates_the_finding_it_authorized() -> None:
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        findings=[Finding(finding_id="finding_1", claim="X")],
+        approvals=[_revoked("finding_1", "approval_1", None)],
+    )
+
+    findings = RevokedApprovalRule().evaluate(state)
+
+    assert len(findings) == 1
+    assert findings[0].component is Component.FINDING
+    assert findings[0].component_id == "finding_1"
+    assert findings[0].status is StateStatus.INVALID
+    assert findings[0].rule == "builtin:revoked_approval"
+
+
+def test_a_revoked_approval_invalidates_an_outstanding_plan_step() -> None:
+    """Only work still outstanding can be blocked by a lost authorization."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        plan=[PlanStep(step_id="step_1", description="file the report")],
+        approvals=[_revoked("step_1", "approval_1", None)],
+    )
+
+    findings = RevokedApprovalRule().evaluate(state)
+
+    assert len(findings) == 1
+    assert findings[0].component is Component.PLAN
+    assert findings[0].component_id == "step_1"
+    assert findings[0].status is StateStatus.INVALID
+
+
+def test_a_completed_plan_step_survives_its_revoked_authorization() -> None:
+    """A step that already finished cannot be blocked retroactively: its work is
+    done, and re-labelling it invalid would rewrite history, not protect it."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        plan=[
+            PlanStep(
+                step_id="step_1", description="file the report", status=PlanStepStatus.COMPLETED
+            )
+        ],
+        approvals=[_revoked("step_1", "approval_1", None)],
+    )
+
+    assert RevokedApprovalRule().evaluate(state) == []
+
+
+def test_a_finding_the_revoked_approval_did_not_authorize_is_untouched() -> None:
+    """The rule follows the subject, not the component type: an unrelated finding
+    keeps its status even when a sibling finding was authorized and revoked."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        findings=[
+            Finding(finding_id="finding_1", claim="authorized"),
+            Finding(finding_id="finding_2", claim="free-standing"),
+        ],
+        approvals=[_revoked("finding_1", "approval_1", None)],
+    )
+
+    findings = RevokedApprovalRule().evaluate(state)
+
+    assert [e.component_id for e in findings] == ["finding_1"]
+
+
+# --- conformance: the environment mutation guard (#2049) ------------------------ #
+
+
+def test_conformance_detects_a_rule_that_mutates_the_environment() -> None:
+    """A rule may observe the environment, not edit it: one that rewrites a
+    captured variable would change the verdict between the assessment and the
+    resume, exactly the drift the seam exists to prevent."""
+
+    class _EnvMutatingRule:
+        name = "test:env_mutating"
+
+        def evaluate(self, state, environment=None):  # type: ignore[no-untyped-def]
+            # Frozen models refuse attribute assignment, but the resources
+            # mapping is still appendable in place -- the mutation a rule must
+            # not get away with, mirroring ``_MutatingRule`` on the state.
+            if environment is not None:
+                environment.resources["poisoned"] = EnvResource(name="poisoned", version="0")
+            return []
+
+    report = check_validation_rule(_EnvMutatingRule(), environment=env())
+
+    assert not report.passed
+    assert any("mutated the environment" in failure for failure in report.failures)
