@@ -19,7 +19,7 @@ from continuum.events import EventType
 from continuum.models import Origin, Run
 from continuum.recovery import RecoveryEngine, render_contract
 from continuum.recovery.contract import verify_contract
-from continuum.recovery.observations import collect_observations
+from continuum.recovery.observations import collect_observations, observation_status
 from continuum.storage import SQLiteStorage
 
 
@@ -277,3 +277,76 @@ ExitCodes_OK_UNSAFE = {
     ExitCode.REQUIRES_REPAIR,
     ExitCode.UNSAFE,
 }
+
+
+# --- guards and relative paths (#2046) ------------------------------------------- #
+
+
+def test_observation_without_an_expected_sha_is_recorded_not_verified(workspace: Path) -> None:
+    """A hook that recorded only the byte count cannot be digest-matched, so the
+    honest label is ``recorded``: the write was observed, never verified."""
+    f = workspace / "sized.txt"
+    f.write_text("body")
+    assert observation_status(str(f), expected_sha=None, expected_bytes=4) == "recorded"
+
+
+def test_observation_of_an_absent_file_is_missing(workspace: Path) -> None:
+    assert observation_status(str(workspace / "gone.txt"), "deadbeef", 1) == "missing"
+
+
+def test_relative_observation_paths_resolve_against_root(db: str, workspace: Path) -> None:
+    """A hook that records a workspace-relative path still finds the file, because
+    the projection resolves it against ``root`` rather than the process cwd."""
+    make_run(db, checkpointed=False)
+    (workspace / "rel.txt").write_text("relative")
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1",
+            EventType.TOOL_COMPLETED,
+            {"tool": "Write", "path": "rel.txt", "bytes": 8},
+        )
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert [e["status"] for e in entries] == ["recorded"]
+    assert entries[0]["path"] == "rel.txt"
+
+
+def test_observations_with_no_digest_and_no_size_are_unresolvable(db: str, workspace: Path) -> None:
+    """Neither a digest nor a byte count leaves nothing to check against, so the
+    entry says ``unresolvable`` rather than pretending to a verdict it cannot reach."""
+    make_run(db, checkpointed=False)
+    (workspace / "bare.txt").write_text("x")
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1",
+            EventType.TOOL_COMPLETED,
+            {"tool": "Write", "path": str(workspace / "bare.txt")},
+        )
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert [e["status"] for e in entries] == ["unresolvable"]
+
+
+def test_malformed_tool_events_are_skipped_cleanly(db: str, workspace: Path) -> None:
+    """The projection is informational: a payload too malformed to interpret is
+    skipped, and must not raise and cost the whole contract section."""
+    make_run(db, checkpointed=False)
+    (workspace / "good.txt").write_text("x")
+    with SQLiteStorage(db) as store:
+        for payload in (
+            {"path": str(workspace / "good.txt"), "bytes": 1},  # no tool
+            {"tool": "Write"},  # no path
+            {"tool": "Write", "path": ""},  # empty path
+            {"tool": 42, "path": str(workspace / "good.txt")},  # non-string tool
+            {"tool": "Write", "path": None},  # non-string path
+        ):
+            store.append_event("run_1", EventType.TOOL_COMPLETED, payload)
+        store.append_event(
+            "run_1",
+            EventType.TOOL_COMPLETED,
+            {"tool": "Write", "path": str(workspace / "good.txt"), "bytes": 1},
+        )
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert len(entries) == 1
+    assert entries[0]["status"] == "recorded"
