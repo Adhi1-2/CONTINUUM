@@ -536,3 +536,120 @@ def test_render_empty_curation_produces_no_lines() -> None:
     """Nothing to say renders as nothing, not an empty header."""
     curated: dict[str, Any] = {"sections": [], "quarantine": [], "omitted": []}
     assert render_curated_briefing(curated) == []
+
+
+# --- system-derived sections and trust-tier propagation (#2047) ------------------ #
+#
+# Attempt lessons, trajectory reports and the informed-retry block are
+# engine-derived, so the default tier is ``system``. But each is distilled from
+# events an agent asserted, and #392's non-amplification invariant has to show
+# up in the tier the briefing *advertises*, not only inside the rendered text:
+# a report built on unverified input must never parade as trusted system output.
+
+
+def _report(derived_origin: str) -> Any:
+    from continuum.models import TrajectoryReport
+
+    return TrajectoryReport(
+        report_id="rep_1",
+        window_start=0,
+        window_end=10,
+        compaction_seq=3,
+        attempts=4,
+        scar_rate=0.25,
+        stall_sites=["payment gateway"],
+        derived_origin=derived_origin,
+    )
+
+
+def test_curate_briefing_renders_attempt_lessons_as_system() -> None:
+    from continuum.models import AttemptLesson
+
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="Settle the invoice batch"),
+        attempt_lessons=[
+            AttemptLesson(attempt_id="attempt_1", falsified="the vendor list was stale")
+        ],
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+
+    section = next(s for s in curated["sections"] if "attempt lessons" in s["title"])
+    assert section["title"] == "attempt lessons (system-derived)"
+    assert section["provenance"] == "system"
+    assert "attempt_1" in "\n".join(section["lines"])
+
+
+def test_curate_briefing_renders_verified_trajectory_reports_as_system() -> None:
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="Settle the invoice batch"),
+        trajectory_reports=[_report(derived_origin="deterministic")],
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+
+    section = next(s for s in curated["sections"] if "trajectory reports" in s["title"])
+    assert section["title"] == "trajectory reports (sleep-time, system-derived)"
+    assert section["provenance"] == "system"
+    assert "distilled from archived history between sessions (issue #393)" in section["reason"]
+    assert "trajectory report rep_1 window 0->10" in section["lines"][0]
+
+
+def test_curate_briefing_degrades_unverified_trajectory_reports_to_agent() -> None:
+    """A report distilled from agent-asserted events inherits that trust level
+    in the advertised tier, never silently the system one."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="Settle the invoice batch"),
+        trajectory_reports=[_report(derived_origin="external_agent")],
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+
+    section = next(s for s in curated["sections"] if "trajectory reports" in s["title"])
+    assert section["title"].endswith(", unverified provenance")
+    assert section["provenance"] == "agent"
+    assert "issue #392" in section["reason"]
+
+
+def test_curate_briefing_renders_a_verified_informed_retry_as_system() -> None:
+    decision = _decision()
+    decision.informed_retry = {
+        "attempts": 2,
+        "completed_recoveries": 1,
+        "derived_origin": "deterministic",
+    }
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+
+    section = next(s for s in curated["sections"] if "previous attempts changed" in s["title"])
+    assert section["title"] == "what previous attempts changed (engine-recorded)"
+    assert section["provenance"] == "system"
+    assert "previous attempt(s): 2" in section["lines"]
+
+
+def test_curate_briefing_degrades_an_unverified_informed_retry_to_agent() -> None:
+    decision = _decision()
+    decision.informed_retry = {
+        "attempts": 2,
+        "derived_origin": "external_agent",
+    }
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+
+    section = next(s for s in curated["sections"] if "previous attempts changed" in s["title"])
+    assert section["title"].endswith(", unverified provenance")
+    assert section["provenance"] == "agent"
+
+
+def test_curate_briefing_omits_the_why_line_when_the_contract_has_no_reason() -> None:
+    """An empty contract reason renders no ``why:`` stub, not a dangling label."""
+    decision = _decision()
+    decision.contract = RecoveryContract(
+        run_id="run_1",
+        recovery_status=RecoverySafety.SAFE_TO_RESUME,
+        reason="",
+        next_allowed_action="resume",
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+
+    (contract_section, *_rest) = curated["sections"]
+    assert not any(line.startswith("why:") for line in contract_section["lines"])
+    assert any(line.startswith("next permitted action:") for line in contract_section["lines"])
