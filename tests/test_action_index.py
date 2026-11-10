@@ -583,3 +583,99 @@ def test_postgres_rebuild_action_index_reports_corrected_count() -> None:
         {"key": "k2", "updated_seq": 2, "status": "started"},
     ]
     assert store.rebuild_action_index() == 0
+
+
+# --- serialization and normalization guards (#2045) ------------------------------ #
+
+
+def test_index_order_for_aligns_a_naive_datetime_to_utc() -> None:
+    """A naive timestamp is read as UTC, never as local time, so the stored
+    order number cannot shift with the machine's timezone."""
+    from datetime import UTC, datetime
+
+    from continuum.storage.actionindex import index_order_for
+
+    naive = datetime(2026, 1, 1, 12, 0, 0)
+    aware = naive.replace(tzinfo=UTC)
+    assert index_order_for(naive) == index_order_for(aware)
+    assert index_order_for(naive) == int(aware.timestamp() * 1_000_000)
+
+
+def test_index_order_for_accepts_an_iso_string_and_a_datetime_equivalently() -> None:
+    from datetime import UTC, datetime
+
+    from continuum.storage.actionindex import index_order_for
+
+    when = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    assert index_order_for(when.isoformat()) == index_order_for(when)
+
+
+def test_index_entry_from_payload_rejects_non_action_events() -> None:
+    from continuum.storage.actionindex import index_entry_from_payload
+
+    payload = {"key": "k", "action": {"run_id": "r", "action_id": "a"}}
+    assert index_entry_from_payload(EventType.RUN_STARTED, payload) is None
+    assert index_entry_from_payload(EventType.STATE_CHECKPOINTED, payload) is None
+
+
+def test_index_entry_from_payload_rejects_invalid_key_and_action_shapes() -> None:
+    from continuum.storage.actionindex import index_entry_from_payload
+
+    action = {"run_id": "r", "action_id": "a"}
+    for key in (None, 123, ""):
+        assert (
+            index_entry_from_payload(EventType.ACTION_RECORDED, {"key": key, "action": action})
+            is None
+        )
+    for bad_action in (None, "string", []):
+        assert (
+            index_entry_from_payload(EventType.ACTION_RECORDED, {"key": "k", "action": bad_action})
+            is None
+        )
+
+
+def test_index_entry_from_payload_drops_a_rendered_key_that_is_not_a_memory_key() -> None:
+    """``rendered_key`` exists for tenant queries such as ``continuum forget``;
+    a non-memory key carries no tenant and must not be indexed as one (#1417)."""
+    from continuum.storage.actionindex import index_entry_from_payload
+
+    entry = index_entry_from_payload(
+        EventType.ACTION_RECORDED,
+        {"key": "k", "action": {"run_id": "r"}, "rendered_key": "not_a_memory_key"},
+    )
+    assert entry is not None
+    assert entry[5] is None
+
+    kept = index_entry_from_payload(
+        EventType.ACTION_RECORDED,
+        {"key": "k", "action": {"run_id": "r"}, "rendered_key": "mem:store:tenant:record"},
+    )
+    assert kept is not None
+    assert kept[5] == "mem:store:tenant:record"
+
+
+def test_index_entry_from_payload_returns_none_for_a_non_serializable_action() -> None:
+    """A payload the log cannot round-trip yields None rather than a half-row,
+    because the index must never disagree with the log silently."""
+    from continuum.storage.actionindex import index_entry_from_payload
+
+    entry = index_entry_from_payload(
+        EventType.ACTION_RECORDED, {"key": "k", "action": {"obj": object()}}
+    )
+    assert entry is None
+
+
+def test_index_entry_from_payload_serializes_the_action_in_sorted_key_order() -> None:
+    from continuum.storage.actionindex import index_entry_from_payload
+
+    entry = index_entry_from_payload(
+        EventType.ACTION_RECORDED,
+        {"key": "k", "action": {"status": "started", "run_id": "r", "action_id": "a"}},
+    )
+    assert entry is not None
+    key, run_id, action_id, status, action_json, rendered = entry
+    assert (key, run_id, action_id, status, rendered) == ("k", "r", "a", "started", None)
+    assert json.loads(action_json) == {"status": "started", "run_id": "r", "action_id": "a"}
+    assert action_json == json.dumps(
+        {"run_id": "r", "action_id": "a", "status": "started"}, sort_keys=True
+    )
