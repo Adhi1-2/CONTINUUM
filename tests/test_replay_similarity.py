@@ -480,3 +480,156 @@ def test_fuzzy_does_not_match_when_values_differ_but_tokenize_to_nothing() -> No
         )
         == 0.0
     )
+
+
+# --- boundary values, embedder resolution, and classification arms (#2053) -------- #
+
+
+def test_jaccard_scores_two_empty_sets_as_one() -> None:
+    """Documented contract: nothing to distinguish means identical."""
+    assert jaccard(frozenset(), frozenset()) == 1.0
+
+
+def test_jaccard_scores_one_empty_set_as_zero() -> None:
+    """One side with nothing in it cannot share any evidence of intent."""
+    assert jaccard(frozenset(), token_set("acme invoice")) == 0.0
+    assert jaccard(token_set("acme invoice"), frozenset()) == 0.0
+
+
+def test_cosine_of_a_zero_norm_vector_is_zero() -> None:
+    """A zero vector has no direction, so the similarity must be 0.0, never NaN."""
+    assert _cosine([0.0, 0.0], [1.0, 2.0]) == 0.0
+    assert _cosine([1.0, 2.0], [0.0, 0.0]) == 0.0
+
+
+def test_embedding_kind_without_an_embedder_raises() -> None:
+    """CONTINUUM bundles no embedding model, so an EMBEDDING config without a
+    callable must fail loudly rather than score everything against nothing."""
+    with pytest.raises(ValueError, match="EMBEDDING kind requires an embedder function"):
+        similarity({"a": 1}, {"a": 1}, SimilarityConfig(kind="embedding"))
+
+
+def test_fuzzy_arguments_that_tokenize_to_nothing_stay_unclaimed_even_when_equal() -> None:
+    """The per-key guard cannot catch this pair -- every key's values agree --
+    so the token-less guard on the flattened text is what keeps it from scoring
+    a perfect match (and from swallowing a genuinely different later call)."""
+    cfg = SimilarityConfig(kind="fuzzy")
+    assert similarity({"a": "1"}, {"a": "1"}, cfg) == 0.0
+
+
+def test_an_exact_key_hit_on_a_completed_prior_action_returns_replay() -> None:
+    """The exact key short-circuits the similarity scan: a completed prior call
+    under the same key hands back the cached result directly."""
+    from continuum.actions.idempotency import idempotency_key
+
+    exact_key = str(idempotency_key("send_invoice", None, scope="run_1", key="invoice:INV-001"))
+    prior = {exact_key: {"action_type": "send_invoice", "status": "completed", "result": "ok"}}
+
+    kind, match = classify_call(
+        new_key="invoice:INV-001",
+        new_args={"customer": "acme"},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=_cfg(),
+        run_id="run_1",
+    )
+    assert kind == "replay"
+    assert match is prior[exact_key]
+
+
+def test_an_exact_key_hit_on_a_non_completed_prior_action_stays_fresh() -> None:
+    """The exact-key arm honours the completed-only rule too: a failed prior
+    call under the same key must not hand back a cached result (issue #1837)."""
+    from continuum.actions.idempotency import idempotency_key
+
+    exact_key = str(idempotency_key("send_invoice", None, scope="run_1", key="invoice:INV-002"))
+    prior = {exact_key: {"action_type": "send_invoice", "status": "failed"}}
+
+    kind, match = classify_call(
+        new_key="invoice:INV-002",
+        new_args={"customer": "acme"},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=_cfg(),
+        run_id="run_1",
+    )
+    assert kind == "fresh"
+    assert match is None
+
+
+def test_a_partially_similar_call_lands_in_the_fork_band() -> None:
+    """Between the fork and replay thresholds the verdict is ``fork``: close
+    enough to be related, far enough that the cached result does not apply."""
+    cfg = SimilarityConfig(kind="fuzzy", replay_threshold=0.85, fork_threshold=0.50)
+    prior = {
+        "k1": {
+            "action_type": "send_invoice",
+            "status": "completed",
+            "arguments": {"customer": "acme", "invoice_id": "INV-001"},
+        }
+    }
+
+    kind, match = classify_call(
+        new_key="paraphrased_key",
+        new_args={"customer": "globex", "invoice_id": "INV-001"},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=cfg,
+        run_id="run_1",
+    )
+    assert kind == "fork"
+    assert match is not None
+    assert match["__ledger_key__"] == "k1"
+
+
+def test_prior_arguments_that_are_not_a_mapping_are_skipped() -> None:
+    """A malformed prior record cannot crash the scan nor feed it a phantom score."""
+    prior = {
+        "k1": {
+            "action_type": "send_invoice",
+            "status": "completed",
+            "arguments": "not-a-dict",
+        }
+    }
+
+    kind, match = classify_call(
+        new_key="any-key",
+        new_args={"customer": "acme"},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=_cfg(),
+        run_id="run_1",
+    )
+    assert kind == "fresh"
+    assert match is None
+
+
+def test_backend_accepts_a_callable_embedder_directly() -> None:
+    """A programmatic registry entry may carry the function itself; the resolver
+    must pass it through rather than treat it as a dotted path."""
+    cfg = similarity_backend({"kind": "embedding", "embedder": embed_text})
+    assert cfg.kind is SimilarityKind.EMBEDDING
+    assert cfg.embedder is embed_text
+
+
+def test_backend_rejects_a_non_string_non_callable_embedder() -> None:
+    with pytest.raises(ValueError, match="embedder must be a dotted path or callable, got int"):
+        similarity_backend({"kind": "embedding", "embedder": 123})
+
+
+def test_backend_rejects_a_path_with_no_module_or_attribute() -> None:
+    with pytest.raises(ValueError, match="embedder must be a dotted path like 'pkg.mod.func'"):
+        similarity_backend({"kind": "embedding", "embedder": "invalidpath"})
+
+
+def test_backend_rejects_a_resolved_non_callable_embedder() -> None:
+    """``math:pi`` resolves, but a float cannot embed anything."""
+    with pytest.raises(ValueError, match="embedder 'math:pi' is not callable"):
+        similarity_backend({"kind": "embedding", "embedder": "math:pi"})
+
+
+def test_backend_rejects_a_config_that_is_no_name_mapping_or_config() -> None:
+    with pytest.raises(
+        ValueError, match="similarity config must be a name, mapping or SimilarityConfig"
+    ):
+        similarity_backend([1, 2, 3])  # type: ignore[arg-type]
